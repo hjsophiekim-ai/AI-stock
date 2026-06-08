@@ -1,0 +1,58 @@
+# 환경변수 (절대 커밋 금지)
+.env
+*.env
+.env.backup*
+
+# Python
+*.pyc
+*.pyo
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 가상환경
+.venv/
+venv/
+env/
+ENV/
+
+# 데이터 파일 (용량이 크므로 제외)
+data/raw/
+data/processed/
+data/intraday/
+
+# 모델 파일
+models/*.pkl
+models/*.joblib
+models/*.bin
+models/kis_token_cache.json
+
+# 리포트
+reports/
+
+# 로그
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
