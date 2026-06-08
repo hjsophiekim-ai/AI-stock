@@ -1,0 +1,175 @@
+live_trade: false
+paper_trade: true
+
+force_trade:
+  enabled: true
+  description: "예산 범위 내에서 최소 1건 이상 주문 발생을 목표로 하는 거래 보장 모드. 수익 보장이 아니라 주문 발생 보장이다."
+  min_orders_per_day: 1
+  max_orders_per_day: 20
+  force_buy_top_n: 20
+  allow_filter_relaxation: true
+  relaxation_steps:
+    - "normal_filters"
+    - "relax_trading_value"
+    - "relax_volatility"
+    - "score_only_with_hard_exclusions"
+  hard_exclusions:
+    exclude_halted_stock: true
+    exclude_management_stock: true
+    exclude_warning_stock: true
+    exclude_preferred_stock: true
+    exclude_spac: true
+    exclude_etf_etn: true
+    min_price: 1000
+  minimum_order_amount: 10000
+  test_order_amount: 10000
+  max_force_trade_budget: 100000
+  use_small_test_order_first: true
+  cancel_test_order_immediately: false
+  allow_real_test_order: false
+
+safety:
+  confirm_live_trade: false
+  require_manual_live_trade_confirmation: true
+  allow_real_test_order: false
+  max_order_retries: 3
+  max_api_error_count: 5
+  stop_new_orders_on_api_error: true
+  allow_market_order: false
+  allow_after_hours_order: true
+  allow_pre_market_order: true
+  allow_next_morning_order: true
+
+# 한국 거래소 KST 기준 거래 시간 (세션별 경계)
+# 공식 기준: KIS Developers https://apiportal.koreainvestment.com/
+trading_hours:
+  pre_market_start: "08:30"           # 장전시간외 호가 시작
+  pre_market_end: "09:00"             # 장전시간외 호가 종료 / 정규장 시작
+  regular_start: "09:00"              # 정규장 시작
+  regular_end: "15:20"                # 정규장 마감 / 동시호가 시작
+  closing_auction_start: "15:20"      # 동시호가 시작
+  closing_auction_end: "15:30"        # 동시호가 종료
+  after_close_start: "15:30"          # 장후시간외 시작
+  after_close_end: "16:00"            # 장후시간외 종료
+  after_hours_single_start: "16:00"   # 시간외단일가 시작
+  after_hours_single_end: "18:00"     # 시간외단일가 종료
+
+# 시간외 주문 설정
+after_hours:
+  enabled: true                       # 시간외 주문 기능 활성화
+  allow_pre_market: true              # 장전시간외 주문 허용 (ORD_DVSN 확인 필요)
+  allow_regular: true                 # 정규장 주문 허용
+  allow_closing_auction: false        # 동시호가 주문 — 미지원 (구조상 불가)
+  allow_after_close: false            # 장후시간외 주문 허용 (ORD_DVSN 확인 필요)
+  allow_after_hours_single: true      # 시간외단일가 주문 허용 (ORD_DVSN 확인 필요)
+  # IMPORTANT: REAL 모드 시간외 주문은 공식 문서에서 주문구분 코드를 직접 확인 후
+  # real_order_confirmed: true 로 변경해야 합니다.
+  # false인 동안은 REAL 모드에서 정규장(ORD_DVSN=00) 외 주문이 NotImplementedError로 차단됩니다.
+  real_order_confirmed: false
+
+strategy:
+  name: "Next Morning 2% Target AI Strategy"
+  description: "+2% 익절 목표 자동매매 전략"
+  lookback_years: 3
+  buy_start_time: "14:40"
+  buy_end_time: "15:00"
+  after_hours_start_time: "15:40"
+  after_hours_end_time: "18:00"
+  pre_market_start_time: "08:30"
+  pre_market_end_time: "08:40"
+  regular_market_start_time: "09:00"
+  forced_exit_time_next_day: "09:30"
+  target_profit_rate: 0.02
+  stop_loss_rate: -0.03
+  max_holding_days: 1
+  prediction_top_n: 50
+  buy_top_n: 20
+  buy_execution_mode: "split_limit"
+  sell_execution_mode: "limit_then_market_if_allowed"
+  use_equal_weight: true
+
+risk:
+  max_positions: 20
+  max_position_weight: 0.05
+  max_daily_loss_rate: -0.03
+  max_market_index_drop_rate: -0.015
+  min_price: 1000
+  min_daily_trading_value: 3000000000
+  min_avg_20d_trading_value: 5000000000
+  relaxed_min_daily_trading_value: 500000000
+  relaxed_min_avg_20d_trading_value: 1000000000
+  exclude_preferred_stock: true
+  exclude_spac: true
+  exclude_etf_etn: true
+  exclude_warning_stock: true
+  exclude_halted_stock: true
+  exclude_management_stock: true
+  use_limit_order_only: true
+  emergency_liquidation_enabled: true
+
+kis:
+  use_mock: true
+  base_url_mock: "https://openapivts.koreainvestment.com:29443"
+  base_url_real: "https://openapi.koreainvestment.com:9443"
+  token_path: "/oauth2/tokenP"
+  app_key_env: "KIS_APP_KEY"
+  app_secret_env: "KIS_APP_SECRET"
+  account_no_env: "KIS_ACCOUNT_NO"
+  account_product_code_env: "KIS_ACCOUNT_PRODUCT_CODE"
+  mock_account_no_env: "KIS_MOCK_ACCOUNT_NO"
+  mock_account_product_code_env: "KIS_MOCK_ACCOUNT_PRODUCT_CODE"
+  request_timeout_seconds: 10
+  rate_limit_sleep_seconds: 0.25
+  token_cache_file: "data/token_cache.json"
+
+order:
+  default_order_type: "limit"
+  buy_price_adjustment_rate: 0.001
+  sell_price_adjustment_rate: -0.001
+  cancel_unfilled_after_seconds: 20
+  retry_unfilled_order: true
+  max_order_amount_per_stock_rate: 0.05
+
+backtest:
+  fee_rate: 0.00015
+  tax_rate: 0.0018
+  slippage_rate: 0.001
+  conservative_entry: true
+  conservative_exit: true
+  initial_capital: 100000000
+
+model:
+  model_type: "lightgbm"
+  fallback_model_type: "random_forest"
+  train_validation_split: "time_series"
+  target_column: "target_2pct_next_morning"
+  primary_metric: "precision_at_top20"
+  random_shuffle: false
+  train_ratio: 0.8
+  n_estimators: 500
+  max_depth: 6
+  learning_rate: 0.05
+  random_state: 42
+
+data:
+  raw_daily_path: "data/raw/daily_prices.csv"
+  raw_intraday_dir: "data/intraday"
+  processed_features_path: "data/processed/features.csv"
+  processed_labels_path: "data/processed/labeled_dataset.csv"
+  positions_file: "data/positions.json"
+  error_log_path: "logs/data_collect_errors.log"
+
+paths:
+  models_dir: "models"
+  model_path: "models/model.joblib"
+  predictions_dir: "reports/predictions"
+  backtests_dir: "reports/backtests"
+  paper_trades_dir: "reports/paper_trades"
+  orders_dir: "reports/orders"
+  logs_dir: "logs"
+
+logging:
+  log_level: "INFO"
+  trade_log_file: "logs/trade.log"
+  api_log_file: "logs/api.log"
+  error_log_file: "logs/error.log"
