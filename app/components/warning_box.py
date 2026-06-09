@@ -1,47 +1,44 @@
-"""경고 박스 컴포넌트."""
+"""Streamlit warning and notice components."""
 
 import streamlit as st
 
 
 def real_order_warning() -> None:
-    """실전 주문 전 강력 경고 박스."""
+    """Show a high-visibility warning before REAL orders."""
     st.error(
         """
-        ⛔ **실전 주문 경고**
+        **실전 주문 경고**
 
-        - 이 작업은 **실제 자금**으로 한국투자증권 계좌에서 주문을 실행합니다.
-        - 이 시스템은 **+2% 익절 목표** 전략을 사용하지만, **수익을 보장하지 않습니다.**
-        - 매수한 종목의 가격이 하락해도 시스템이 이를 보상하지 않습니다.
-        - 주문 실행 전 본인이 직접 리스크를 확인하고 책임지세요.
-        - 최소 주문 단위로만 테스트하세요.
+        - 실전 주문은 한국투자증권 실전 계좌에서 실제 자금으로 실행됩니다.
+        - 이 프로그램은 +2% 익절 목표 전략을 사용할 수 있지만 수익을 보장하지 않습니다.
+        - 주문 전 종목, 수량, 가격, 주문금액을 직접 확인해야 합니다.
+        - 먼저 1주 또는 소액 테스트만 진행하세요.
+        - 주문 결과와 투자 손익에 대한 책임은 사용자 본인에게 있습니다.
         """
     )
 
 
 def force_trade_disclaimer() -> None:
-    """force_trade 모드 안내."""
+    """Explain force_trade mode."""
     st.info(
         """
-        ℹ️ **거래 보장 모드(force_trade) 안내**
+        **거래 보장 모드 안내**
 
-        - 이 모드는 하루에 최소 1건 이상 **주문 발생을 목표**로 필터를 단계적으로 완화합니다.
-        - **수익을 보장하는 기능이 아닙니다.**
-        - hard exclusion(거래정지·관리종목·우선주 등)은 어떤 경우에도 우회되지 않습니다.
+        - force_trade는 최소 주문 발생을 목표로 일부 필터를 단계적으로 완화합니다.
+        - 수익을 보장하는 기능이 아닙니다.
+        - 거래정지, 관리종목, 투자주의환기종목 등 hard exclusion은 우회하지 않습니다.
         """
     )
 
 
 def emergency_stop_warning() -> None:
-    """긴급중단 활성 경고."""
-    st.error(
-        "🚨 **긴급중단(EMERGENCY_STOP) 활성 상태** — "
-        "모든 신규 매수가 차단됩니다. 해제하려면 '긴급중단 해제' 버튼을 누르세요."
-    )
+    """Show emergency stop warning."""
+    st.error("**긴급중단(EMERGENCY_STOP) 활성화 상태**: 모든 신규 매수가 차단됩니다.")
 
 
 def no_profit_guarantee_notice() -> None:
-    """수익 무보장 고지."""
+    """Show no-profit-guarantee notice."""
     st.caption(
-        "⚠️ 이 시스템은 +2% 익절 목표 전략을 사용하며, 수익을 보장하지 않습니다. "
+        "이 시스템은 +2% 익절 목표 전략을 사용할 수 있지만 수익을 보장하지 않습니다. "
         "투자 결과에 대한 책임은 사용자 본인에게 있습니다."
     )

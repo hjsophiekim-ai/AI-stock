@@ -54,6 +54,7 @@ class NoTradeReason:
     SAFETY_GATE_REJECTED = "SafetyGate 거부"
     RISK_MANAGER_REJECTED = "RiskManager 거부"
     API_ORDER_REJECTED = "한국투자증권 API 주문 거부"
+    MOCK_UNSUPPORTED = "모의투자 미지원 주문유형 (MOCK_UNSUPPORTED_ORDER_TYPE)"
     CANCELLED_UNFILLED = "미체결 후 취소"
     FORCE_TRADE_DISABLED = "force_trade.enabled=false"
     EMERGENCY_STOP = "긴급 중단 활성화"
@@ -261,12 +262,26 @@ class ForceAutoTrader:
             quantity = alloc["quantity"]
             order_price = alloc["order_price"]
             current_price = int(alloc["current_price"])
+            original_price = alloc.get("original_price", order_price)
+            tick_size = alloc.get("tick_size", 0)
+            tick_adjusted = alloc.get("tick_adjusted", False)
 
-            logger.info(
-                "[주문] %s(%s) %d주 × %d원 = %d원 [모드=%s]",
-                stock_code, stock_name, quantity, order_price,
-                quantity * order_price, trade_mode,
+            tick_info = (
+                f" [호가보정: {original_price:,}→{order_price:,} tick={tick_size}]"
+                if tick_adjusted else ""
             )
+            logger.info(
+                "[주문] %s(%s) %d주 × %d원 = %d원 [모드=%s]%s",
+                stock_code, stock_name, quantity, order_price,
+                quantity * order_price, trade_mode, tick_info,
+            )
+            if tick_adjusted:
+                print(
+                    f"\n  [주문] {stock_code} {stock_name} {quantity}주"
+                    f"\n    원가격   : {original_price:,}원"
+                    f"\n    보정가격 : {order_price:,}원 (호가단위 {tick_size}원)"
+                    f"\n    모드     : {trade_mode}"
+                )
 
             result = self.order_mgr.place_order_with_verification(
                 stock_code=stock_code,
@@ -279,13 +294,37 @@ class ForceAutoTrader:
             result["stock_code"] = stock_code
             result["stock_name"] = stock_name
             result["order_price"] = order_price
+            result["original_price"] = original_price
+            result["tick_size"] = tick_size
+            result["tick_adjusted"] = tick_adjusted
             result["quantity"] = quantity
             result["trade_mode"] = trade_mode
             results.append(result)
 
             if not result.get("success"):
                 reason = result.get("rejected_reason", result.get("reason", ""))
-                if "RiskManager" in reason:
+                error_category = result.get("error_category", "")
+                order_session = result.get("order_session", "")
+                ord_dvsn = result.get("ord_dvsn", "")
+                tr_id = result.get("tr_id", "")
+                raw_msg = result.get("raw_msg", "")
+
+                if error_category == "MOCK_UNSUPPORTED_ORDER_TYPE":
+                    print(
+                        f"\n주문 실패 원인 분석 [{stock_code} {stock_name}]:"
+                        f"\n  프로그램 로직  : 정상"
+                        f"\n  API 호출       : 성공"
+                        f"\n  주문 세션      : {order_session}"
+                        f"\n  주문구분(ORD_DVSN): {ord_dvsn}"
+                        f"\n  TR_ID          : {tr_id}"
+                        f"\n  한국투자증권 응답: {raw_msg}"
+                        f"\n  판정           : MOCK_UNSUPPORTED_ORDER_TYPE"
+                        f"\n  다음 조치      : 정규장(REGULAR) MOCK 주문으로 검증하거나,"
+                        f"\n                   KIS 공식 문서에서 {order_session} 주문구분 코드 재확인 필요"
+                        f"\n                   python src/diagnose_after_hours_orders.py --stock-code {stock_code} --amount 10000 --session {order_session}"
+                    )
+                    self._add_no_trade(NoTradeReason.MOCK_UNSUPPORTED, f"{stock_code}: 세션={order_session} ORD_DVSN={ord_dvsn} msg={raw_msg}")
+                elif "RiskManager" in reason:
                     self._add_no_trade(NoTradeReason.RISK_MANAGER_REJECTED, f"{stock_code}: {reason}")
                 elif "SafetyGate" in reason:
                     self._add_no_trade(NoTradeReason.SAFETY_GATE_REJECTED, f"{stock_code}: {reason}")

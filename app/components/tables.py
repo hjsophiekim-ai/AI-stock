@@ -1,41 +1,46 @@
-"""테이블 컴포넌트."""
+"""Shared Streamlit table renderers."""
 
-from typing import List, Optional
+from typing import List
+
 import pandas as pd
 import streamlit as st
 
 
 def render_candidates_table(df: pd.DataFrame) -> None:
-    """AI 후보 종목 테이블 렌더링."""
     if df is None or df.empty:
         st.info("표시할 후보 종목이 없습니다.")
         return
     display_cols = {
+        "rank": "순위",
+        "final_rank": "순위",
+        "stock_code": "종목코드",
         "ticker": "종목코드",
+        "stock_name": "종목명",
         "name": "종목명",
         "close": "현재가",
         "current_price": "현재가",
+        "buy_allowed": "매수허용",
+        "disclosure_score": "공시점수",
+        "disclosure_risk_score": "공시위험",
+        "disclosure_summary": "공시요약",
+        "disclosure_risk_reason": "위험사유",
+        "final_score": "최종점수",
+        "probability_2pct": "상승확률",
         "prediction_score": "예측점수",
-        "probability": "상승확률",
         "trading_value": "거래대금",
-        "avg_20d_trading_value": "20일평균거래대금",
-        "selected_by_step": "선정단계",
         "exclusion_reason": "제외사유",
-        "final_rank": "순위",
     }
-    cols = [c for c in display_cols if c in df.columns]
+    seen = set()
+    cols = []
+    for col, label in display_cols.items():
+        if col in df.columns and label not in seen:
+            cols.append(col)
+            seen.add(label)
     view = df[cols].rename(columns={c: display_cols[c] for c in cols})
-    if "현재가" in view.columns:
-        view["현재가"] = view["현재가"].apply(lambda x: f"{int(x):,}원" if pd.notna(x) else "-")
-    if "거래대금" in view.columns:
-        view["거래대금"] = view["거래대금"].apply(lambda x: f"{x/1e8:.0f}억" if pd.notna(x) and x > 0 else "-")
-    if "20일평균거래대금" in view.columns:
-        view["20일평균거래대금"] = view["20일평균거래대금"].apply(lambda x: f"{x/1e8:.0f}억" if pd.notna(x) and x > 0 else "-")
     st.dataframe(view, use_container_width=True)
 
 
 def render_positions_table(positions: List[dict]) -> None:
-    """보유종목 테이블 렌더링."""
     if not positions:
         st.info("보유 중인 종목이 없습니다.")
         return
@@ -52,35 +57,31 @@ def render_positions_table(positions: List[dict]) -> None:
             "종목코드": pos.get("stock_code", ""),
             "종목명": pos.get("stock_name", ""),
             "수량": qty,
-            "매수가": f"{ep:,.0f}",
-            "현재가": f"{cp:,.0f}",
-            "목표가(+2%)": f"{tp:,.0f}",
-            "손절가(-3%)": f"{sp:,.0f}",
-            "평가손익": f"{pnl:+,.0f}",
-            "수익률": f"{pnl_rate:+.2f}%",
+            "매수가": round(ep),
+            "현재가": round(cp),
+            "목표가(+2%)": round(tp),
+            "손절가(-3%)": round(sp),
+            "최고가": round(float(pos.get("trailing_high_price", 0) or 0)),
+            "트레일링 스탑가": round(float(pos.get("trailing_stop_price", 0) or 0)),
+            "평가손익": round(pnl),
+            "수익률": round(pnl_rate, 2),
+            "매도방식": pos.get("sell_policy_name", pos.get("sell_policy_id", "")),
+            "자동매도": not bool(pos.get("manual_only", False)),
+            "수동보유": bool(pos.get("manual_only", False)),
             "주문번호": pos.get("order_no", "-"),
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 
 def render_order_results_table(results: List[dict]) -> None:
-    """주문 결과 테이블 렌더링."""
     if not results:
         st.info("주문 결과가 없습니다.")
         return
-    cols = ["trade_mode", "stock_code", "stock_name", "quantity", "price",
-            "amount", "order_no", "filled_quantity", "rejected_reason",
-            "api_called", "real_order_called", "success"]
-    rows = []
-    for r in results:
-        row = {c: r.get(c, "") for c in cols}
-        rows.append(row)
-    df = pd.DataFrame(rows)
-    rename = {
-        "trade_mode": "모드", "stock_code": "종목코드", "stock_name": "종목명",
-        "quantity": "수량", "price": "가격", "amount": "주문금액",
-        "order_no": "주문번호", "filled_quantity": "체결수량",
-        "rejected_reason": "거부사유", "api_called": "API호출",
-        "real_order_called": "실전주문", "success": "성공여부",
-    }
-    st.dataframe(df.rename(columns=rename), use_container_width=True)
+    cols = [
+        "requested_mode", "resolved_mode", "stock_code", "stock_name", "quantity",
+        "price", "order_price", "amount", "order_amount", "sell_policy_id",
+        "sell_policy_name", "order_no", "rejected_reason", "api_called",
+        "mock_order_called", "real_order_called", "success",
+    ]
+    rows = [{c: r.get(c, "") for c in cols if c in r} for r in results]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)

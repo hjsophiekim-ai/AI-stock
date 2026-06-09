@@ -358,7 +358,7 @@ class OrderManager:
         )
 
         if mode == TRADE_MODE_PAPER:
-            self.pos_mgr.update_position_after_sell(stock_code, sell_price, reason, now)
+            self.pos_mgr.update_position_after_sell(stock_code, sell_price, reason, now, quantity=quantity)
             order_info.update({"success": True, "order_no": f"PAPER_{now.strftime('%H%M%S%f')}"})
             logger.info("[PAPER 체결] 매도 %s %d주 @ %d원 (사유=%s)", stock_code, quantity, sell_price, reason)
             return order_info
@@ -370,7 +370,7 @@ class OrderManager:
                 rt_cd = resp.get("rt_cd", "")
                 order_no = resp.get("output", {}).get("ODNO", "")
                 if rt_cd == "0":
-                    self.pos_mgr.update_position_after_sell(stock_code, sell_price, reason, now)
+                    self.pos_mgr.update_position_after_sell(stock_code, sell_price, reason, now, quantity=quantity)
                     order_info.update({"success": True, "order_no": order_no})
                     logger.info("[주문 성공] 매도 %s %d주 @ %d원 (주문번호=%s)", stock_code, quantity, sell_price, order_no)
                     return order_info

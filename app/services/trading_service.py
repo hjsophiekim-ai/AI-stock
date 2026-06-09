@@ -32,6 +32,13 @@ def get_positions() -> List[Dict]:
                 "order_no": getattr(pos, "order_no", ""),
                 "strategy_id": getattr(pos, "strategy_id", ""),
                 "strategy_name": getattr(pos, "strategy_name", ""),
+                "sell_policy_id": getattr(pos, "sell_policy_id", "fixed_2pct"),
+                "sell_policy_name": getattr(pos, "sell_policy_name", "기본 자동매도"),
+                "trailing_active": getattr(pos, "trailing_active", False),
+                "trailing_high_price": getattr(pos, "trailing_high_price", 0),
+                "trailing_stop_price": getattr(pos, "trailing_stop_price", 0),
+                "manual_only": getattr(pos, "manual_only", False),
+                "auto_take_profit_enabled": getattr(pos, "auto_take_profit_enabled", True),
                 "allowed_sell_sessions": getattr(pos, "allowed_sell_sessions", []),
                 "status": getattr(pos, "status", "OPEN"),
                 "source": getattr(pos, "source", "local"),
@@ -140,9 +147,22 @@ def run_buy_candidates(
     refresh_prices: bool = False,
     preview_only: bool = False,
     allow_additional_buy: bool = False,
+    sell_policy_id: str = "fixed_2pct",
 ) -> Dict:
     inject_to_os_env()
     try:
+        if (mode or "").lower() == "real":
+            cfg = load_config()
+            if not (
+                cfg.get("real_trade", {}).get("allow_bulk_buy", False)
+                and cfg.get("force_trade", {}).get("allow_real_bulk_order", False)
+                and cfg.get("safety", {}).get("confirm_live_trade", False)
+            ):
+                return {
+                    "success": False,
+                    "message": "실전 전체 리스트 매수는 비활성화되어 있습니다. 먼저 개별 종목 1주 테스트를 완료하세요.",
+                    "orders_placed": 0,
+                }
         from buy_candidate_list import buy_candidates
         result = buy_candidates(
             candidate_file=candidate_file,
@@ -155,17 +175,29 @@ def run_buy_candidates(
             preview_only=preview_only,
             allow_outside_window=True,
             allow_additional_buy=allow_additional_buy,
+            sell_policy_id=sell_policy_id,
         )
         return result if isinstance(result, dict) else {"success": False, "message": "buy_candidates returned non-dict", "orders_placed": 0}
     except Exception as e:
         return {"success": False, "message": str(e), "orders_placed": 0}
 
 
-def run_force_sell_once(strategy_id: Optional[str] = None, mode: str = "mock") -> Dict:
+def run_force_sell_once(
+    strategy_id: Optional[str] = None,
+    mode: str = "mock",
+    sell_policy_id: Optional[str] = None,
+    policy_override: bool = False,
+) -> Dict:
     inject_to_os_env()
     try:
         from monitor_take_profit import monitor_once
-        result = monitor_once(mode=mode, strategy=strategy_id, config_path=str(PROJECT_ROOT / "config.yaml"))
+        result = monitor_once(
+            mode=mode,
+            strategy=strategy_id,
+            config_path=str(PROJECT_ROOT / "config.yaml"),
+            sell_policy_id=sell_policy_id,
+            policy_override=policy_override,
+        )
         return {"success": True, "data": result.get("rows", []), **result}
     except Exception as e:
         return {"success": False, "message": str(e)}
@@ -190,3 +222,50 @@ def check_real_order_conditions() -> Dict:
         return {"success": all(conditions.values()), "conditions": conditions}
     except Exception as e:
         return {"success": False, "conditions": {}, "message": str(e)}
+
+
+def run_real_order_readiness_check() -> Dict:
+    inject_to_os_env()
+    try:
+        from real_order_readiness_check import run_readiness_check, save_report
+        result = run_readiness_check(str(PROJECT_ROOT / "config.yaml"))
+        paths = save_report(result)
+        return {"success": True, **result, **paths}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+def run_real_single_order_test(stock_code: str, quantity: int = 1, price: int = 0, execute: bool = False) -> Dict:
+    inject_to_os_env()
+    try:
+        from real_order_test import run_real_order_test
+        return run_real_order_test(
+            stock_code=stock_code,
+            quantity=quantity,
+            price=price,
+            execute=execute,
+            config_path=str(PROJECT_ROOT / "config.yaml"),
+        )
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+def list_sell_policies() -> List[Dict]:
+    try:
+        from sell_policy import list_sell_policies as _list
+        return _list(load_config())
+    except Exception:
+        return [
+            {"id": "fixed_2pct", "name": "기본 자동매도"},
+            {"id": "market_strength_trailing", "name": "강한 장 트레일링 매도"},
+            {"id": "manual_hold", "name": "수동매도 전까지 보유"},
+        ]
+
+
+def run_market_strength() -> Dict:
+    inject_to_os_env()
+    try:
+        from market_strength import get_market_strength
+        return {"success": True, **get_market_strength()}
+    except Exception as e:
+        return {"success": False, "message": str(e)}

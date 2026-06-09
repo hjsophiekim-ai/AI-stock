@@ -16,6 +16,7 @@ import requests
 from dotenv import load_dotenv
 
 from kis_auth import KISAuth
+from price_tick import adjust_price_to_tick, get_tick_size, is_valid_tick_price
 from safety_gate import SafetyGate, TRADE_MODE_REAL, TRADE_MODE_MOCK
 from trading_calendar import (
     SESSION_PRE_MARKET, SESSION_REGULAR, SESSION_CLOSING_AUCTION,
@@ -349,6 +350,65 @@ class KISApiClient:
     # 세션별 주문구분 코드 해석
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # 주문 응답 에러 분류
+    # ------------------------------------------------------------------
+
+    # KIS 응답 메시지 → error_category 매핑 (공식 메시지 기준)
+    _MOCK_UNSUPPORTED_MSGS = (
+        "모의투자에서 제공하지 않는 주문유형입니다",
+        "모의투자에서 제공하지 않는",
+    )
+
+    ERROR_MOCK_UNSUPPORTED = "MOCK_UNSUPPORTED_ORDER_TYPE"
+    ERROR_API_REJECTED = "API_ORDER_REJECTED"
+    ERROR_NONE = ""
+
+    @classmethod
+    def classify_order_error(cls, rt_cd: str, msg: str) -> str:
+        """API 응답 rt_cd + msg → error_category 분류.
+
+        Returns:
+            "" — 성공 (rt_cd=0)
+            "MOCK_UNSUPPORTED_ORDER_TYPE" — 모의투자 서버가 해당 주문유형 미지원
+            "API_ORDER_REJECTED" — 그 외 API 거부
+        """
+        if rt_cd == "0":
+            return cls.ERROR_NONE
+        for keyword in cls._MOCK_UNSUPPORTED_MSGS:
+            if keyword in msg:
+                return cls.ERROR_MOCK_UNSUPPORTED
+        return cls.ERROR_API_REJECTED
+
+    def _enrich_order_response(
+        self, resp: Dict, resolved: Dict, side: str
+    ) -> Dict:
+        """주문 API 응답에 분류 필드를 추가.
+
+        원본 resp를 수정하지 않고 복사본에 추가합니다.
+
+        추가 필드:
+            order_session, ord_dvsn, tr_id, side,
+            error_category, is_mock_supported, is_real_safe_to_use, raw_msg
+        """
+        rt_cd = resp.get("rt_cd", "")
+        raw_msg = resp.get("msg1", "")
+        error_category = self.classify_order_error(rt_cd, raw_msg)
+        is_success = rt_cd == "0"
+
+        enriched = dict(resp)
+        enriched.update({
+            "order_session": resolved.get("session", ""),
+            "ord_dvsn": resolved.get("ord_dvsn", ""),
+            "tr_id": resolved.get("tr_id", ""),
+            "side": side,
+            "error_category": error_category,
+            "is_mock_supported": is_success or error_category != self.ERROR_MOCK_UNSUPPORTED,
+            "is_real_safe_to_use": resolved.get("is_confirmed_for_real", False),
+            "raw_msg": raw_msg,
+        })
+        return enriched
+
     def resolve_order_division(self, order_session: str, side: str = "buy") -> Dict:
         """거래 세션에 따른 주문구분 코드(ORD_DVSN)와 TR_ID를 반환합니다.
 
@@ -415,10 +475,20 @@ class KISApiClient:
         # REAL 모드에서는 config.yaml after_hours.real_order_confirmed: true 필요
         real_confirmed = self.cfg.get("after_hours", {}).get("real_order_confirmed", False)
 
+        ah_cfg = self.cfg.get("after_hours", {})
         candidate_codes = {
-            SESSION_PRE_MARKET: ("60", "장전시간외 (후보 코드 — 공식 문서 재확인 필요)"),
-            SESSION_AFTER_CLOSE: ("62", "장후시간외 (후보 코드 — 공식 문서 재확인 필요)"),
-            SESSION_AFTER_HOURS_SINGLE: ("61", "시간외단일가 (후보 코드 — 공식 문서 재확인 필요)"),
+            SESSION_PRE_MARKET: (
+                ah_cfg.get("pre_market_default_ord_dvsn", "05"),
+                "장전시간외 (후보 코드 — 공식 문서 재확인 필요)",
+            ),
+            SESSION_AFTER_CLOSE: (
+                ah_cfg.get("after_close_default_ord_dvsn", "06"),
+                "장후시간외 (후보 코드 — 공식 문서 재확인 필요)",
+            ),
+            SESSION_AFTER_HOURS_SINGLE: (
+                ah_cfg.get("after_hours_single_default_ord_dvsn", "61"),
+                "시간외단일가 (후보 코드 — 공식 문서 재확인 필요)",
+            ),
         }
 
         if order_session in candidate_codes:
@@ -481,6 +551,7 @@ class KISApiClient:
         price: int,
         order_type: str = "limit",
         order_session: Optional[str] = None,
+        ord_dvsn_override: Optional[str] = None,
     ) -> Dict:
         """현금 매수 주문.
 
@@ -540,10 +611,29 @@ class KISApiClient:
 
         if order_type == "market":
             ord_dvsn = "01"
+        elif ord_dvsn_override is not None:
+            ord_dvsn = ord_dvsn_override
+            resolved = dict(resolved)
+            resolved["ord_dvsn"] = ord_dvsn_override
+            resolved["description"] = f"ORD_DVSN override ({ord_dvsn_override})"
         else:
             ord_dvsn = resolved["ord_dvsn"]
 
         tr_id = resolved["tr_id"]
+
+        # 호가단위 보정 (지정가 주문만)
+        original_price = int(price)
+        if order_type == "limit":
+            tick_cfg = self.cfg.get("order_price", {})
+            if tick_cfg.get("tick_adjust_enabled", True):
+                buy_method = tick_cfg.get("buy_tick_method", "floor")
+                adjusted = adjust_price_to_tick(original_price, side="buy", method=buy_method)
+                if adjusted != original_price and tick_cfg.get("log_tick_adjustment", True):
+                    logger.info(
+                        "[호가보정] %s buy %d → %d (tick=%d method=%s)",
+                        stock_code, original_price, adjusted, get_tick_size(adjusted), buy_method,
+                    )
+                price = adjusted
 
         body = {
             "CANO": self._account_no,
@@ -559,11 +649,23 @@ class KISApiClient:
             self.gate.mode,
             self.gate.mask_account_no(self._account_no),
         )
-        return self._post(
+        resp = self._post(
             "/uapi/domestic-stock/v1/trading/order-cash",
             tr_id,
             body,
         )
+        enriched = self._enrich_order_response(resp, resolved, "buy")
+        enriched["original_price"] = original_price
+        enriched["adjusted_price"] = price
+        enriched["tick_size"] = get_tick_size(price)
+        enriched["tick_adjusted"] = (price != original_price)
+        enriched["tick_valid"] = is_valid_tick_price(price)
+        if enriched.get("error_category") == self.ERROR_MOCK_UNSUPPORTED:
+            logger.warning(
+                "[MOCK 미지원] 세션=%s ORD_DVSN=%s TR_ID=%s 메시지=%s → 판정: MOCK_UNSUPPORTED_ORDER_TYPE",
+                order_session, ord_dvsn, tr_id, enriched.get("raw_msg", ""),
+            )
+        return enriched
 
     def place_cash_sell_order(
         self,
@@ -624,6 +726,20 @@ class KISApiClient:
 
         tr_id = resolved["tr_id"]
 
+        # 호가단위 보정 (지정가 주문만)
+        original_price = int(price)
+        if order_type == "limit":
+            tick_cfg = self.cfg.get("order_price", {})
+            if tick_cfg.get("tick_adjust_enabled", True):
+                sell_method = tick_cfg.get("sell_tick_method", "ceil")
+                adjusted = adjust_price_to_tick(original_price, side="sell", method=sell_method)
+                if adjusted != original_price and tick_cfg.get("log_tick_adjustment", True):
+                    logger.info(
+                        "[호가보정] %s sell %d → %d (tick=%d method=%s)",
+                        stock_code, original_price, adjusted, get_tick_size(adjusted), sell_method,
+                    )
+                price = adjusted
+
         body = {
             "CANO": self._account_no,
             "ACNT_PRDT_CD": self._product_code,
@@ -638,11 +754,23 @@ class KISApiClient:
             self.gate.mode,
             self.gate.mask_account_no(self._account_no),
         )
-        return self._post(
+        resp = self._post(
             "/uapi/domestic-stock/v1/trading/order-cash",
             tr_id,
             body,
         )
+        enriched = self._enrich_order_response(resp, resolved, "sell")
+        enriched["original_price"] = original_price
+        enriched["adjusted_price"] = price
+        enriched["tick_size"] = get_tick_size(price)
+        enriched["tick_adjusted"] = (price != original_price)
+        enriched["tick_valid"] = is_valid_tick_price(price)
+        if enriched.get("error_category") == self.ERROR_MOCK_UNSUPPORTED:
+            logger.warning(
+                "[MOCK 미지원] 세션=%s ORD_DVSN=%s TR_ID=%s 메시지=%s → 판정: MOCK_UNSUPPORTED_ORDER_TYPE",
+                order_session, ord_dvsn, tr_id, enriched.get("raw_msg", ""),
+            )
+        return enriched
 
     def cancel_order(
         self,

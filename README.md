@@ -936,3 +936,60 @@ python src/monitor_take_profit.py --mode mock --loop --sleep 5
 ```bash
 reports/take_profit_monitor_YYYYMMDD.csv
 ```
+
+## 실전 주문 전환 절차
+
+실전 주문은 기본값으로 차단되어 있습니다. 전체 후보 리스트 실전매수도 기본 비활성화 상태이며, 먼저 개별 종목 1주 또는 소액 테스트만 허용하도록 설계했습니다.
+
+1. MOCK 주문으로 충분히 테스트합니다.
+2. `.env`에 실전 API 키와 계좌번호를 확인합니다.
+3. 앱의 `API 설정` 화면에서 실전 주문 관련 체크박스 5개를 모두 직접 체크합니다.
+4. `실전 개별 주문 테스트 모드 켜기`를 눌러 안전조건을 저장합니다.
+5. `실전 준비상태 점검 실행`으로 REAL API, 계좌조회, 주문가능금액, 안전조건을 확인합니다.
+6. `예산배분 및 주문` 화면의 `개별 종목 주문 테스트`에서 REAL을 선택합니다.
+7. 주문 미리보기를 확인하고 최종 확인 체크박스를 체크한 뒤 `REAL 주문 실행`을 누릅니다.
+
+점검 명령어:
+
+```bash
+python src/real_order_readiness_check.py
+python src/real_order_test.py --stock-code 005930 --quantity 1 --dry-run
+python src/real_order_test.py --stock-code 005930 --quantity 1 --execute
+```
+
+주의:
+
+- `--execute`는 조건이 모두 충족된 경우 실제 자금으로 주문을 시도합니다.
+- 시장가 주문은 기본 차단되며, 지정가 1주 또는 설정된 최대 주문금액 이내만 허용됩니다.
+- 이 프로그램은 +2% 익절 목표 전략을 사용할 수 있지만 수익을 보장하지 않습니다.
+- 전체 리스트 실전매수는 별도 고급 옵션이며 기본 차단 상태를 유지합니다.
+
+## 매도방식 선택
+
+매수 시 매수전략과 별도로 포지션별 매도방식을 선택할 수 있습니다.
+
+1. 기본 자동매도
+   +2% 도달 시 전량 매도하고, -3% 도달 시 손절합니다.
+
+2. 강한 장 트레일링 매도
+   +2% 도달 후 시장이 강하면 일부를 보유하고, 고점 대비 하락 시 트레일링 스탑으로 매도합니다.
+
+3. 수동매도 전까지 보유
+   +2% 도달해도 자동매도하지 않고 알림만 표시합니다. 사용자가 직접 매도 버튼을 눌러야 매도됩니다.
+
+주의:
+
+- 수동보유는 수익을 더 추구할 수 있지만 손실로 전환될 수 있습니다.
+- 자동매도는 감시 프로그램이 실행 중일 때만 작동합니다.
+- REAL 주문은 기존 SafetyGate 안전장치가 충족된 경우에만 가능합니다.
+- 이 프로그램은 +2% 익절 목표 전략을 사용할 수 있지만 수익을 보장하지 않습니다.
+
+CLI 예:
+
+```bash
+python src/buy_candidate_list.py --file reports/predictions/top100_20260609.csv --budget 5000000 --mode mock --strategy morning_0930 --sell-policy fixed_2pct
+python src/buy_candidate_list.py --file reports/predictions/top100_20260609.csv --budget 5000000 --mode mock --strategy morning_0930 --sell-policy market_strength_trailing
+python src/buy_candidate_list.py --file reports/predictions/top100_20260609.csv --budget 5000000 --mode mock --strategy morning_0930 --sell-policy manual_hold
+python src/monitor_take_profit.py --mode mock --sell-policy market_strength_trailing --policy-override
+python src/monitor_take_profit.py --mode mock --loop --sleep 5
+```

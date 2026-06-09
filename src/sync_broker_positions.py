@@ -60,9 +60,12 @@ def sync_broker_positions(mode: str = "mock", strategy: str = "morning_0930", co
                 stop_loss_rate=strategy_cfg["stop_loss_rate"],
                 allowed_sell_sessions=strategy_cfg["allowed_sell_sessions"],
                 source="broker",
+                replace_existing=True,
+                sell_policy_id=(getattr(existing, "sell_policy_id", "") if existing else ""),
             )
             pos.current_price = current_price
             pos.avg_price = avg_price
+            pos.profit_loss_rate = float(row.get("pnl_rate", 0) or 0)
             pos.target_price = adjust_price_to_tick(round(avg_price * 1.02), side="sell", method="ceil")
             pos.stop_price = adjust_price_to_tick(round(avg_price * 0.97), side="sell", method="ceil")
             pos.stop_loss_price = pos.stop_price

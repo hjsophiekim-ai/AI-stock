@@ -30,6 +30,7 @@ models/*.pkl
 models/*.joblib
 models/*.bin
 models/kis_token_cache.json
+data/*token_cache.json
 
 # 리포트
 reports/

@@ -18,7 +18,7 @@ from prediction_service import (
     run_force_trade_selector, run_no_trade_analysis,
     get_today_str, get_top20_path, get_force_candidates_path,
 )
-from trading_service import run_buy_candidates
+from trading_service import run_buy_candidates, list_sell_policies
 from tables import render_candidates_table
 from warning_box import force_trade_disclaimer, no_profit_guarantee_notice
 from mode_badge import render_mode_badge, render_mode_warning
@@ -246,6 +246,15 @@ if df_top100 is not None and not df_top100.empty:
     except Exception:
         strategy_id = "morning_0930" if "장초반" in strategy_label else "afternoon_1500"
 
+    sell_policies = list_sell_policies()
+    policy_labels = {p["name"]: p["id"] for p in sell_policies}
+    policy_descriptions = {p["id"]: p.get("description", "") for p in sell_policies}
+    selected_policy_label = st.radio("매도방식 선택", list(policy_labels.keys()), horizontal=True, index=0)
+    sell_policy_id = policy_labels[selected_policy_label]
+    st.caption(policy_descriptions.get(sell_policy_id, ""))
+    if sell_policy_id == "manual_hold":
+        st.warning("수동매도 전까지 보유를 선택하면 +2%에 도달해도 자동매도되지 않습니다.")
+
     s_col1, s_col2, s_col3, s_col4 = st.columns(4)
     with s_col1:
         order_mode = st.selectbox("주문 모드", ["MOCK", "PAPER", "REAL"], index=0)
@@ -272,6 +281,7 @@ if df_top100 is not None and not df_top100.empty:
                     candidate_file=candidate_file, budget=int(buy_budget),
                     mode=order_mode.lower(), strategy_id=strategy_id,
                     max_orders=int(max_ord), refresh_prices=do_refresh,
+                    sell_policy_id=sell_policy_id,
                 )
             if not isinstance(r, dict):
                 st.error("매수 반환값 오류")
@@ -295,6 +305,7 @@ if df_top100 is not None and not df_top100.empty:
                     mode=order_mode.lower(), strategy_id=strategy_id,
                     max_orders=len(sel_codes), selected_codes=[str(c) for c in sel_codes],
                     refresh_prices=do_refresh,
+                    sell_policy_id=sell_policy_id,
                 )
             if not isinstance(r, dict):
                 st.error("매수 반환값 오류")
@@ -313,6 +324,7 @@ if df_top100 is not None and not df_top100.empty:
                     candidate_file=candidate_file, budget=int(buy_budget),
                     mode=order_mode.lower(), strategy_id=strategy_id,
                     max_orders=int(max_ord), preview_only=True,
+                    sell_policy_id=sell_policy_id,
                 )
             if not isinstance(r, dict):
                 st.error("미리보기 반환값 오류")

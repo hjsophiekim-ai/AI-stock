@@ -199,6 +199,61 @@ class SafetyGate:
             "force_trade.allow_real_test_order=true": ft.get("allow_real_test_order", False),
         }
 
+    def get_real_order_conditions(self) -> dict:
+        """Return all conditions required for a REAL single-stock test order."""
+        safety = self.cfg.get("safety", {})
+        ft = self.cfg.get("force_trade", {})
+        real_trade = self.cfg.get("real_trade", {})
+        return {
+            "live_trade=true": bool(self.cfg.get("live_trade", False)),
+            "paper_trade=false": not bool(self.cfg.get("paper_trade", True)),
+            "kis.use_mock=false": not bool(self.cfg.get("kis", {}).get("use_mock", True)),
+            "safety.confirm_live_trade=true": bool(safety.get("confirm_live_trade", False)),
+            "safety.allow_real_test_order=true": bool(safety.get("allow_real_test_order", False)),
+            "force_trade.allow_real_test_order=true": bool(ft.get("allow_real_test_order", False)),
+            "real_trade.enabled=true": bool(real_trade.get("enabled", False)),
+            "real_trade.allow_single_stock_test=true": bool(real_trade.get("allow_single_stock_test", False)),
+            "real_trade.real_order_confirmed_by_user=true": bool(real_trade.get("real_order_confirmed_by_user", False)),
+        }
+
+    def is_real_single_test_allowed(self) -> bool:
+        return self.mode == TRADE_MODE_REAL and all(self.get_real_order_conditions().values())
+
+    def assert_can_place_real_single_order(self, amount: int, quantity: int, order_type: str = "limit") -> None:
+        conditions = self.get_real_order_conditions()
+        failed = [k for k, v in conditions.items() if not v]
+        if self.mode != TRADE_MODE_REAL:
+            failed.append(f"resolved_mode=REAL (current={self.mode})")
+        if failed:
+            raise RuntimeError("REAL single-stock test blocked: " + ", ".join(failed))
+        real_trade = self.cfg.get("real_trade", {})
+        safety = self.cfg.get("safety", {})
+        max_amount = int(real_trade.get("max_single_test_amount", safety.get("max_real_test_order_amount", 10_000)))
+        max_qty = int(real_trade.get("max_single_test_quantity", safety.get("max_real_test_quantity", 1)))
+        if amount > max_amount:
+            raise RuntimeError(f"REAL single-stock test amount limit exceeded: {amount:,} > {max_amount:,}")
+        if quantity > max_qty:
+            raise RuntimeError(f"REAL single-stock test quantity limit exceeded: {quantity} > {max_qty}")
+        if order_type != real_trade.get("allowed_order_type", "limit"):
+            raise RuntimeError(f"REAL order type blocked: {order_type}")
+        if order_type == "market" and not bool(real_trade.get("allow_market_order", False)):
+            raise RuntimeError("REAL market order is disabled")
+
+    def assert_can_place_real_bulk_order(self, amount: int) -> None:
+        failed = []
+        real_trade = self.cfg.get("real_trade", {})
+        ft = self.cfg.get("force_trade", {})
+        if not self.is_real_single_test_allowed():
+            failed.extend([k for k, v in self.get_real_order_conditions().items() if not v])
+        if not bool(real_trade.get("allow_bulk_buy", False)):
+            failed.append("real_trade.allow_bulk_buy=true")
+        if not bool(ft.get("allow_real_bulk_order", False)):
+            failed.append("force_trade.allow_real_bulk_order=true")
+        if bool(self.cfg.get("safety", {}).get("block_real_bulk_order", True)):
+            failed.append("safety.block_real_bulk_order=false")
+        if failed:
+            raise RuntimeError("REAL bulk order blocked: " + ", ".join(failed))
+
     def assert_real_test_order_allowed(self, order_amount: int = 0) -> None:
         """실전 테스트 주문 가능 여부 검증.
 

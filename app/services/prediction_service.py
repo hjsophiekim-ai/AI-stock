@@ -5,7 +5,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 import pandas as pd
 
@@ -51,14 +51,15 @@ def load_force_candidates(date_str: Optional[str] = None) -> Optional[pd.DataFra
     return pd.read_csv(p, encoding="utf-8-sig")
 
 
-def run_script(script_name: str, timeout: int = 120) -> Dict:
+def run_script(script_name: str, timeout: int = 120, args: Optional[List] = None) -> Dict:
     """src/ 스크립트를 subprocess로 실행."""
     script_path = str(PROJECT_ROOT / "src" / script_name)
     if not os.path.exists(script_path):
         return {"success": False, "message": f"스크립트 없음: {script_name}"}
     try:
+        cmd = [sys.executable, script_path] + (args or [])
         result = subprocess.run(
-            [sys.executable, script_path],
+            cmd,
             capture_output=True, text=True, timeout=timeout,
             cwd=str(PROJECT_ROOT),
         )
@@ -69,6 +70,66 @@ def run_script(script_name: str, timeout: int = 120) -> Dict:
         return {"success": False, "message": f"{script_name} 타임아웃 ({timeout}초)"}
     except Exception as e:
         return {"success": False, "message": f"{script_name} 오류: {e}"}
+
+
+def run_full_pipeline(
+    years: int = 3,
+    limit: Optional[int] = None,
+    budget: Optional[int] = None,
+    top_n: int = 100,
+) -> Dict:
+    """전체 AI 예측 파이프라인 실행. 항상 dict를 반환한다 — 절대 None 반환 없음."""
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from run_ai_prediction_pipeline import run_pipeline
+        result = run_pipeline(years=years, limit=limit, budget=budget, top_n=top_n)
+        if not isinstance(result, dict):
+            return {
+                "success": False, "stage": "unknown",
+                "message": f"파이프라인 반환값이 dict가 아님: {type(result).__name__}",
+                "errors": ["None or non-dict result from run_pipeline"],
+                "created_files": [], "predictions_file": None, "top100_file": None,
+            }
+        return result
+    except ImportError:
+        r = run_script("run_ai_prediction_pipeline.py", timeout=3600)
+        if not isinstance(r, dict):
+            return {"success": False, "stage": "import_fallback", "message": "subprocess 반환값 없음", "errors": []}
+        return r
+    except Exception as ex:
+        return {
+            "success": False, "stage": "exception",
+            "message": f"파이프라인 오류: {ex}",
+            "errors": [str(ex)], "created_files": [],
+            "predictions_file": None, "top100_file": None,
+        }
+
+
+def run_backtest_service(
+    start_date: str = "2024-01-01",
+    end_date: str = "2024-12-31",
+    top_n: int = 20,
+    strategy_id: str = "morning_0930",
+) -> Dict:
+    """백테스트 실행 서비스. 항상 dict를 반환한다."""
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from backtest import run_backtest
+        result = run_backtest(
+            start_date=start_date, end_date=end_date,
+            top_n=top_n, strategy_id=strategy_id,
+        )
+        if not isinstance(result, dict):
+            return {"success": False, "stage": "unknown", "message": "백테스트 None 반환", "errors": []}
+        return result
+    except ImportError:
+        r = run_script("backtest.py", args=["--start", start_date, "--end", end_date,
+                                            "--top-n", str(top_n), "--strategy", strategy_id], timeout=300)
+        if not isinstance(r, dict):
+            return {"success": False, "stage": "import_fallback", "message": "subprocess 반환값 없음", "errors": []}
+        return r
+    except Exception as ex:
+        return {"success": False, "stage": "exception", "message": f"백테스트 오류: {ex}", "errors": [str(ex)]}
 
 
 def run_force_trade_selector(date_str: Optional[str] = None, min_candidates: int = 1) -> Dict:

@@ -202,7 +202,23 @@ def main() -> None:
         help="특정 전략 포지션만 감시 (기본값: 전체 감시)",
     )
     parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--sell-policy", default=None, choices=["fixed_2pct", "market_strength_trailing", "manual_hold"])
+    parser.add_argument("--policy-override", action="store_true")
     args = parser.parse_args()
+
+    if args.sell_policy:
+        from monitor_take_profit import monitor_once
+        import json
+        result = monitor_once(
+            mode="mock",
+            strategy=args.strategy,
+            config_path=args.config,
+            sell_now=True,
+            sell_policy_id=args.sell_policy,
+            policy_override=args.policy_override,
+        )
+        print(json.dumps({k: v for k, v in result.items() if k != "rows"}, ensure_ascii=False, indent=2))
+        return
 
     monitor = ForceSellMonitor(args.config)
     strategy_label = f" [전략: {args.strategy}]" if args.strategy else " [전체 전략]"

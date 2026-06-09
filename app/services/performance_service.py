@@ -182,6 +182,7 @@ def get_summary() -> Dict:
     cum_return = calc_cumulative_return(df=order_df)
 
     trade_reasons: Dict[str, int] = {"take_profit": 0, "stop_loss": 0, "forced_exit": 0}
+    sell_policy_summary: Dict[str, Dict[str, float]] = {}
     if not order_df.empty and "reason" in order_df.columns:
         for r, g in order_df.groupby("reason"):
             key = str(r)
@@ -191,6 +192,23 @@ def get_summary() -> Dict:
                 trade_reasons["stop_loss"] += len(g)
             elif "force" in key or "exit" in key:
                 trade_reasons["forced_exit"] += len(g)
+
+    if not order_df.empty and "sell_policy_id" in order_df.columns:
+        for policy_id, g in order_df.groupby("sell_policy_id"):
+            sells = g[g.get("side", "") == "sell"] if "side" in g.columns else g
+            sell_policy_summary[str(policy_id)] = {
+                "trade_count": float(len(sells)),
+                "realized_pnl": float(calc_realized_pnl(sells)) if not sells.empty else 0.0,
+            }
+
+    for pos in positions:
+        policy_id = str(pos.get("sell_policy_id", "unknown"))
+        item = sell_policy_summary.setdefault(policy_id, {"trade_count": 0.0, "realized_pnl": 0.0})
+        item["open_positions"] = item.get("open_positions", 0.0) + 1
+        ep = float(pos.get("entry_price", 0) or 0)
+        cp = float(pos.get("current_price", 0) or 0)
+        if ep > 0 and cp >= ep * 1.02 and bool(pos.get("manual_only", False)):
+            item["manual_hold_target_reached"] = item.get("manual_hold_target_reached", 0.0) + 1
 
     return {
         "total_trades": total_trades,
@@ -203,4 +221,5 @@ def get_summary() -> Dict:
         "stop_loss_count": trade_reasons["stop_loss"],
         "forced_exit_count": trade_reasons["forced_exit"],
         "position_count": len(positions),
+        "sell_policy_summary": sell_policy_summary,
     }

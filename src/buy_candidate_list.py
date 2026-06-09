@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from budget_allocator import BudgetAllocator
 from price_tick import get_tick_size
 from strategy_config import get_strategy, validate_strategy_id
+from sell_policy import get_sell_policy, validate_sell_policy
 from utils import ensure_dir, setup_logger
 
 logger = setup_logger(__name__, "logs/buy_candidate_list.log")
@@ -151,6 +152,7 @@ def buy_candidates(
     preview_only: bool = False,
     allow_outside_window: bool = True,
     allow_additional_buy: bool = False,
+    sell_policy_id: str = "fixed_2pct",
 ) -> dict:
     errors: list = []
     mode = (mode or "paper").lower()
@@ -162,8 +164,11 @@ def buy_candidates(
             return {"success": False, "message": f"file not found: {candidate_file}", "errors": [candidate_file], "orders_placed": 0, "allocation_preview": []}
         if not validate_strategy_id(strategy_id):
             return {"success": False, "message": f"invalid strategy_id: {strategy_id}", "errors": [strategy_id], "orders_placed": 0, "allocation_preview": []}
+        if not validate_sell_policy(sell_policy_id):
+            return {"success": False, "message": f"invalid sell_policy_id: {sell_policy_id}", "errors": [sell_policy_id], "orders_placed": 0, "allocation_preview": []}
 
         strategy_cfg = get_strategy(strategy_id)
+        sell_policy = get_sell_policy(sell_policy_id)
         df = _load_candidates(candidate_file, selected_codes)
         if df.empty:
             return {"success": False, "message": "no candidates after filtering", "errors": ["no candidates"], "orders_placed": 0, "allocation_preview": []}
@@ -201,6 +206,8 @@ def buy_candidates(
             "remaining_budget": int(alloc_result.remaining_budget),
             "strategy_id": strategy_id,
             "strategy_name": strategy_cfg["name"],
+            "sell_policy_id": sell_policy["id"],
+            "sell_policy_name": sell_policy["name"],
         }
         _save_budget_usage(base_result, allocations, today)
 
@@ -214,6 +221,8 @@ def buy_candidates(
             a["take_profit_rate"] = strategy_cfg["take_profit_rate"]
             a["stop_loss_rate"] = strategy_cfg["stop_loss_rate"]
             a["force_exit_rule"] = strategy_cfg["force_exit_rule"]
+            a["sell_policy_id"] = sell_policy["id"]
+            a["sell_policy_name"] = sell_policy["name"]
 
         preview = [{
             "strategy_id": a["strategy_id"],
@@ -229,6 +238,8 @@ def buy_candidates(
             "remaining_budget": int(a.get("remaining_budget", 0)),
             "take_profit_rate": a["take_profit_rate"],
             "stop_loss_rate": a["stop_loss_rate"],
+            "sell_policy_id": a["sell_policy_id"],
+            "sell_policy_name": a["sell_policy_name"],
         } for a in allocations]
 
         if preview_only:
@@ -255,6 +266,8 @@ def buy_candidates(
                 "tick_size": a.get("tick_size", get_tick_size(price)),
                 "quantity": qty,
                 "order_amount": int(a["order_amount"]),
+                "sell_policy_id": a["sell_policy_id"],
+                "sell_policy_name": a["sell_policy_name"],
             })
             order_results.append(order_r)
             if order_r.get("success"):
@@ -272,6 +285,7 @@ def buy_candidates(
                     allowed_sell_sessions=strategy_cfg["allowed_sell_sessions"],
                     buy_window=f"{strategy_cfg['buy_window_start']}~{strategy_cfg['buy_window_end']}",
                     force_exit_rule=strategy_cfg["force_exit_rule"],
+                    sell_policy_id=a["sell_policy_id"],
                 )
             else:
                 errors.append(f"{code} order failed: {order_r.get('rejected_reason') or order_r.get('reason') or order_r.get('msg', '')}")
@@ -307,6 +321,7 @@ def main() -> None:
     parser.add_argument("--refresh-prices", action="store_true")
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--allow-additional-buy", action="store_true")
+    parser.add_argument("--sell-policy", default="fixed_2pct", choices=["fixed_2pct", "market_strength_trailing", "manual_hold"])
     args = parser.parse_args()
 
     selected = [c.strip() for c in args.selected_codes.split(",")] if args.selected_codes else None
@@ -321,6 +336,7 @@ def main() -> None:
         refresh_prices=args.refresh_prices,
         preview_only=args.preview,
         allow_additional_buy=args.allow_additional_buy,
+        sell_policy_id=args.sell_policy,
     )
     print(json.dumps({
         "success": result.get("success"),
@@ -332,6 +348,8 @@ def main() -> None:
         "effective_budget": result.get("effective_budget", 0),
         "expected_order_amount": result.get("expected_order_amount", 0),
         "remaining_budget": result.get("remaining_budget", 0),
+        "sell_policy_id": result.get("sell_policy_id", ""),
+        "sell_policy_name": result.get("sell_policy_name", ""),
         "errors": result.get("errors", [])[:3],
     }, ensure_ascii=False, indent=2))
     if not result.get("success"):

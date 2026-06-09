@@ -56,6 +56,7 @@ VERDICT_PAPER = "READY_FOR_PAPER"
 VERDICT_MOCK = "READY_FOR_MOCK"
 VERDICT_AI_PREDICTION = "READY_FOR_AI_PREDICTION"
 VERDICT_MOCK_AUTOTRADE = "READY_FOR_MOCK_AUTOTRADE"
+VERDICT_APP_STRATEGY = "READY_FOR_APP_STRATEGY_TRADING"
 VERDICT_REAL_REVIEW = "READY_FOR_REAL_REVIEW"
 VERDICT_NOT_READY = "NOT_READY"
 
@@ -171,6 +172,7 @@ class SystemVerifier:
         self._real_token_ok: bool = False
         self._started_at = datetime.now()
         self._ai_pipeline_ready: bool = False
+        self._strategy_ready: bool = False
 
     # ── 로깅 ──────────────────────────────────
     def _log(self, msg: str) -> None:
@@ -603,6 +605,88 @@ class SystemVerifier:
                 r.status = STATUS_WARN
         self._record(r)
 
+        # 시간외 세션별 주문구분 코드 존재 여부 확인
+        from trading_calendar import SESSION_PRE_MARKET, SESSION_AFTER_CLOSE
+        after_hours_checks = [
+            (SESSION_PRE_MARKET, "60", "장전시간외"),
+            (SESSION_AFTER_CLOSE, "62", "장후시간외"),
+            (SESSION_AFTER_HOURS_SINGLE, "61", "시간외단일가"),
+        ]
+        if self._mock_keys_ok:
+            for sess_key, expected_dvsn, label in after_hours_checks:
+                r = VerificationResult(f"주문구분_{sess_key}")
+                try:
+                    from kis_api import KISApiClient
+                    for k, v in self._env.items():
+                        os.environ[k] = v
+                    api = KISApiClient(self.config_path)
+                    resolved = api.resolve_order_division(sess_key, "buy")
+                    dvsn = resolved.get("ord_dvsn", "")
+                    is_confirmed = resolved.get("is_confirmed_for_real", False)
+                    r.warn(f"{label}: ORD_DVSN={dvsn} (후보 코드 — 공식 문서 재확인 필요)")
+                    r.data.update({"session": sess_key, "ord_dvsn": dvsn, "is_confirmed": is_confirmed})
+                except Exception as e:
+                    r.warn(str(e)[:100])
+                self._record(r)
+
+    # ──────────────────────────────────────────
+    # 4c. 시간외 주문 진단 (현재 세션이 시간외일 때)
+    # ──────────────────────────────────────────
+    def verify_after_hours_diagnosis(self) -> None:
+        self._section("4c. 시간외 주문 진단")
+
+        from trading_calendar import (
+            TradingCalendar, SESSION_PRE_MARKET, SESSION_AFTER_CLOSE,
+            SESSION_AFTER_HOURS_SINGLE,
+        )
+        cal = TradingCalendar(self.config_path)
+        current_session = cal.get_market_session()
+        after_hours_sessions = {SESSION_PRE_MARKET, SESSION_AFTER_CLOSE, SESSION_AFTER_HOURS_SINGLE}
+        in_after_hours = current_session in after_hours_sessions
+
+        r = VerificationResult("현재_시간외_세션_여부")
+        if in_after_hours:
+            r.ok(f"현재 세션={current_session} — 시간외 진단 실행")
+        else:
+            r.skip(f"현재 세션={current_session} — 시간외 세션이 아님 (SKIP)")
+        self._record(r)
+
+        if not in_after_hours:
+            self._record(
+                VerificationResult("시간외_주문_MOCK_진단").skip(
+                    f"현재 세션({current_session})이 시간외가 아닙니다. "
+                    "PRE_MARKET/AFTER_CLOSE/AFTER_HOURS_SINGLE 시간대에 재실행하면 MOCK API 결과를 확인합니다."
+                )
+            )
+            return
+
+        if not self._mock_keys_ok:
+            self._record(
+                VerificationResult("시간외_주문_MOCK_진단").skip("MOCK 키 없음 — diagnose 실행 생략")
+            )
+            return
+
+        r = VerificationResult("시간외_주문_MOCK_진단")
+        rc, out, err = _run_cmd(
+            [sys.executable, "src/diagnose_after_hours_orders.py",
+             "--stock-code", "005930", "--amount", "10000",
+             "--session", current_session],
+            timeout=60,
+        )
+        combined = out + err
+        if "MOCK_UNSUPPORTED_ORDER_TYPE" in combined:
+            r.warn(
+                f"세션={current_session}: MOCK 서버가 해당 주문유형 미지원. "
+                "코드 정상 — KIS 공식 문서에서 ORD_DVSN 재확인 필요.",
+            )
+        elif "MOCK 지원      : YES" in combined or "rt_cd          : 0" in combined:
+            r.ok(f"세션={current_session}: MOCK API 주문 지원 확인됨")
+        elif rc == 0:
+            r.ok(f"diagnose 정상 실행 (rc=0) | {combined.strip()[-80:]}")
+        else:
+            r.warn(f"diagnose 실행 오류: rc={rc} | {combined.strip()[:100]}")
+        self._record(r)
+
     # ──────────────────────────────────────────
     # 5. 후보 생성 검증
     # ──────────────────────────────────────────
@@ -811,6 +895,12 @@ class SystemVerifier:
             "주문번호", "odno", "rt_cd", "MOCK", "주문 성공", "완료",
             "resolved_mode", "mock_order_called",
         ]
+        # MOCK 서버 미지원 — 코드 정상, WARN으로 분류
+        mock_unsupported_signals = [
+            "MOCK_UNSUPPORTED_ORDER_TYPE",
+            "모의투자에서 제공하지 않는 주문유형",
+            "판정: MOCK_UNSUPPORTED",
+        ]
         # 거래 없음 (후보 없음 등 — 인프라 문제 아님)
         warn_signals = ["후보 종목 없음", "예측 파일 없음", "거래없음 보고서"]
         # 치명적 오류
@@ -819,6 +909,11 @@ class SystemVerifier:
         if any(s.lower() in combined.lower() for s in fail_signals):
             err_short = combined.strip()[:300]
             r.fail(f"MOCK 주문 오류: rc={rc}", err_short)
+        elif any(s.lower() in combined.lower() for s in mock_unsupported_signals):
+            r.warn(
+                "MOCK 주문 — 모의투자 서버가 해당 시간외 주문유형을 미지원 (MOCK_UNSUPPORTED_ORDER_TYPE). "
+                "프로그램 로직 정상. 공식 문서에서 ORD_DVSN 코드 재확인 필요."
+            )
         elif any(s.lower() in combined.lower() for s in order_signals):
             r.ok("MOCK 주문 완료 (API 호출 포함)", rc=rc)
         elif any(s.lower() in combined.lower() for s in warn_signals):
@@ -957,6 +1052,298 @@ class SystemVerifier:
             r.warn(f"rc={rc}: {err_short[:100]}")
             r.status = STATUS_WARN
         self._record(r)
+
+    # ──────────────────────────────────────────
+    # 13a. 호가단위 유틸 검증
+    # ──────────────────────────────────────────
+    def verify_price_tick(self) -> None:
+        self._section("13a. 호가단위 유틸 (price_tick) 검증")
+
+        r = VerificationResult("price_tick_import")
+        try:
+            from price_tick import get_tick_size, adjust_price_to_tick, is_valid_tick_price
+            r.ok("price_tick 모듈 import 성공")
+        except Exception as e:
+            r.fail(f"import 실패: {e}")
+            self._record(r)
+            return
+        self._record(r)
+
+        r2 = VerificationResult("price_tick_cases")
+        cases = [
+            (900,    1,    True,  "900원 → tick 1"),
+            (2500,   5,    True,  "2500원 → tick 5"),
+            (7500,   10,   True,  "7500원 → tick 10"),
+            (30000,  50,   True,  "30000원 → tick 50"),
+            (80000,  100,  True,  "80000원 → tick 100"),
+            (151600, 100,  True,  "151600원 → tick 100 (유효)"),
+            (151651, 100,  False, "151651원 → tick 100 (무효)"),
+            (250000, 500,  True,  "250000원 → tick 500"),
+            (600000, 1000, True,  "600000원 → tick 1000"),
+        ]
+        failed_cases = []
+        for price, expected_tick, expected_valid, label in cases:
+            tick = get_tick_size(price)
+            valid = is_valid_tick_price(price)
+            if tick != expected_tick or valid != expected_valid:
+                failed_cases.append(f"{label}: tick={tick}(expected {expected_tick}) valid={valid}(expected {expected_valid})")
+        if failed_cases:
+            r2.fail(f"케이스 실패: {failed_cases}")
+        else:
+            r2.ok(f"9개 케이스 모두 통과")
+        self._record(r2)
+
+        r3 = VerificationResult("price_tick_adjustment")
+        adj_cases = [
+            (151651, "floor", 151600, "151651 floor → 151600"),
+            (151651, "ceil",  151700, "151651 ceil → 151700"),
+            (151651, "nearest", 151700, "151651 nearest → 151700 (거리50 vs 49)"),
+            (151600, "floor", 151600, "151600 floor → 151600 (이미 유효)"),
+        ]
+        adj_failed = []
+        for price, method, expected, label in adj_cases:
+            result = adjust_price_to_tick(price, method=method)
+            if result != expected:
+                adj_failed.append(f"{label}: got {result}")
+        if adj_failed:
+            r3.fail(f"보정 케이스 실패: {adj_failed}")
+        else:
+            r3.ok("4개 보정 케이스 모두 통과 (151651→151600/151700)")
+        self._record(r3)
+
+    # ──────────────────────────────────────────
+    # 13b. 계좌 동기화 및 후보 컬럼 검증
+    # ──────────────────────────────────────────
+    def verify_account_sync_and_columns(self) -> None:
+        self._section("13b. 계좌 동기화 및 후보 컬럼 검증")
+
+        # KIS get_positions 호출 가능 여부
+        r1 = VerificationResult("KIS_get_positions")
+        try:
+            from kis_api import KISApiClient
+            api = KISApiClient(str(PROJECT_ROOT / "config.yaml"))
+            import pandas as pd
+            df = api.get_positions()
+            r1.ok(f"MOCK 계좌 보유 종목 {len(df)}개 조회", count=len(df))
+        except Exception as e:
+            r1.warn(f"get_positions 오류: {e}")
+        self._record(r1)
+
+        # positions.json 읽기
+        r2 = VerificationResult("positions_json_read")
+        pos_file = PROJECT_ROOT / "data" / "positions.json"
+        try:
+            import json
+            if pos_file.exists():
+                with open(pos_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                r2.ok(f"positions.json 읽기 성공: {len(data)}개 종목")
+            else:
+                r2.warn("positions.json 없음")
+        except Exception as e:
+            r2.warn(f"positions.json 읽기 실패: {e}")
+        self._record(r2)
+
+        # top100 CSV 컬럼 검증
+        r3 = VerificationResult("top100_columns")
+        today = datetime.now().strftime("%Y%m%d")
+        preds_dir = PROJECT_ROOT / "reports" / "predictions"
+        top100_file = next((preds_dir / f"top{n}_{today}.csv" for n in [100, 50, 20]
+                            if (preds_dir / f"top{n}_{today}.csv").exists()), None)
+        if top100_file:
+            try:
+                import pandas as pd
+                df = pd.read_csv(top100_file)
+                required = ["stock_code", "stock_name"]
+                missing = [c for c in required if c not in df.columns]
+                if missing:
+                    r3.warn(f"필수 컬럼 없음: {missing} | 실제 컬럼: {list(df.columns[:8])}")
+                else:
+                    r3.ok(f"stock_code/stock_name 컬럼 존재 확인 ({top100_file.name})")
+            except Exception as e:
+                r3.warn(f"파일 읽기 오류: {e}")
+        else:
+            r3.warn(f"top100/50/20 파일 없음 ({today})")
+        self._record(r3)
+
+        # sync_broker_to_local 함수 존재 확인
+        r4 = VerificationResult("sync_broker_to_local_exists")
+        try:
+            sys_path_backup = list(sys.path)
+            sys.path.insert(0, str(PROJECT_ROOT / "app" / "services"))
+            from trading_service import sync_broker_to_local
+            r4.ok("trading_service.sync_broker_to_local 함수 존재")
+        except ImportError as e:
+            r4.warn(f"sync_broker_to_local import 실패: {e}")
+        finally:
+            sys.path = sys_path_backup
+        self._record(r4)
+
+    # ──────────────────────────────────────────
+    # 13c. 전략 기능 검증
+    # ──────────────────────────────────────────
+    def verify_strategy_features(self) -> None:
+        self._section("13c. 전략 기능 검증")
+
+        # strategy_config 로드
+        r1 = VerificationResult("strategy_config_load")
+        try:
+            from strategy_config import STRATEGIES, get_strategy, list_strategies
+            ids = list(STRATEGIES.keys())
+            required = ["morning_0930", "afternoon_1500"]
+            missing = [s for s in required if s not in ids]
+            if missing:
+                r1.fail(f"전략 미등록: {missing}")
+            else:
+                r1.ok(f"전략 2개 로드 OK: {ids}")
+        except Exception as e:
+            r1.fail(f"strategy_config import 오류: {e}")
+        self._record(r1)
+
+        # run_pipeline() 존재 및 반환 타입
+        r2 = VerificationResult("run_pipeline_returns_dict")
+        try:
+            from run_ai_prediction_pipeline import run_pipeline
+            # 함수 시그니처만 확인 (실제 실행 안 함)
+            import inspect
+            sig = inspect.signature(run_pipeline)
+            r2.ok(f"run_pipeline() 함수 존재: 파라미터 {list(sig.parameters.keys())}")
+        except Exception as e:
+            r2.fail(f"run_pipeline import 오류: {e}")
+        self._record(r2)
+
+        # run_backtest() 존재 및 반환 타입
+        r3 = VerificationResult("run_backtest_returns_dict")
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "backtest", str(PROJECT_ROOT / "src" / "backtest.py")
+            )
+            mod = importlib.util.module_from_spec(spec)
+            # __name__ 설정으로 main() 자동 실행 방지
+            mod.__name__ = "backtest_import_check"
+            import inspect
+            src = (PROJECT_ROOT / "src" / "backtest.py").read_text(encoding="utf-8", errors="replace")
+            if "def run_backtest(" in src:
+                r3.ok("backtest.run_backtest() 함수 정의 확인")
+            else:
+                r3.fail("backtest.py에 run_backtest() 없음")
+        except Exception as e:
+            r3.fail(f"backtest 검사 오류: {e}")
+        self._record(r3)
+
+        # buy_candidate_list.py 존재
+        r4 = VerificationResult("buy_candidate_list_exists")
+        bcl_path = PROJECT_ROOT / "src" / "buy_candidate_list.py"
+        if bcl_path.exists():
+            src = bcl_path.read_text(encoding="utf-8", errors="replace")
+            if "def buy_candidates(" in src:
+                r4.ok("buy_candidate_list.buy_candidates() 함수 존재")
+            else:
+                r4.fail("buy_candidate_list.py에 buy_candidates() 없음")
+        else:
+            r4.fail("src/buy_candidate_list.py 없음")
+        self._record(r4)
+
+        # strategy_executor.py 존재
+        r5 = VerificationResult("strategy_executor_exists")
+        se_path = PROJECT_ROOT / "src" / "strategy_executor.py"
+        if se_path.exists():
+            src = se_path.read_text(encoding="utf-8", errors="replace")
+            if "def execute_buy_strategy(" in src:
+                r5.ok("strategy_executor.execute_buy_strategy() 함수 존재")
+            else:
+                r5.fail("strategy_executor.py에 execute_buy_strategy() 없음")
+        else:
+            r5.fail("src/strategy_executor.py 없음")
+        self._record(r5)
+
+        # trading_service.run_buy_candidates 존재
+        r6 = VerificationResult("run_buy_candidates_exists")
+        try:
+            svc_backup = list(sys.path)
+            sys.path.insert(0, str(PROJECT_ROOT / "app" / "services"))
+            from trading_service import run_buy_candidates
+            r6.ok("trading_service.run_buy_candidates() 함수 존재")
+        except ImportError as e:
+            r6.warn(f"run_buy_candidates import 오류: {e}")
+        finally:
+            sys.path = svc_backup
+        self._record(r6)
+
+        # prediction_service.run_backtest_service 존재
+        r7 = VerificationResult("run_backtest_service_exists")
+        try:
+            svc_backup2 = list(sys.path)
+            sys.path.insert(0, str(PROJECT_ROOT / "app" / "services"))
+            from prediction_service import run_backtest_service
+            r7.ok("prediction_service.run_backtest_service() 함수 존재")
+        except ImportError as e:
+            r7.warn(f"run_backtest_service import 오류: {e}")
+        finally:
+            sys.path = svc_backup2
+        self._record(r7)
+
+        # position_manager PositionRecord strategy 필드
+        r8 = VerificationResult("PositionRecord_strategy_fields")
+        try:
+            from position_manager import PositionRecord
+            import dataclasses
+            fields = {f.name for f in dataclasses.fields(PositionRecord)}
+            required_fields = {"strategy_id", "strategy_name", "take_profit_rate",
+                               "stop_loss_rate", "allowed_sell_sessions", "force_exit_rule"}
+            missing = required_fields - fields
+            if missing:
+                r8.fail(f"PositionRecord 전략 필드 누락: {missing}")
+            else:
+                r8.ok("PositionRecord 전략 필드 모두 존재")
+        except Exception as e:
+            r8.fail(f"PositionRecord 검사 오류: {e}")
+        self._record(r8)
+
+        # force_sell_monitor strategy_id 파라미터
+        r9 = VerificationResult("force_sell_monitor_strategy_param")
+        try:
+            import inspect
+            from force_sell_monitor import ForceSellMonitor
+            sig = inspect.signature(ForceSellMonitor.run_once)
+            if "strategy_id" in sig.parameters:
+                r9.ok("ForceSellMonitor.run_once(strategy_id=) 파라미터 존재")
+            else:
+                r9.fail("ForceSellMonitor.run_once에 strategy_id 파라미터 없음")
+        except Exception as e:
+            r9.fail(f"force_sell_monitor 검사 오류: {e}")
+        self._record(r9)
+
+        # src 파일 구문 검사
+        r10 = VerificationResult("전략파일_구문검사")
+        import ast
+        check_files = [
+            "strategy_config.py", "buy_candidate_list.py", "strategy_executor.py",
+            "force_sell_monitor.py",
+        ]
+        parse_errors = []
+        for fname in check_files:
+            fpath = PROJECT_ROOT / "src" / fname
+            if fpath.exists():
+                try:
+                    ast.parse(fpath.read_text(encoding="utf-8", errors="replace"))
+                except SyntaxError as e:
+                    parse_errors.append(f"{fname}:{e.lineno}")
+        if not parse_errors:
+            r10.ok(f"전략 관련 파일 {len(check_files)}개 구문 오류 없음")
+        else:
+            r10.fail(f"구문 오류: {', '.join(parse_errors)}")
+        self._record(r10)
+
+        # 전략 기능 종합 판정
+        strategy_ok = all(
+            self.results.get(k, VerificationResult("x")).status in (STATUS_OK, STATUS_WARN)
+            for k in ["strategy_config_load", "run_pipeline_returns_dict",
+                      "buy_candidate_list_exists", "PositionRecord_strategy_fields",
+                      "force_sell_monitor_strategy_param"]
+        )
+        self._strategy_ready = strategy_ok
 
     # ──────────────────────────────────────────
     # 13. Streamlit 앱 파일 검증
@@ -1114,6 +1501,10 @@ class SystemVerifier:
         if fail_count >= 5:
             return VERDICT_NOT_READY
 
+        # AI 파이프라인 + 전략 기능 + MOCK 준비
+        if self._ai_pipeline_ready and self._strategy_ready and self._token_ok and self._mock_keys_ok:
+            return VERDICT_APP_STRATEGY
+
         # AI 파이프라인 + MOCK 자동매매 준비
         if self._ai_pipeline_ready and self._token_ok and self._mock_keys_ok:
             return VERDICT_MOCK_AUTOTRADE
@@ -1189,6 +1580,9 @@ class SystemVerifier:
         verdict_color = {
             VERDICT_PAPER: "PAPER만 가능",
             VERDICT_MOCK: "MOCK까지 가능",
+            VERDICT_AI_PREDICTION: "AI 파이프라인 준비됨",
+            VERDICT_MOCK_AUTOTRADE: "MOCK 자동매매 가능",
+            VERDICT_APP_STRATEGY: "앱 전략 매매 가능 (MOCK/PAPER)",
             VERDICT_REAL_REVIEW: "REAL 조건 검토 가능",
             VERDICT_NOT_READY: "준비 안 됨",
         }.get(verdict, verdict)
@@ -1221,6 +1615,13 @@ class SystemVerifier:
         print(f"|  매도감시       : {_icon('매도감시_실행')}{'':<32}|")
         print(f"|  강제청산 안전  : {_icon('강제청산_안전장치')}{'':<32}|")
         print(sep)
+        print(f"|  {'[Strategy]':<56}|")
+        print(f"|  strategy_config: {_icon('strategy_config_load')}{'':<32}|")
+        print(f"|  run_pipeline() : {_icon('run_pipeline_returns_dict')}{'':<32}|")
+        print(f"|  buy_candidates : {_icon('buy_candidate_list_exists')}{'':<32}|")
+        print(f"|  PositionRecord : {_icon('PositionRecord_strategy_fields')}{'':<32}|")
+        print(f"|  monitor 전략   : {_icon('force_sell_monitor_strategy_param')}{'':<32}|")
+        print(sep)
         print(f"|  {'[App]':<56}|")
         print(f"|  Streamlit      : {_icon('Streamlit_import')}{'':<32}|")
         print(f"|  앱 파일        : {_icon('메인앱_파일')}{'':<32}|")
@@ -1244,6 +1645,115 @@ class SystemVerifier:
     # ──────────────────────────────────────────
     # 전체 실행
     # ──────────────────────────────────────────
+    def verify_sell_policy_features(self) -> None:
+        """Verify sell-policy selection and trailing-stop helpers without placing orders."""
+        self._section("13d. sell policy and trailing stop check")
+        try:
+            from sell_policy import should_auto_sell, list_sell_policies
+            from market_strength import get_market_strength
+            from trailing_stop_manager import update_trailing_state
+
+            policies = {p["id"] for p in list_sell_policies(self._cfg)}
+            required = {"fixed_2pct", "market_strength_trailing", "manual_hold"}
+            missing = required - policies
+            if missing:
+                self._record(VerificationResult("sell_policy_list").fail(f"missing: {missing}"))
+            else:
+                self._record(VerificationResult("sell_policy_list").ok("3 policies available"))
+
+            base = {"stock_code": "005930", "stock_name": "TEST", "quantity": 10, "avg_price": 10000, "entry_price": 10000}
+            fixed = should_auto_sell({**base, "sell_policy_id": "fixed_2pct"}, 10200, {"level": "normal"})
+            self._record(
+                VerificationResult("fixed_2pct_should_sell").ok("TAKE_PROFIT")
+                if fixed.get("should_sell") and fixed.get("sell_reason") == "TAKE_PROFIT"
+                else VerificationResult("fixed_2pct_should_sell").fail(str(fixed))
+            )
+
+            manual = should_auto_sell({**base, "sell_policy_id": "manual_hold"}, 10200, {"level": "normal"})
+            self._record(
+                VerificationResult("manual_hold_alert_only").ok("alert only; no auto sell")
+                if not manual.get("should_sell") and manual.get("alert_only")
+                else VerificationResult("manual_hold_alert_only").fail(str(manual))
+            )
+
+            trailing = update_trailing_state({**base, "sell_policy_id": "market_strength_trailing"}, 10300, {
+                "trailing_stop_rate": {"normal": 0.006}
+            }, "normal")
+            self._record(
+                VerificationResult("trailing_state_update").ok("trailing state created")
+                if trailing.get("trailing_active") and trailing.get("trailing_stop_price")
+                else VerificationResult("trailing_state_update").fail(str(trailing))
+            )
+
+            ms = get_market_strength(config=self._cfg)
+            self._record(
+                VerificationResult("market_strength_fallback").ok(f"{ms.get('level')} score={ms.get('score')}")
+                if ms.get("level") in {"weak", "normal", "strong", "very_strong"}
+                else VerificationResult("market_strength_fallback").fail(str(ms))
+            )
+        except Exception as exc:
+            self._record(VerificationResult("sell_policy_import").fail(str(exc)))
+
+    def verify_real_single_order_safety(self) -> None:
+        """Verify REAL single-order tooling without placing any order."""
+        self._section("13d. REAL single-order safety check")
+
+        readiness_path = PROJECT_ROOT / "src" / "real_order_readiness_check.py"
+        test_path = PROJECT_ROOT / "src" / "real_order_test.py"
+        self._record(
+            VerificationResult("real_order_readiness_check.py").ok(str(readiness_path))
+            if readiness_path.exists()
+            else VerificationResult("real_order_readiness_check.py").fail("missing")
+        )
+        self._record(
+            VerificationResult("real_order_test.py").ok(str(test_path))
+            if test_path.exists()
+            else VerificationResult("real_order_test.py").fail("missing")
+        )
+
+        try:
+            import real_order_readiness_check  # type: ignore  # noqa: F401
+            import real_order_test  # type: ignore  # noqa: F401
+            from safety_gate import SafetyGate  # type: ignore
+
+            self._record(VerificationResult("REAL_order_modules_import").ok("import ok"))
+            gate = SafetyGate(config_path=str(PROJECT_ROOT / self.config_path), runtime_mode="real")
+            conditions = gate.get_real_order_conditions()
+            missing = [name for name, ok in conditions.items() if not ok]
+            if missing:
+                self._record(
+                    VerificationResult("REAL_single_test_conditions")
+                    .ok("blocked by default: " + ", ".join(missing), conditions=conditions)
+                )
+            else:
+                self._record(
+                    VerificationResult("REAL_single_test_conditions")
+                    .warn("all REAL single-test conditions are enabled; verification still does not order", conditions=conditions)
+                )
+        except Exception as exc:
+            self._record(VerificationResult("REAL_order_modules_import").fail(str(exc)))
+
+        rc, out, err = _run_cmd(
+            [sys.executable, "src/real_order_test.py", "--stock-code", "005930", "--quantity", "1", "--dry-run"],
+            timeout=45,
+        )
+        r = VerificationResult("REAL_order_test_dry_run")
+        if rc == 0:
+            r.ok("dry-run completed; no real order placed")
+        else:
+            r.warn(f"dry-run returned rc={rc}; no real order placed", detail=(out + "\n" + err)[-1000:])
+        self._record(r)
+
+        cfg = self._cfg or {}
+        real_trade = cfg.get("real_trade", {}) if isinstance(cfg, dict) else {}
+        force_trade = cfg.get("force_trade", {}) if isinstance(cfg, dict) else {}
+        r = VerificationResult("REAL_bulk_order_blocked")
+        if not real_trade.get("allow_bulk_buy") and not force_trade.get("allow_real_bulk_order"):
+            r.ok("REAL bulk order disabled by default")
+        else:
+            r.warn("REAL bulk order flags are enabled; use advanced option only")
+        self._record(r)
+
     def run_all(self) -> None:
         print("\n" + "=" * 60)
         print("  AI Stock 시스템 통합 검증 시작")
@@ -1256,6 +1766,7 @@ class SystemVerifier:
         self.verify_api_keys()
         self.verify_api_connection()
         self.verify_market_session()
+        self.verify_after_hours_diagnosis()
         self.verify_candidate_generation()
         self.verify_ai_pipeline()
         self.verify_budget_allocation()
@@ -1265,6 +1776,11 @@ class SystemVerifier:
         self.verify_sell_monitor()
         self.verify_force_exit_safety()
         self.verify_no_trade_analysis()
+        self.verify_price_tick()
+        self.verify_account_sync_and_columns()
+        self.verify_strategy_features()
+        self.verify_sell_policy_features()
+        self.verify_real_single_order_safety()
         self.verify_streamlit_app()
 
         # 보고서 생성

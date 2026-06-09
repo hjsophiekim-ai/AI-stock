@@ -220,5 +220,149 @@ def main() -> None:
     print("=" * 60)
 
 
+def run_pipeline(
+    years: int = 3,
+    limit=None,
+    all_stocks: bool = False,
+    budget=None,
+    top_n: int = 100,
+    refresh_prices: bool = False,
+    skip_collect: bool = False,
+    skip_train: bool = False,
+) -> dict:
+    """파이프라인을 함수로 실행. 항상 dict를 반환하며 절대 None을 반환하지 않는다."""
+    today = ""
+    created_files = []
+    errors = []
+    try:
+        today = get_today_str("%Y%m%d")
+    except Exception:
+        from datetime import datetime as _dt
+        today = _dt.now().strftime("%Y%m%d")
+
+    python = sys.executable
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _run(label, cmd, timeout=600):
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout, cwd=project_root,
+            )
+            return r.returncode == 0, (r.stderr or "")[-500:]
+        except subprocess.TimeoutExpired:
+            return False, f"{label} 타임아웃 ({timeout}초)"
+        except Exception as ex:
+            return False, str(ex)
+
+    safe_cfg = {}
+    try:
+        safe_cfg = load_config("config.yaml") or {}
+    except Exception as ex:
+        errors.append(f"config 로드 실패: {ex}")
+
+    data_cfg = safe_cfg.get("data") or {}
+    paths_cfg = safe_cfg.get("paths") or {}
+    predictions_dir = paths_cfg.get("predictions_dir", "reports/predictions")
+    top100_file = os.path.join(project_root, predictions_dir, f"top100_{today}.csv")
+    force_file = os.path.join(project_root, "reports", f"force_trade_candidates_{today}.csv")
+
+    try:
+        # Step 1: 데이터 수집
+        if not skip_collect:
+            collect_cmd = [python, "src/collect_daily_data.py", "--years", str(years)]
+            if all_stocks:
+                collect_cmd.append("--all")
+            elif limit:
+                collect_cmd += ["--limit", str(limit)]
+            ok, err = _run("데이터수집", collect_cmd, timeout=3600)
+            if not ok:
+                daily_path = os.path.join(project_root, data_cfg.get("raw_daily_path", "data/raw/daily_prices.csv"))
+                if not os.path.exists(daily_path):
+                    errors.append(f"데이터 수집 실패: {err}")
+                    return {
+                        "success": False, "stage": "collect_data",
+                        "message": f"일봉 데이터 수집 실패: {err}",
+                        "created_files": [], "errors": errors,
+                        "predictions_file": None, "top100_file": None, "force_trade_file": None,
+                    }
+
+        # Step 2: 피처 생성
+        ok, err = _run("피처생성", [python, "src/make_features.py"], timeout=600)
+        if not ok:
+            feat_path = os.path.join(project_root, data_cfg.get("processed_features_path", "data/processed/features.csv"))
+            if not os.path.exists(feat_path):
+                errors.append(f"피처 생성 실패: {err}")
+                return {
+                    "success": False, "stage": "make_features",
+                    "message": f"피처 생성 실패: {err}",
+                    "created_files": created_files, "errors": errors,
+                    "predictions_file": None, "top100_file": None, "force_trade_file": None,
+                }
+
+        # Step 3: 라벨 생성
+        ok, err = _run("라벨생성", [python, "src/make_labels.py"], timeout=300)
+        if not ok:
+            lbl_path = os.path.join(project_root, data_cfg.get("processed_labels_path", "data/processed/labeled_dataset.csv"))
+            if not os.path.exists(lbl_path):
+                errors.append(f"라벨 생성 실패: {err}")
+
+        # Step 4: 모델 학습
+        if not skip_train:
+            ok, err = _run("모델학습", [python, "src/train_model.py"], timeout=1800)
+            if not ok:
+                model_path = os.path.join(project_root, paths_cfg.get("model_path", "models/model.joblib"))
+                if not os.path.exists(model_path):
+                    errors.append(f"모델 학습 실패: {err}")
+                    return {
+                        "success": False, "stage": "train_model",
+                        "message": f"모델 학습 실패 (모델 파일 없음): {err}",
+                        "created_files": created_files, "errors": errors,
+                        "predictions_file": None, "top100_file": None, "force_trade_file": None,
+                    }
+
+        # Step 5: 예측 생성
+        ok, err = _run("예측생성", [python, "src/predict_candidates.py"], timeout=300)
+        pred_file = os.path.join(project_root, predictions_dir, f"predictions_{today}.csv")
+        if os.path.exists(pred_file):
+            created_files.append(pred_file)
+
+        # Step 6: Top100 생성
+        ok, err = _run("Top100생성", [python, "src/select_top_candidates.py", "--top-n", "100", "--all"], timeout=120)
+        if os.path.exists(top100_file):
+            created_files.append(top100_file)
+
+        # (선택) 예산 배분
+        if budget:
+            _run("예산배분", [python, "src/budget_allocator.py", "--budget", str(budget), "--max-orders", "100"], timeout=120)
+
+        # force_trade 후보
+        _run("force_trade후보", [python, "src/force_trade_selector.py"], timeout=60)
+        if os.path.exists(force_file):
+            created_files.append(force_file)
+
+        success = os.path.exists(top100_file)
+        return {
+            "success": success,
+            "stage": "completed" if success else "top100_missing",
+            "message": "전체 파이프라인 완료" if success else f"top100 파일 미생성: {top100_file}",
+            "created_files": created_files,
+            "errors": errors,
+            "predictions_file": pred_file if os.path.exists(pred_file) else None,
+            "top100_file": top100_file if os.path.exists(top100_file) else None,
+            "force_trade_file": force_file if os.path.exists(force_file) else None,
+            "today": today,
+        }
+
+    except Exception as ex:
+        import traceback
+        errors.append(traceback.format_exc())
+        return {
+            "success": False, "stage": "exception",
+            "message": f"파이프라인 예외 발생: {ex}",
+            "created_files": created_files, "errors": errors,
+            "predictions_file": None, "top100_file": None, "force_trade_file": None,
+        }
+
+
 if __name__ == "__main__":
     main()

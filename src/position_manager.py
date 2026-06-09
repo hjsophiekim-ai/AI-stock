@@ -24,6 +24,7 @@ class PositionRecord:
     stop_price: float = 0.0
     stop_loss_price: float = 0.0
     current_price: float = 0.0
+    profit_loss_rate: float = 0.0
     is_closed: bool = False
     status: str = "OPEN"
     source: str = "local"
@@ -40,6 +41,19 @@ class PositionRecord:
     strategy_name: str = ""
     take_profit_rate: float = 0.02
     stop_loss_rate: float = -0.03
+    sell_policy_id: str = "fixed_2pct"
+    sell_policy_name: str = "기본 자동매도"
+    auto_take_profit_enabled: bool = True
+    auto_stop_loss_enabled: bool = True
+    trailing_enabled: bool = False
+    manual_only: bool = False
+    trailing_active: bool = False
+    trailing_high_price: float = 0.0
+    trailing_stop_rate: float = 0.0
+    trailing_stop_price: float = 0.0
+    first_take_profit_done: bool = False
+    additional_take_profit_done: bool = False
+    last_trailing_update_at: str = ""
     allowed_sell_sessions: list = field(default_factory=list)
     buy_window: str = ""
     force_exit_rule: str = ""
@@ -85,6 +99,7 @@ class PositionManager:
                 rec.setdefault("stop_price", round(float(rec.get("entry_price", 0)) * 0.97))
                 rec.setdefault("stop_loss_price", rec.get("stop_price", 0))
                 rec.setdefault("status", "CLOSED" if rec.get("is_closed") else "OPEN")
+                rec = self._apply_sell_policy_defaults(rec)
                 allowed = {f.name for f in PositionRecord.__dataclass_fields__.values()}
                 rec = {k: v for k, v in rec.items() if k in allowed}
                 loaded[str(code).zfill(6)] = PositionRecord(**rec)
@@ -98,6 +113,26 @@ class PositionManager:
         data = {code: asdict(pos) for code, pos in self._positions.items()}
         with open(self._positions_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _apply_sell_policy_defaults(self, rec: dict, sell_policy_id: str = "") -> dict:
+        try:
+            from sell_policy import apply_sell_policy_to_position
+            default_id = self.cfg.get("sell_policy", {}).get("default_policy", "fixed_2pct")
+            policy_id = sell_policy_id or rec.get("sell_policy_id") or default_id
+            return apply_sell_policy_to_position(rec, policy_id, self.cfg)
+        except Exception:
+            rec.setdefault("sell_policy_id", sell_policy_id or self.cfg.get("sell_policy", {}).get("default_policy", "fixed_2pct"))
+            rec.setdefault("sell_policy_name", rec["sell_policy_id"])
+            rec.setdefault("auto_take_profit_enabled", True)
+            rec.setdefault("auto_stop_loss_enabled", True)
+            rec.setdefault("trailing_enabled", False)
+            rec.setdefault("manual_only", False)
+            rec.setdefault("trailing_active", False)
+            rec.setdefault("trailing_high_price", 0.0)
+            rec.setdefault("trailing_stop_price", 0.0)
+            rec.setdefault("first_take_profit_done", False)
+            rec.setdefault("additional_take_profit_done", False)
+            return rec
 
     def sync_positions_from_broker(self, broker_positions) -> None:
         if broker_positions is None or len(broker_positions) == 0:
@@ -151,11 +186,13 @@ class PositionManager:
         buy_window: str = "",
         force_exit_rule: str = "",
         source: str = "local",
+        replace_existing: bool = False,
+        sell_policy_id: str = "",
     ) -> PositionRecord:
         code = str(stock_code).zfill(6)
         t = entry_time or datetime.now()
         existing = self._positions.get(code)
-        if existing and not existing.is_closed:
+        if existing and not existing.is_closed and not replace_existing:
             total_qty = int(existing.quantity) + int(quantity)
             if total_qty > 0:
                 entry_price = (
@@ -167,31 +204,33 @@ class PositionManager:
         sl_rate = stop_loss_rate if stop_loss_rate != 0.0 else self._stop_rate
         target_p = adjust_price_to_tick(round(float(entry_price) * (1 + tp_rate)), side="sell", method="ceil")
         stop_p = adjust_price_to_tick(round(float(entry_price) * (1 + sl_rate)), side="sell", method="ceil")
-        pos = PositionRecord(
-            stock_code=code,
-            stock_name=stock_name,
-            quantity=int(quantity),
-            entry_price=float(entry_price),
-            avg_price=float(entry_price),
-            entry_time=t.isoformat(),
-            target_price=target_p,
-            stop_price=stop_p,
-            stop_loss_price=stop_p,
-            current_price=float(entry_price),
-            order_no=order_no,
-            filled_quantity=filled_quantity if filled_quantity > 0 else int(quantity),
-            filled_price=filled_price if filled_price > 0 else float(entry_price),
-            force_trade_mode=force_trade_mode,
-            forced_exit_time_str=self._forced_exit_time,
-            strategy_id=strategy_id,
-            strategy_name=strategy_name,
-            take_profit_rate=tp_rate,
-            stop_loss_rate=sl_rate,
-            allowed_sell_sessions=allowed_sell_sessions or [],
-            buy_window=buy_window,
-            force_exit_rule=force_exit_rule,
-            source=source,
-        )
+        pos_data = {
+            "stock_code": code,
+            "stock_name": stock_name,
+            "quantity": int(quantity),
+            "entry_price": float(entry_price),
+            "avg_price": float(entry_price),
+            "entry_time": t.isoformat(),
+            "target_price": target_p,
+            "stop_price": stop_p,
+            "stop_loss_price": stop_p,
+            "current_price": float(entry_price),
+            "order_no": order_no,
+            "filled_quantity": filled_quantity if filled_quantity > 0 else int(quantity),
+            "filled_price": filled_price if filled_price > 0 else float(entry_price),
+            "force_trade_mode": force_trade_mode,
+            "forced_exit_time_str": self._forced_exit_time,
+            "strategy_id": strategy_id,
+            "strategy_name": strategy_name,
+            "take_profit_rate": tp_rate,
+            "stop_loss_rate": sl_rate,
+            "allowed_sell_sessions": allowed_sell_sessions or [],
+            "buy_window": buy_window,
+            "force_exit_rule": force_exit_rule,
+            "source": source,
+        }
+        pos_data = self._apply_sell_policy_defaults(pos_data, sell_policy_id)
+        pos = PositionRecord(**pos_data)
         self._positions[code] = pos
         self.save_local_positions()
         return pos
@@ -202,12 +241,20 @@ class PositionManager:
         exit_price: float,
         exit_reason: str,
         exit_time: Optional[datetime] = None,
+        quantity: Optional[int] = None,
     ) -> Optional[PositionRecord]:
         code = str(stock_code).zfill(6)
         pos = self._positions.get(code)
         if pos is None:
             return None
         t = exit_time or datetime.now()
+        sell_qty = int(quantity or pos.quantity)
+        if sell_qty < int(pos.quantity):
+            pos.quantity = int(pos.quantity) - sell_qty
+            pos.filled_quantity = max(0, int(pos.filled_quantity) - sell_qty)
+            pos.current_price = float(exit_price)
+            self.save_local_positions()
+            return pos
         pos.exit_price = float(exit_price)
         pos.exit_time = t.isoformat()
         pos.exit_reason = exit_reason

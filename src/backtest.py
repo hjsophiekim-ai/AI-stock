@@ -210,7 +210,7 @@ class BacktestEngine:
             candidates = day_df.nlargest(self.top_n, "proba_up")
 
             # 유동성 필터
-            min_tv = cfg["risk"].get("min_daily_trading_value", 3_000_000_000)
+            min_tv = (cfg.get("risk") or {}).get("min_daily_trading_value", 3_000_000_000)
             if "trading_value" in candidates.columns:
                 candidates = candidates[candidates["trading_value"] >= min_tv]
 
@@ -306,7 +306,7 @@ class BacktestEngine:
             "",
             "--- 전략 성과 ---",
             f"승률: {summary.get('win_rate', 0):.2%}",
-            f"+{cfg['strategy']['target_profit_rate']*100:.0f}% 익절 비율: {summary.get('take_profit_rate', 0):.2%}",
+            f"+{((cfg or {}).get('strategy') or {}).get('target_profit_rate', 0.02)*100:.0f}% 익절 비율: {summary.get('take_profit_rate', 0):.2%}",
             f"손절 비율: {summary.get('stop_loss_rate', 0):.2%}",
             f"강제청산 비율: {summary.get('forced_exit_rate', 0):.2%}",
             f"평균 이익 거래: {summary.get('avg_win_pnl', 0):.4%}",
@@ -323,45 +323,122 @@ class BacktestEngine:
         logger.info("\n" + "\n".join(lines))
 
 
+def run_backtest(
+    start_date: str = "2024-01-01",
+    end_date: str = "2024-12-31",
+    top_n: int = 20,
+    threshold: float = 0.5,
+    strategy_id: str = "morning_0930",
+) -> dict:
+    """백테스트를 함수로 실행. 항상 dict를 반환하며 절대 None을 반환하지 않는다."""
+    try:
+        safe_cfg = cfg or {}
+        data_cfg = safe_cfg.get("data") or {}
+        paths_cfg = safe_cfg.get("paths") or {}
+        bt_cfg = safe_cfg.get("backtest") or {}
+
+        labels_path = data_cfg.get("processed_labels_path", "data/processed/labeled_dataset.csv")
+        model_path = paths_cfg.get("model_path", "models/model.joblib")
+        output_dir = paths_cfg.get("backtests_dir", "reports/backtests")
+
+        missing = []
+        if not os.path.exists(labels_path):
+            missing.append(f"라벨 파일: {labels_path}")
+        if not os.path.exists(model_path):
+            missing.append(f"모델 파일: {model_path}")
+
+        if missing:
+            return {
+                "success": False, "stage": "missing_data",
+                "message": "필수 파일 없음 — 먼저 데이터 수집 → 피처 → 라벨 → 모델학습을 실행하세요.",
+                "errors": missing,
+                "trades_file": None, "summary_file": None,
+                "total_trades": 0, "strategy_id": strategy_id,
+            }
+
+        import joblib
+        model = joblib.load(model_path)
+        labeled_df = pd.read_csv(labels_path, parse_dates=["date"])
+
+        if labeled_df.empty:
+            return {
+                "success": False, "stage": "empty_data",
+                "message": "라벨 데이터가 비어 있습니다.",
+                "errors": ["labeled_dataset.csv 행 없음"],
+                "trades_file": None, "summary_file": None,
+                "total_trades": 0, "strategy_id": strategy_id,
+            }
+
+        engine = BacktestEngine(
+            start_date=start_date, end_date=end_date,
+            top_n=top_n, threshold=threshold,
+            initial_capital=bt_cfg.get("initial_capital", 100_000_000),
+        )
+        engine.run(labeled_df, model)
+        engine.save_results(output_dir)
+
+        summary = engine.summary()
+        trades_file = os.path.join(output_dir, "backtest_trades.csv")
+        summary_file = os.path.join(output_dir, "backtest_summary.txt")
+
+        import json as _json
+        ensure_dir(output_dir)
+        with open(os.path.join(output_dir, "backtest_result.json"), "w", encoding="utf-8") as _f:
+            _json.dump({**summary, "strategy_id": strategy_id,
+                        "start_date": start_date, "end_date": end_date, "top_n": top_n},
+                       _f, ensure_ascii=False, indent=2)
+
+        return {
+            "success": True, "stage": "completed",
+            "message": f"백테스트 완료: {summary.get('total_trades', 0)}건 거래",
+            "errors": [],
+            "trades_file": trades_file if os.path.exists(trades_file) else None,
+            "summary_file": summary_file if os.path.exists(summary_file) else None,
+            "total_trades": summary.get("total_trades", 0),
+            "win_rate": summary.get("win_rate", 0),
+            "avg_pnl_rate": summary.get("avg_pnl_rate", 0),
+            "cumulative_return": summary.get("cumulative_return", 0),
+            "strategy_id": strategy_id,
+            "summary": summary,
+        }
+
+    except Exception as ex:
+        import traceback
+        tb = traceback.format_exc()
+        logger.error("백테스트 예외: %s", tb)
+        return {
+            "success": False, "stage": "exception",
+            "message": f"백테스트 예외: {ex}",
+            "errors": [tb[-1000:]],
+            "trades_file": None, "summary_file": None,
+            "total_trades": 0, "strategy_id": strategy_id,
+        }
+
+
 def main() -> None:
     """메인 실행 함수."""
     parser = argparse.ArgumentParser(description="백테스트 실행")
-    parser.add_argument("--start", default="2023-01-01", help="시작일 YYYY-MM-DD")
+    parser.add_argument("--start", default="2024-01-01", help="시작일 YYYY-MM-DD")
     parser.add_argument("--end", default="2024-12-31", help="종료일 YYYY-MM-DD")
     parser.add_argument("--top-n", type=int, default=20, help="매일 매수 종목 수")
     parser.add_argument("--threshold", type=float, default=0.5, help="상승확률 최소 기준")
+    parser.add_argument("--strategy", default="morning_0930",
+                        choices=["morning_0930", "afternoon_1500"], help="전략 ID")
     args = parser.parse_args()
 
-    labels_path = cfg["data"]["processed_labels_path"]
-    model_path = cfg["paths"]["model_path"]
-    output_dir = cfg["paths"]["backtests_dir"]
-
     logger.info("=== 백테스트 시작 ===")
-
-    if not os.path.exists(labels_path):
-        logger.error(f"라벨 파일 없음: {labels_path}")
-        sys.exit(1)
-    if not os.path.exists(model_path):
-        logger.error(f"모델 파일 없음: {model_path}")
-        sys.exit(1)
-
-    import joblib
-    model = joblib.load(model_path)
-
-    labeled_df = pd.read_csv(labels_path, parse_dates=["date"])
-
-    engine = BacktestEngine(
-        start_date=args.start,
-        end_date=args.end,
-        top_n=args.top_n,
-        threshold=args.threshold,
-        initial_capital=cfg["backtest"].get("initial_capital", 100_000_000),
+    result = run_backtest(
+        start_date=args.start, end_date=args.end,
+        top_n=args.top_n, threshold=args.threshold, strategy_id=args.strategy,
     )
 
-    engine.run(labeled_df, model)
-    engine.save_results(output_dir)
-
-    logger.info("=== 백테스트 완료 ===")
+    if result["success"]:
+        logger.info("=== 백테스트 완료: %d건 ===", result.get("total_trades", 0))
+    else:
+        logger.error("백테스트 실패: %s", result.get("message", ""))
+        for e in result.get("errors", []):
+            print(e)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
