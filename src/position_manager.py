@@ -1,16 +1,12 @@
-"""보유 포지션 관리 모듈.
-
-매수가, 목표가, 손절가, 보유 시각을 추적하고
-data/positions.json에 저장·복원합니다.
-"""
+"""Local position storage for buy/sell and take-profit monitoring."""
 
 import json
-import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from price_tick import adjust_price_to_tick
 from utils import ensure_dir, load_config, setup_logger
 
 logger = setup_logger(__name__, "logs/position_manager.log")
@@ -18,142 +14,123 @@ logger = setup_logger(__name__, "logs/position_manager.log")
 
 @dataclass
 class PositionRecord:
-    """단일 포지션 정보."""
     stock_code: str
     stock_name: str
     quantity: int
     entry_price: float
-    entry_time: str          # ISO 형식 문자열
+    entry_time: str
     target_price: float = 0.0
+    avg_price: float = 0.0
     stop_price: float = 0.0
+    stop_loss_price: float = 0.0
+    current_price: float = 0.0
     is_closed: bool = False
+    status: str = "OPEN"
+    source: str = "local"
+    broker_synced_at: str = ""
     exit_price: Optional[float] = None
     exit_time: Optional[str] = None
     exit_reason: Optional[str] = None
-    order_no: str = ""                # 주문번호
-    filled_quantity: int = 0          # 체결수량
-    filled_price: float = 0.0         # 체결가격
-    force_trade_mode: bool = False     # force_trade로 매수한 종목 여부
-    forced_exit_time_str: str = "09:30"  # 강제청산 시각 (HH:MM)
+    order_no: str = ""
+    filled_quantity: int = 0
+    filled_price: float = 0.0
+    force_trade_mode: bool = False
+    forced_exit_time_str: str = "09:30"
+    strategy_id: str = ""
+    strategy_name: str = ""
+    take_profit_rate: float = 0.02
+    stop_loss_rate: float = -0.03
+    allowed_sell_sessions: list = field(default_factory=list)
+    buy_window: str = ""
+    force_exit_rule: str = ""
 
     def pnl_rate(self, current_price: Optional[float] = None) -> float:
-        """현재 또는 최종 손익률 계산."""
-        p = current_price or self.exit_price
-        if p is None:
+        p = current_price if current_price is not None else self.exit_price
+        if p is None or self.entry_price <= 0:
             return 0.0
-        return (p - self.entry_price) / (self.entry_price + 1e-9)
+        return (float(p) - float(self.entry_price)) / float(self.entry_price)
 
 
 class PositionManager:
-    """보유 포지션 관리 클래스.
-
-    매수 후 포지션을 기록하고 익절/손절/강제청산 시점을 판단합니다.
-    """
-
     def __init__(self, config_path: str = "config.yaml") -> None:
         self.cfg = load_config(config_path)
         strategy = self.cfg.get("strategy", {})
-        self._target_rate: float = strategy.get("target_profit_rate", 0.02)
-        self._stop_rate: float = strategy.get("stop_loss_rate", -0.03)
-        self._forced_exit_time: str = strategy.get("forced_exit_time_next_day", "09:30")
-        self._positions_file = Path(
-            self.cfg.get("data", {}).get("positions_file", "data/positions.json")
-        )
+        self._target_rate = float(strategy.get("target_profit_rate", 0.02))
+        self._stop_rate = float(strategy.get("stop_loss_rate", -0.03))
+        self._forced_exit_time = strategy.get("forced_exit_time_next_day", "09:30")
+        self._positions_file = Path(self.cfg.get("data", {}).get("positions_file", "data/positions.json"))
         self._positions: Dict[str, PositionRecord] = {}
         self._load_local_positions()
 
-    # ------------------------------------------------------------------
-    # 저장·복원
-    # ------------------------------------------------------------------
-
     def _load_local_positions(self) -> None:
-        """파일에서 포지션 복원 (프로그램 재시작 시).
-
-        positions.json이 [] 리스트이면 {} 빈 딕셔너리로 자동 보정합니다.
-        JSON 파싱 실패 시 백업을 만들고 빈 포지션으로 초기화합니다.
-        """
         if not self._positions_file.exists():
             return
         try:
             with open(self._positions_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            # [] 리스트 또는 None → {} 딕셔너리로 보정
-            if data is None or isinstance(data, list):
-                logger.warning(
-                    "positions.json이 %s 형식 — 빈 딕셔너리로 초기화합니다.",
-                    type(data).__name__,
-                )
+                data = json.load(f) or {}
+            if isinstance(data, list):
                 data = {}
-                # 보정된 내용을 즉시 저장
-                with open(self._positions_file, "w", encoding="utf-8") as fw:
-                    json.dump(data, fw, ensure_ascii=False, indent=2)
-
-            self._positions = {
-                code: PositionRecord(**rec)
-                for code, rec in data.items()
-            }
-            logger.info("포지션 복원 완료: %d개 종목", len(self._positions))
-
-        except json.JSONDecodeError as e:
-            # JSON 파싱 실패 → 백업 후 초기화
-            backup = self._positions_file.with_suffix(".json.bak")
-            try:
-                self._positions_file.rename(backup)
-                logger.error("positions.json 파싱 실패 → 백업: %s | 오류: %s", backup, str(e))
-            except Exception:
-                pass
-            self._positions = {}
-            with open(self._positions_file, "w", encoding="utf-8") as fw:
-                json.dump({}, fw, ensure_ascii=False, indent=2)
-
-        except Exception as e:
-            logger.error("포지션 파일 로드 실패: %s", str(e))
+            loaded = {}
+            for code, rec in data.items():
+                if not isinstance(rec, dict):
+                    continue
+                rec = dict(rec)
+                rec.setdefault("stock_code", code)
+                rec.setdefault("stock_name", code)
+                rec.setdefault("quantity", 0)
+                rec.setdefault("entry_price", rec.get("avg_price", 0))
+                rec.setdefault("entry_time", datetime.now().isoformat())
+                rec.setdefault("avg_price", rec.get("entry_price", 0))
+                rec.setdefault("target_price", round(float(rec.get("entry_price", 0)) * 1.02))
+                rec.setdefault("stop_price", round(float(rec.get("entry_price", 0)) * 0.97))
+                rec.setdefault("stop_loss_price", rec.get("stop_price", 0))
+                rec.setdefault("status", "CLOSED" if rec.get("is_closed") else "OPEN")
+                allowed = {f.name for f in PositionRecord.__dataclass_fields__.values()}
+                rec = {k: v for k, v in rec.items() if k in allowed}
+                loaded[str(code).zfill(6)] = PositionRecord(**rec)
+            self._positions = loaded
+        except Exception as ex:
+            logger.error("positions load failed: %s", ex)
             self._positions = {}
 
     def save_local_positions(self) -> None:
-        """현재 포지션을 파일에 저장."""
         ensure_dir(str(self._positions_file.parent))
-        try:
-            data = {code: asdict(pos) for code, pos in self._positions.items()}
-            with open(self._positions_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error("포지션 저장 실패: %s", str(e))
+        data = {code: asdict(pos) for code, pos in self._positions.items()}
+        with open(self._positions_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
-    # ------------------------------------------------------------------
-    # 브로커 동기화
-    # ------------------------------------------------------------------
-
-    def sync_positions_from_broker(self, broker_positions: "pd.DataFrame") -> None:  # noqa: F821
-        """브로커 잔고와 로컬 포지션 동기화.
-
-        브로커에 있는데 로컬에 없는 종목을 추가합니다.
-
-        Args:
-            broker_positions: kis_api.get_positions() 반환값
-        """
+    def sync_positions_from_broker(self, broker_positions) -> None:
         if broker_positions is None or len(broker_positions) == 0:
             return
         for _, row in broker_positions.iterrows():
-            code = str(row["stock_code"])
-            if code not in self._positions:
-                logger.info(
-                    "브로커 포지션 추가 (로컬 없음): %s (%s) %d주 @ %.0f원",
-                    code, row.get("stock_name", ""), row["quantity"], row["avg_price"]
-                )
-                self.update_position_after_buy(
+            code = str(row.get("stock_code", "")).zfill(6)
+            qty = int(row.get("quantity", 0) or 0)
+            if not code or qty <= 0:
+                continue
+            avg_price = float(row.get("avg_price", 0) or 0)
+            current_price = float(row.get("current_price", avg_price) or avg_price)
+            pos = self._positions.get(code)
+            if pos is None:
+                pos = self.update_position_after_buy(
                     stock_code=code,
-                    stock_name=str(row.get("stock_name", "")),
-                    quantity=int(row["quantity"]),
-                    entry_price=float(row["avg_price"]),
+                    stock_name=str(row.get("stock_name", code)),
+                    quantity=qty,
+                    entry_price=avg_price,
                     entry_time=datetime.now(),
+                    source="broker",
                 )
+            pos.quantity = qty
+            pos.entry_price = avg_price
+            pos.avg_price = avg_price
+            pos.current_price = current_price
+            pos.target_price = adjust_price_to_tick(round(avg_price * 1.02), side="sell", method="ceil")
+            pos.stop_price = adjust_price_to_tick(round(avg_price * 0.97), side="sell", method="ceil")
+            pos.stop_loss_price = pos.stop_price
+            pos.source = "broker"
+            pos.broker_synced_at = datetime.now().isoformat()
+            pos.status = "OPEN"
+            pos.is_closed = False
         self.save_local_positions()
-
-    # ------------------------------------------------------------------
-    # 포지션 업데이트
-    # ------------------------------------------------------------------
 
     def update_position_after_buy(
         self,
@@ -166,40 +143,56 @@ class PositionManager:
         filled_quantity: int = 0,
         filled_price: float = 0.0,
         force_trade_mode: bool = False,
+        strategy_id: str = "",
+        strategy_name: str = "",
+        take_profit_rate: float = 0.0,
+        stop_loss_rate: float = 0.0,
+        allowed_sell_sessions: Optional[list] = None,
+        buy_window: str = "",
+        force_exit_rule: str = "",
+        source: str = "local",
     ) -> PositionRecord:
-        """매수 후 포지션 추가.
-
-        Args:
-            stock_code: 종목코드
-            stock_name: 종목명
-            quantity: 매수 수량
-            entry_price: 매수 가격
-            entry_time: 매수 시각
-
-        Returns:
-            생성된 PositionRecord
-        """
+        code = str(stock_code).zfill(6)
         t = entry_time or datetime.now()
+        existing = self._positions.get(code)
+        if existing and not existing.is_closed:
+            total_qty = int(existing.quantity) + int(quantity)
+            if total_qty > 0:
+                entry_price = (
+                    float(existing.entry_price) * int(existing.quantity)
+                    + float(entry_price) * int(quantity)
+                ) / total_qty
+                quantity = total_qty
+        tp_rate = take_profit_rate if take_profit_rate != 0.0 else self._target_rate
+        sl_rate = stop_loss_rate if stop_loss_rate != 0.0 else self._stop_rate
+        target_p = adjust_price_to_tick(round(float(entry_price) * (1 + tp_rate)), side="sell", method="ceil")
+        stop_p = adjust_price_to_tick(round(float(entry_price) * (1 + sl_rate)), side="sell", method="ceil")
         pos = PositionRecord(
-            stock_code=stock_code,
+            stock_code=code,
             stock_name=stock_name,
-            quantity=quantity,
-            entry_price=entry_price,
+            quantity=int(quantity),
+            entry_price=float(entry_price),
+            avg_price=float(entry_price),
             entry_time=t.isoformat(),
-            target_price=self.get_target_price(entry_price),
-            stop_price=self.get_stop_loss_price(entry_price),
+            target_price=target_p,
+            stop_price=stop_p,
+            stop_loss_price=stop_p,
+            current_price=float(entry_price),
             order_no=order_no,
-            filled_quantity=filled_quantity if filled_quantity > 0 else quantity,
-            filled_price=filled_price if filled_price > 0 else entry_price,
+            filled_quantity=filled_quantity if filled_quantity > 0 else int(quantity),
+            filled_price=filled_price if filled_price > 0 else float(entry_price),
             force_trade_mode=force_trade_mode,
             forced_exit_time_str=self._forced_exit_time,
+            strategy_id=strategy_id,
+            strategy_name=strategy_name,
+            take_profit_rate=tp_rate,
+            stop_loss_rate=sl_rate,
+            allowed_sell_sessions=allowed_sell_sessions or [],
+            buy_window=buy_window,
+            force_exit_rule=force_exit_rule,
+            source=source,
         )
-        self._positions[stock_code] = pos
-        logger.info(
-            "포지션 추가: %s(%s) %d주 @ %.0f원 | 목표가=%.0f | 손절가=%.0f",
-            stock_code, stock_name, quantity, entry_price,
-            pos.target_price, pos.stop_price,
-        )
+        self._positions[code] = pos
         self.save_local_positions()
         return pos
 
@@ -210,116 +203,59 @@ class PositionManager:
         exit_reason: str,
         exit_time: Optional[datetime] = None,
     ) -> Optional[PositionRecord]:
-        """매도 후 포지션 청산 처리.
-
-        Args:
-            stock_code: 종목코드
-            exit_price: 매도 가격
-            exit_reason: 청산 사유
-            exit_time: 청산 시각
-
-        Returns:
-            청산된 PositionRecord 또는 None
-        """
-        pos = self._positions.get(stock_code)
+        code = str(stock_code).zfill(6)
+        pos = self._positions.get(code)
         if pos is None:
-            logger.warning("포지션 없음: %s", stock_code)
             return None
         t = exit_time or datetime.now()
-        pos.exit_price = exit_price
+        pos.exit_price = float(exit_price)
         pos.exit_time = t.isoformat()
         pos.exit_reason = exit_reason
         pos.is_closed = True
-        logger.info(
-            "포지션 청산: %s(%s) %d주 @ %.0f원 (사유=%s, 손익=%.2f%%)",
-            pos.stock_code, pos.stock_name, pos.quantity, exit_price,
-            exit_reason, pos.pnl_rate(exit_price) * 100,
-        )
-        del self._positions[stock_code]
+        pos.status = "CLOSED"
+        del self._positions[code]
         self.save_local_positions()
         return pos
 
-    # ------------------------------------------------------------------
-    # 목표가·손절가 계산
-    # ------------------------------------------------------------------
-
     def get_target_price(self, entry_price: float) -> float:
-        """익절 목표가 계산 (+2%).
-
-        Args:
-            entry_price: 매수가
-
-        Returns:
-            목표가
-        """
-        return round(entry_price * (1 + self._target_rate))
+        return round(float(entry_price) * (1 + self._target_rate))
 
     def get_stop_loss_price(self, entry_price: float) -> float:
-        """손절가 계산 (-3%).
-
-        Args:
-            entry_price: 매수가
-
-        Returns:
-            손절가
-        """
-        return round(entry_price * (1 + self._stop_rate))
-
-    # ------------------------------------------------------------------
-    # 청산 조건 판단
-    # ------------------------------------------------------------------
+        return round(float(entry_price) * (1 + self._stop_rate))
 
     def should_take_profit(self, stock_code: str, current_price: float) -> bool:
-        """+2% 익절 조건 충족 여부."""
-        pos = self._positions.get(stock_code)
-        if pos is None:
-            return False
-        return current_price >= pos.target_price
+        pos = self._positions.get(str(stock_code).zfill(6))
+        return bool(pos and float(current_price) >= float(pos.target_price))
 
     def should_stop_loss(self, stock_code: str, current_price: float) -> bool:
-        """-3% 손절 조건 충족 여부."""
-        pos = self._positions.get(stock_code)
-        if pos is None:
-            return False
-        return current_price <= pos.stop_price
+        pos = self._positions.get(str(stock_code).zfill(6))
+        return bool(pos and float(current_price) <= float(pos.stop_price))
 
     def should_force_exit(self, stock_code: str, now: Optional[datetime] = None) -> bool:
-        """다음 거래일 09:30 강제청산 여부."""
-        pos = self._positions.get(stock_code)
+        pos = self._positions.get(str(stock_code).zfill(6))
         if pos is None:
             return False
         current = now or datetime.now()
-        entry_dt = datetime.fromisoformat(pos.entry_time)
+        try:
+            entry_dt = datetime.fromisoformat(pos.entry_time)
+        except Exception:
+            return False
         if current.date() <= entry_dt.date():
             return False
         force_h, force_m = map(int, self._forced_exit_time.split(":"))
-        return current.hour > force_h or (
-            current.hour == force_h and current.minute >= force_m
-        )
-
-    # ------------------------------------------------------------------
-    # 조회
-    # ------------------------------------------------------------------
+        return current.hour > force_h or (current.hour == force_h and current.minute >= force_m)
 
     def get_all_positions(self) -> Dict[str, PositionRecord]:
-        """모든 보유 포지션 반환."""
         return dict(self._positions)
 
     def get_position(self, stock_code: str) -> Optional[PositionRecord]:
-        """특정 종목 포지션 반환."""
-        return self._positions.get(stock_code)
+        return self._positions.get(str(stock_code).zfill(6))
 
     def has_position(self, stock_code: str) -> bool:
-        """특정 종목 보유 여부."""
-        return stock_code in self._positions
+        return str(stock_code).zfill(6) in self._positions
 
     def position_count(self) -> int:
-        """현재 보유 종목 수."""
         return len(self._positions)
 
     def get_force_exit_targets(self, now: Optional[datetime] = None) -> List[str]:
-        """강제청산 대상 종목코드 목록."""
-        return [
-            code for code in self._positions
-            if self.should_force_exit(code, now)
-        ]
+        return [code for code in self._positions if self.should_force_exit(code, now)]

@@ -184,6 +184,9 @@ class ForceTradeSelector:
         if self._hard.get("exclude_etf_etn", True) and name_col in df.columns:
             mask &= ~df[name_col].astype(str).apply(is_etf_etn)
 
+        if "buy_allowed" in df.columns:
+            mask &= df["buy_allowed"].astype(str).str.lower().isin(["true", "1", "yes"])
+
         # 최소 가격
         price_col = next((c for c in ("close", "current_price") if c in df.columns), None)
         if price_col:
@@ -240,7 +243,7 @@ class ForceTradeSelector:
         return df
 
     def _get_score_col(self, df: pd.DataFrame) -> Optional[str]:
-        for col in ("probability_2pct", "prediction_score", "proba_up", "probability"):
+        for col in ("final_score", "probability_2pct", "prediction_score", "proba_up", "probability"):
             if col in df.columns:
                 return col
         return None

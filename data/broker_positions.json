@@ -1,0 +1,20 @@
+[
+  {
+    "stock_code": "035420",
+    "stock_name": "NAVER",
+    "quantity": 1,
+    "avg_price": 252500.0,
+    "current_price": 252500,
+    "eval_amount": 252500,
+    "pnl_rate": 0.0
+  },
+  {
+    "stock_code": "105560",
+    "stock_name": "KB금융",
+    "quantity": 1,
+    "avg_price": 151600.0,
+    "current_price": 154300,
+    "eval_amount": 154300,
+    "pnl_rate": 1.78
+  }
+]

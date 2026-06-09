@@ -171,20 +171,224 @@ python src/force_auto_trade.py --budget 300000 --mode mock --min-orders 1 --max-
 > KIS 모의투자 서버(`openapivts.koreainvestment.com`)는 시간외 주문 유형을 지원하지 않는 경우가 많습니다.
 > 코드가 정상적으로 `ORD_DVSN=61`을 전송하고 있다면, MOCK 서버 제약이며 코드 오류가 아닙니다.
 
-### 9. 시스템 전체 검증
+### 9. 시간외 주문구분 후보 테스트
+
+PRE_MARKET 세션에서 MOCK 주문 API가 호출되더라도 모의투자 서버가 주문유형을 지원하지 않을 수 있습니다.
+
+**"모의투자에서 제공하지 않는 주문유형입니다."** 메시지의 의미:
+- 코드가 KIS API까지 정상 도달했다는 뜻입니다 → **프로그램은 정상**
+- KIS 모의투자 서버(`openapivts.koreainvestment.com`)가 해당 시간외 주문구분 코드를 지원하지 않는 상태입니다
+- 이 경우 판정: `MOCK_UNSUPPORTED_ORDER_TYPE` (프로그램 실패가 아닌 MOCK 서버 제약)
+
+**현재 주문구분 코드 상태 (config.yaml `after_hours` 섹션 기준):**
+
+| 세션 | 기본 코드 | 후보 코드 | 상태 |
+|------|---------|----------|------|
+| REGULAR | `00` | `00` | 공식 확인됨 |
+| PRE_MARKET | `05` | `05`, `60` | 후보 코드 — 공식 문서 재확인 필요 |
+| AFTER_CLOSE | `06` | `06`, `62` | 후보 코드 — 공식 문서 재확인 필요 |
+| AFTER_HOURS_SINGLE | `61` | `61` | 후보 코드 — 공식 문서 재확인 필요 |
+
+> **실전 주문은 KIS 공식 문서(https://apiportal.koreainvestment.com/)에서 ORD_DVSN 코드를 직접 확인한 후에만 활성화하세요.**
+
+**주문구분 후보 코드 전체 테스트 (--test-all-codes):**
+
+```bash
+# PRE_MARKET 세션에서 05, 60 두 코드를 모두 테스트
+python src/diagnose_after_hours_orders.py --stock-code 105560 --amount 10000 --session PRE_MARKET --test-all-codes
+
+# 특정 코드만 테스트
+python src/diagnose_after_hours_orders.py --stock-code 105560 --amount 10000 --session PRE_MARKET --ord-dvsn 05
+python src/diagnose_after_hours_orders.py --stock-code 105560 --amount 10000 --session PRE_MARKET --ord-dvsn 60
+
+# API 호출 없이 해석만 출력 (dry-run)
+python src/diagnose_after_hours_orders.py --stock-code 105560 --amount 10000 --dry-run
+
+# 전체 세션 진단
+python src/diagnose_after_hours_orders.py --stock-code 005930 --amount 10000
+```
+
+**응답 분류:**
+
+| 분류 | 의미 |
+|------|------|
+| `SUPPORTED` | MOCK 서버에서 주문 성공 |
+| `MOCK_UNSUPPORTED_ORDER_TYPE` | 모의투자 서버 미지원 주문유형 (코드 정상) |
+| `MARKET_CLOSED_OR_WRONG_SESSION` | 장종료 또는 세션 불일치 |
+| `VALID_ORDER_TYPE_BUT_INSUFFICIENT_FUNDS` | 잔고 부족 (주문구분 자체는 유효) |
+| `VALID_ORDER_TYPE_BUT_INVALID_PRICE` | 호가단위/가격 오류 |
+| `API_REJECTED` | 기타 거부 |
+
+진단 보고서 저장 위치:
+```
+reports/after_hours_diagnosis_YYYYMMDD_HHMMSS.txt
+reports/after_hours_diagnosis_YYYYMMDD_HHMMSS.json
+```
+
+### 10. 호가단위 오류 해결
+
+국내주식은 가격대별 호가단위(KRX 기준)가 정해져 있으므로 유효하지 않은 가격으로는 주문할 수 없습니다.
+
+**가격대별 호가단위:**
+
+| 가격 범위 | 호가단위 |
+|---------|---------|
+| 2,000원 미만 | 1원 |
+| 2,000원~5,000원 미만 | 5원 |
+| 5,000원~20,000원 미만 | 10원 |
+| 20,000원~50,000원 미만 | 50원 |
+| 50,000원~200,000원 미만 | 100원 |
+| 200,000원~500,000원 미만 | 500원 |
+| 500,000원 이상 | 1,000원 |
+
+**예시:**
+- KB금융 151,600원 × 1.001 = 151,751원 (무효) → 자동 보정 → 151,700원
+- 기본 매수 전략: `floor` (아래 유효 호가로 내림)
+- 기본 매도 전략: `ceil` (위 유효 호가로 올림)
+
+**설정 (config.yaml):**
+```yaml
+order_price:
+  tick_adjust_enabled: true  # 자동 보정 활성화
+  buy_tick_method: "floor"   # 매수: 내림
+  sell_tick_method: "ceil"   # 매도: 올림
+  log_tick_adjustment: true  # 보정 내역 로그 기록
+```
+
+**호가단위 테스트:**
+```bash
+python src/price_tick.py           # 자가 테스트 실행
+python src/full_system_verification.py  # 시스템 통합 검증 (항목 13a 포함)
+```
+
+### 11. 보유종목 KIS 계좌 동기화
+
+**문제:** `data/positions.json`이 오늘 MOCK 주문 기준으로 갱신되어 실제 KIS MOCK 계좌 잔고와 다를 수 있습니다.
+
+**해결:** Streamlit 앱 5번 화면(보유종목 및 매도감시)에서 **"KIS 계좌 동기화"** 버튼 클릭 → 브로커 잔고를 로컬 파일에 반영.
+
+```bash
+# 진단 (불일치 확인)
+python src/diagnose_account_sync.py
+
+# KIS→로컬 자동 동기화
+python src/diagnose_account_sync.py --sync
+
+# positions.json 완전 재생성 (KIS 계좌 기준)
+python src/diagnose_account_sync.py --reset
+```
+
+**화면 구성:**
+- **KIS 계좌 탭**: 한국투자증권 MOCK 계좌 실시간 보유 종목
+- **로컬 JSON 탭**: `data/positions.json` 기준 보유 종목
+- **비교 탭**: 불일치 종목 표시 + 경고
+
+---
+
+### 12. AI 후보 리스트 종목코드/종목명 표시
+
+**문제:** `tables.py` `render_candidates_table()`이 `ticker`/`name` 컬럼만 매핑 → top100 CSV의 `stock_code`/`stock_name` 컬럼을 표시하지 못함.
+
+**해결:** `display_cols`에 `stock_code`→"종목코드", `stock_name`→"종목명" 추가. 컬럼 순서: 순위→종목코드→종목명→현재가→상승확률→예측점수→거래대금.
+
+```bash
+# AI 후보 현재가 갱신
+python src/refresh_candidate_prices.py
+python src/refresh_candidate_prices.py --date 20260609 --top 100
+python src/refresh_candidate_prices.py --dry-run   # API 호출 없이 파일 상태 확인
+```
+
+**Streamlit 3번 화면 버튼:**
+- **캐시 초기화**: `st.cache_data.clear()` 후 재실행
+- **현재가 갱신**: `refresh_candidate_prices.py` 실행 후 재실행
+
+---
+
+### 13. 시스템 전체 검증
 
 ```bash
 python src/full_system_verification.py
 ```
+
+검증 항목 13b: KIS 계좌 직접 조회, positions.json 읽기, top100 stock_code/stock_name 컬럼 존재, `sync_broker_to_local` 함수 존재.
 
 최종 판정 기준:
 - `READY_FOR_PAPER`: PAPER 매매만 가능
 - `READY_FOR_MOCK`: API/MOCK 주문 가능
 - `READY_FOR_AI_PREDICTION`: 3년치 데이터, 모델, top100 후보 생성까지 완료
 - `READY_FOR_MOCK_AUTOTRADE`: top100 기반 MOCK 자동매매 가능
+- `READY_FOR_APP_STRATEGY_TRADING`: 앱에서 2가지 전략 매매 가능 (MOCK/PAPER)
 - `READY_FOR_REAL_REVIEW`: 실전 인증 가능, 실전 주문은 수동 검토 필요
 
 > **주의:** top100 후보는 투자 추천이 아닌 모델 기반 후보군입니다. 실제 수익은 보장되지 않습니다. 실전 주문은 반드시 MOCK 검증 이후 소액으로만 진행하세요.
+
+---
+
+### 14. 앱에서 2가지 매수 전략 사용
+
+Streamlit 앱 3번(AI 후보 리스트), 4번(예산배분) 화면에서 2가지 전략을 선택해 매수할 수 있습니다.
++2% 익절 목표 전략 — 수익을 보장하지 않습니다.
+
+#### 전략 1: 장초반 매매 (`morning_0930`)
+
+- 매수 시간: 09:25 ~ 09:40
+- 허용 세션: REGULAR(정규장)
+- 익절 기준: +2%, 손절 기준: -3%
+- 매도: REGULAR 세션 내 +2% 도달 시 또는 당일 장 마감 전 강제청산
+- 강제청산 규칙: `same_day_or_manual` (당일 장 중 청산 또는 수동)
+
+#### 전략 2: 종가 매매 (`afternoon_1500`)
+
+- 매수 시간: 14:50 ~ 15:20
+- 허용 세션: REGULAR, CLOSING_AUCTION(동시호가)
+- 익절 기준: +2%, 손절 기준: -3%
+- 매도: REGULAR / 장후시간외(AFTER_CLOSE) / 시간외단일가(AFTER_HOURS_SINGLE) / 장전시간외(PRE_MARKET) 포함
+- 강제청산 규칙: `next_day_0930_or_after` (다음날 오전 9시30분 또는 이후)
+
+#### CLI 사용법
+
+```bash
+# 전략 매수 (PAPER 테스트)
+python src/buy_candidate_list.py \
+  --file reports/predictions/top100_20260609.csv \
+  --budget 300000 --mode paper --strategy morning_0930 --max-orders 100
+
+# 전략 매수 (MOCK)
+python src/buy_candidate_list.py \
+  --file reports/predictions/top100_20260609.csv \
+  --budget 300000 --mode mock --strategy morning_0930 --max-orders 100
+
+# 주문 미리보기 (실제 주문 없음)
+python src/buy_candidate_list.py \
+  --file reports/predictions/top100_20260609.csv \
+  --budget 300000 --mode paper --strategy afternoon_1500 --preview
+
+# 전략별 매도 감시 (1회)
+python src/force_sell_monitor.py --strategy morning_0930
+python src/force_sell_monitor.py --strategy afternoon_1500
+
+# 전략별 매도 감시 (루프)
+python src/force_sell_monitor.py --strategy morning_0930 --loop --sleep 10
+
+# 백테스트 (전략별)
+python src/backtest.py --start 2024-01-01 --end 2024-12-31 --top-n 20 --strategy morning_0930
+python src/backtest.py --start 2024-01-01 --end 2024-12-31 --top-n 20 --strategy afternoon_1500
+```
+
+#### 앱 사용 순서
+
+1. `streamlit run app\streamlit_app.py` 실행
+2. **3번 AI 후보 리스트** 화면 → "전체 파이프라인 실행" 또는 단계별 실행으로 top100 생성
+3. **거래전략 선택** 라디오 버튼에서 전략 선택
+4. **주문 모드** (MOCK / PAPER / REAL) 선택
+5. **현재 리스트 전부 매수** 또는 체크박스 선택 후 **선택 종목만 매수**
+6. **5번 보유종목** 화면에서 포지션 확인 및 전략별 매도 감시 실행
+
+#### 보안 원칙
+
+- REAL 주문은 config.yaml 3중 안전장치 (`live_trade`, `use_mock`, `confirm_live_trade`) 모두 충족 시에만 허용
+- 미확인 시간외 ORD_DVSN 코드는 REAL 모드에서 절대 사용하지 않음
+- `real_order_confirmed: false`이면 REAL 시간외 주문은 항상 차단됨
 
 ---
 
@@ -692,3 +896,43 @@ streamlit run app\streamlit_app.py
 - 자동매매 프로그램의 오작동, API 오류, 시장 급변 등으로 예상치 못한 손실이 발생할 수 있습니다.
 - **소액으로 충분히 검증한 후 투자 규모를 결정하세요.**
 - 본 코드는 교육·연구 목적으로 제공되며, 실제 투자 손실에 대한 책임은 사용자 본인에게 있습니다.
+## 수동 매수와 전략 시간
+
+장초반 매매와 종가 매매 전략은 기본 매수시간을 갖습니다. 다만 앱에서 사용자가 `현재 리스트 전부 매수` 또는 선택 종목 매수를 직접 누르는 경우에는 수동 실행으로 처리됩니다.
+
+- MOCK/PAPER: 전략 매수시간 밖이어도 즉시 실행됩니다.
+- REAL: 전략 매수시간 밖이면 기존 안전장치에 따라 차단됩니다.
+- 이 전략은 수익을 보장하지 않으며 `+2% 익절 목표 전략`입니다.
+
+## 예산 한도까지 매수
+
+매수 예산은 `입력 예산`과 `실제 주문가능금액` 중 작은 금액을 기준으로 사용합니다. 후보 리스트를 순위순으로 확인해 1주 이상 살 수 있으면 주문 대상에 넣고, 예산이 남으면 다시 상위 후보부터 1주씩 추가 배분합니다.
+
+결과 리포트:
+
+```bash
+reports/budget_usage_YYYYMMDD.csv
+```
+
+## 자동매도 감시
+
+자동매도는 감시 프로세스가 실행 중일 때만 작동합니다. 앱을 닫았거나 감시 루프가 꺼져 있으면 +2%에 도달해도 자동매도되지 않습니다.
+
+MOCK 계좌와 로컬 포지션 동기화:
+
+```bash
+python src/sync_broker_positions.py --mode mock --strategy morning_0930
+```
+
++2% 익절 목표 감시:
+
+```bash
+python src/monitor_take_profit.py --mode mock
+python src/monitor_take_profit.py --mode mock --loop --sleep 5
+```
+
+감시 결과 리포트:
+
+```bash
+reports/take_profit_monitor_YYYYMMDD.csv
+```

@@ -16,9 +16,126 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
+from price_tick import adjust_price_to_tick, get_tick_size
 from utils import ensure_dir, get_today_str, load_config, setup_logger
 
 logger = setup_logger(__name__, "logs/budget_allocator.log")
+
+
+def _normalize_stock_code(value) -> str:
+    text = str(value).replace(".0", "").strip()
+    try:
+        return str(int(text)).zfill(6)
+    except Exception:
+        return text.zfill(6)
+
+
+def allocate_until_budget(
+    candidates: pd.DataFrame,
+    budget: int,
+    orderable_cash: int | None = None,
+    max_orders: int = 100,
+    allocation_mode: str = "rank_one_share_then_repeat",
+    allow_additional_buy: bool = False,
+    held_codes: Optional[set] = None,
+    config_path: str = "config.yaml",
+) -> pd.DataFrame:
+    """Allocate orders by repeatedly buying one share by candidate rank until budget is used."""
+    cfg = load_config(config_path)
+    buy_adj = cfg.get("order", {}).get("buy_price_adjustment_rate", 0.001)
+    effective_budget = int(min(int(budget), int(orderable_cash))) if orderable_cash is not None else int(budget)
+    held_codes = held_codes or set()
+
+    base_cols = [
+        "rank", "stock_code", "stock_name", "current_price", "order_price", "tick_size",
+        "quantity", "order_amount", "cumulative_order_amount", "remaining_budget",
+        "allocation_round", "allocation_reason",
+    ]
+    if candidates is None or candidates.empty or effective_budget <= 0:
+        return pd.DataFrame(columns=base_cols)
+
+    df = candidates.copy()
+    code_col = "stock_code" if "stock_code" in df.columns else ("ticker" if "ticker" in df.columns else None)
+    name_col = "stock_name" if "stock_name" in df.columns else ("name" if "name" in df.columns else None)
+    price_col = next((c for c in ("current_price", "close", "price") if c in df.columns), None)
+    if code_col is None or price_col is None:
+        return pd.DataFrame(columns=base_cols)
+
+    df["_stock_code"] = df[code_col].apply(_normalize_stock_code)
+    df["_stock_name"] = df[name_col].fillna("").astype(str) if name_col else df["_stock_code"]
+    df["_current_price"] = pd.to_numeric(df[price_col], errors="coerce").fillna(0).astype(float)
+    if "rank" in df.columns:
+        df["_rank_sort"] = pd.to_numeric(df["rank"], errors="coerce").fillna(999999)
+    elif "prediction_score" in df.columns:
+        df["_rank_sort"] = -pd.to_numeric(df["prediction_score"], errors="coerce").fillna(0)
+    elif "probability_2pct" in df.columns:
+        df["_rank_sort"] = -pd.to_numeric(df["probability_2pct"], errors="coerce").fillna(0)
+    elif "proba_up" in df.columns:
+        df["_rank_sort"] = -pd.to_numeric(df["proba_up"], errors="coerce").fillna(0)
+    else:
+        df["_rank_sort"] = range(1, len(df) + 1)
+
+    ranked = df.sort_values("_rank_sort", kind="stable").reset_index(drop=True)
+    ranked = ranked[ranked["_current_price"] > 0].copy()
+    if "buy_allowed" in ranked.columns:
+        ranked = ranked[ranked["buy_allowed"].astype(str).str.lower().isin(["true", "1", "yes"])].copy()
+    if not allow_additional_buy:
+        ranked = ranked[~ranked["_stock_code"].isin(held_codes)].copy()
+
+    rows_by_code: Dict[str, Dict] = {}
+    remaining = effective_budget
+    cumulative = 0
+    order_count = 0
+    round_no = 1
+
+    while order_count < max_orders and not ranked.empty:
+        bought_in_round = False
+        for idx, row in ranked.iterrows():
+            if order_count >= max_orders:
+                break
+            raw_price = int(float(row["_current_price"]) * (1 + buy_adj))
+            tick_cfg = cfg.get("order_price", {})
+            if tick_cfg.get("tick_adjust_enabled", True):
+                order_price = adjust_price_to_tick(raw_price, side="buy", method=tick_cfg.get("buy_tick_method", "floor"))
+            else:
+                order_price = raw_price
+            if order_price <= 0 or order_price > remaining:
+                continue
+
+            code = row["_stock_code"]
+            cumulative += order_price
+            remaining -= order_price
+            order_count += 1
+            bought_in_round = True
+            if code not in rows_by_code:
+                rank_value = int(row["rank"]) if "rank" in row and pd.notna(row.get("rank")) else int(idx + 1)
+                rows_by_code[code] = {
+                    "rank": rank_value,
+                    "stock_code": code,
+                    "stock_name": row["_stock_name"],
+                    "current_price": int(row["_current_price"]),
+                    "order_price": order_price,
+                    "tick_size": get_tick_size(order_price),
+                    "quantity": 0,
+                    "order_amount": 0,
+                    "cumulative_order_amount": cumulative,
+                    "remaining_budget": remaining,
+                    "allocation_round": round_no,
+                    "allocation_reason": allocation_mode,
+                }
+            rows_by_code[code]["quantity"] += 1
+            rows_by_code[code]["order_amount"] += order_price
+            rows_by_code[code]["cumulative_order_amount"] = cumulative
+            rows_by_code[code]["remaining_budget"] = remaining
+            rows_by_code[code]["allocation_round"] = round_no
+        if not bought_in_round:
+            break
+        round_no += 1
+
+    out = pd.DataFrame(list(rows_by_code.values()), columns=base_cols)
+    if not out.empty:
+        out = out.sort_values("rank", kind="stable").reset_index(drop=True)
+    return out
 
 
 class BudgetAllocationResult:
@@ -50,6 +167,7 @@ class BudgetAllocationResult:
 
 class BudgetAllocator:
     def __init__(self, config_path: str = "config.yaml") -> None:
+        self.config_path = config_path
         self.cfg = load_config(config_path)
         self.ft = self.cfg.get("force_trade", {})
         self._buy_adj = self.cfg.get("order", {}).get("buy_price_adjustment_rate", 0.001)
@@ -126,7 +244,13 @@ class BudgetAllocator:
                 result.excluded.append({"stock_code": code, "stock_name": name, "reason": "가격 0"})
                 continue
 
-            order_price = int(price * (1 + self._buy_adj))
+            raw_price = int(price * (1 + self._buy_adj))
+            tick_cfg = self.cfg.get("order_price", {})
+            if tick_cfg.get("tick_adjust_enabled", True):
+                buy_method = tick_cfg.get("buy_tick_method", "floor")
+                order_price = adjust_price_to_tick(raw_price, side="buy", method=buy_method)
+            else:
+                order_price = raw_price
             slot = effective * float(weights.iloc[i])
             slot = min(slot, remaining)
 
@@ -151,11 +275,16 @@ class BudgetAllocator:
             order_amount = qty * order_price
             remaining -= order_amount
 
+            rank_col = next((c for c in ("rank",) if c in candidates.columns), None)
             alloc = {
+                "rank": int(row[rank_col]) if rank_col else (len(allocations) + 1),
                 "stock_code": code,
                 "stock_name": name,
                 "current_price": price,
+                "original_price": int(price * (1 + self._buy_adj)),
                 "order_price": order_price,
+                "tick_size": get_tick_size(order_price),
+                "tick_adjusted": (order_price != int(price * (1 + self._buy_adj))),
                 "quantity": qty,
                 "order_amount": order_amount,
                 "prediction_score": float(row.get(score_col, 0)) if score_col else 0,
@@ -172,6 +301,33 @@ class BudgetAllocator:
         result.allocations = allocations
         result.total_order_amount = sum(a["order_amount"] for a in allocations)
         result.remaining_budget = remaining
+        return result
+
+    def allocate_until_budget(
+        self,
+        candidates: pd.DataFrame,
+        budget: int,
+        orderable_cash: int | None = None,
+        max_orders: int = 100,
+        allow_additional_buy: bool = False,
+        held_codes: Optional[set] = None,
+    ) -> BudgetAllocationResult:
+        result = BudgetAllocationResult()
+        result.total_budget = float(budget)
+        result.orderable_cash = float(orderable_cash or 0)
+        result.effective_budget = float(min(budget, orderable_cash) if orderable_cash is not None else budget)
+        df = allocate_until_budget(
+            candidates=candidates,
+            budget=int(budget),
+            orderable_cash=int(orderable_cash) if orderable_cash is not None else None,
+            max_orders=max_orders,
+            allow_additional_buy=allow_additional_buy,
+            held_codes=held_codes,
+            config_path=self.config_path,
+        )
+        result.allocations = df.to_dict("records")
+        result.total_order_amount = float(df["order_amount"].sum()) if not df.empty else 0.0
+        result.remaining_budget = result.effective_budget - result.total_order_amount
         return result
 
     def save_result(self, result: BudgetAllocationResult, date_str: Optional[str] = None) -> str:

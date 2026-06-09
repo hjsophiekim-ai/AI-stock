@@ -13,11 +13,29 @@ import streamlit as st
 import pandas as pd
 from config_service import load_config, get_trade_mode, get_safety_status
 from trading_service import (run_budget_allocation, run_paper_order,
-                               check_real_order_conditions)
+                               run_buy_candidates, check_real_order_conditions)
 from prediction_service import load_top20, get_today_str
 from tables import render_order_results_table
 from warning_box import real_order_warning, no_profit_guarantee_notice
 from mode_badge import render_mode_badge, render_mode_warning
+
+
+def render_budget_result_metrics(result: dict) -> None:
+    if not isinstance(result, dict):
+        return
+    labels = [
+        ("입력 예산", "input_budget"),
+        ("실제 주문가능금액", "orderable_cash"),
+        ("실제 사용 가능 예산", "effective_budget"),
+        ("예상 사용금액", "expected_order_amount"),
+        ("남은 금액", "remaining_budget"),
+    ]
+    if not any(key in result for _, key in labels):
+        return
+    cols = st.columns(len(labels))
+    for col, (label, key) in zip(cols, labels):
+        value = int(float(result.get(key, 0) or 0))
+        col.metric(label, f"{value:,}원")
 
 st.set_page_config(page_title="예산배분 및 주문", page_icon="💰", layout="wide")
 st.title("💰 예산배분 및 주문")
@@ -50,6 +68,14 @@ def load_top_n_candidates(date_str: str) -> pd.DataFrame | None:
 
 
 df_candidates, loaded_n = load_top_n_candidates(today_str)
+_enriched_candidates_path = PROJECT_ROOT / "reports" / f"enriched_candidates_{today_str}.csv"
+if _enriched_candidates_path.exists():
+    try:
+        _enriched_df = pd.read_csv(_enriched_candidates_path)
+        if not _enriched_df.empty:
+            df_candidates, loaded_n = _enriched_df, 100
+    except Exception:
+        pass
 
 if df_candidates is None or df_candidates.empty:
     st.warning(
@@ -59,6 +85,24 @@ if df_candidates is None or df_candidates.empty:
     st.stop()
 
 st.success(f"Top{loaded_n} 후보 파일 로드됨 ({len(df_candidates)}개 종목)")
+
+# ── 거래전략 선택 ────────────────────────────────────────────────
+st.subheader("거래전략 선택")
+try:
+    from strategy_config import get_strategy_display_labels, label_to_strategy_id
+    _strategy_labels = get_strategy_display_labels()
+except Exception:
+    _strategy_labels = [
+        "장초반 매매 — 9시30분경 매수, +2% 익절 목표",
+        "종가 매매 — 오후 3시경 매수, 시간외·프리마켓·다음날 장중 +2% 익절 목표",
+    ]
+
+_strategy_label = st.radio("전략", _strategy_labels, horizontal=True, index=0)
+try:
+    _strategy_id = label_to_strategy_id(_strategy_label)
+except Exception:
+    _strategy_id = "morning_0930" if "장초반" in _strategy_label else "afternoon_1500"
+st.caption(f"선택된 전략 ID: `{_strategy_id}`")
 
 # ── 예산 입력 ────────────────────────────────────────────────────
 st.subheader("예산 설정")
@@ -114,9 +158,66 @@ if st.button("예산배분 계산", type="primary"):
 
 st.divider()
 
+# ── 전략 매수 실행 (후보 리스트 전부/선택) ─────────────────────────
+st.subheader("전략 매수 실행")
+st.caption(f"선택 전략: **{_strategy_label}** | +2% 익절 목표 전략 — 수익을 보장하지 않습니다.")
+
+_cand_file = next(
+    (str(PROJECT_ROOT / "reports" / "predictions" / f"top{n}_{today_str}.csv")
+     for n in [100, 50, 20]
+     if (PROJECT_ROOT / "reports" / "predictions" / f"top{n}_{today_str}.csv").exists()),
+    None,
+)
+if _enriched_candidates_path.exists():
+    _cand_file = str(_enriched_candidates_path)
+
+_order_mode = st.radio("주문 모드", ["MOCK", "PAPER", "REAL"], index=0, horizontal=True, key="strategy_order_mode")
+if _order_mode == "REAL":
+    real_order_warning()
+
+_b_col1, _b_col2, _b_col3 = st.columns(3)
+with _b_col1:
+    if st.button("현재 리스트 전부 매수", type="primary", use_container_width=True):
+        if not _cand_file:
+            st.error("후보 파일이 없습니다.")
+        else:
+            with st.spinner(f"{_order_mode} 전략 매수 실행 중..."):
+                r = run_buy_candidates(
+                    candidate_file=_cand_file, budget=int(budget),
+                    mode=_order_mode.lower(), strategy_id=_strategy_id,
+                    max_orders=int(max_orders),
+                )
+            if not isinstance(r, dict):
+                st.error("매수 반환값 오류")
+            elif r.get("success"):
+                st.success(r.get("message", "매수 완료"))
+            else:
+                st.error(f"매수 실패: {r.get('message','')}")
+            if isinstance(r, dict) and r.get("allocation_preview"):
+                st.dataframe(pd.DataFrame(r["allocation_preview"]), use_container_width=True)
+
+with _b_col2:
+    if st.button("주문 미리보기", use_container_width=True):
+        if not _cand_file:
+            st.error("후보 파일이 없습니다.")
+        else:
+            with st.spinner("미리보기 생성 중..."):
+                r = run_buy_candidates(
+                    candidate_file=_cand_file, budget=int(budget),
+                    mode=_order_mode.lower(), strategy_id=_strategy_id,
+                    max_orders=int(max_orders), preview_only=True,
+                )
+            if isinstance(r, dict) and r.get("allocation_preview"):
+                st.success(f"미리보기 {len(r['allocation_preview'])}건 (실제 주문 없음)")
+                st.dataframe(pd.DataFrame(r["allocation_preview"]), use_container_width=True)
+            else:
+                st.warning((r or {}).get("message", "미리보기 없음"))
+
+st.divider()
+
 # ── 주문 실행 ────────────────────────────────────────────────────
-st.subheader("주문 실행")
-order_mode = st.radio("주문 모드", ["PAPER", "MOCK", "REAL"], index=0, horizontal=True)
+st.subheader("개별 종목 주문 테스트")
+order_mode = st.radio("주문 모드", ["PAPER", "MOCK", "REAL"], index=0, horizontal=True, key="single_order_mode")
 
 if order_mode == "REAL":
     real_order_warning()

@@ -15,6 +15,7 @@ import pandas as pd
 
 from kis_api import KISApiClient
 from position_manager import PositionManager
+from price_tick import adjust_price_to_tick, get_tick_size
 from risk_manager import RiskManager
 from safety_gate import SafetyGate, TRADE_MODE_PAPER, TRADE_MODE_MOCK, TRADE_MODE_REAL
 from trading_calendar import TradingCalendar, SESSION_CLOSED, SESSION_CLOSING_AUCTION
@@ -39,10 +40,11 @@ class OrderManager:
         self,
         config_path: str = "config.yaml",
         gate: Optional["SafetyGate"] = None,
+        runtime_mode: Optional[str] = None,
     ) -> None:
         self._config_path = config_path
         self.cfg = load_config(config_path)
-        self.gate = gate if gate is not None else SafetyGate(config_path)
+        self.gate = gate if gate is not None else SafetyGate(config_path, runtime_mode=runtime_mode)
         self.risk = RiskManager(config_path)
         self.pos_mgr = PositionManager(config_path)
         self.calendar = TradingCalendar(config_path)
@@ -133,8 +135,19 @@ class OrderManager:
         quantity = int(target_amount // current_price)
         if quantity <= 0:
             return {"success": False, "reason": f"매수 수량 0: target_amount={target_amount:.0f}원, price={current_price}원"}
-        # 지정가: 현재가보다 살짝 높게 (체결 확률 높이기)
-        order_price = int(current_price * (1 + self._buy_adj))
+        # 지정가: 현재가보다 살짝 높게, 호가단위 보정
+        raw_price = int(current_price * (1 + self._buy_adj))
+        tick_cfg = self.cfg.get("order_price", {})
+        if tick_cfg.get("tick_adjust_enabled", True):
+            buy_method = tick_cfg.get("buy_tick_method", "floor")
+            order_price = adjust_price_to_tick(raw_price, side="buy", method=buy_method)
+            if order_price != raw_price and tick_cfg.get("log_tick_adjustment", True):
+                logger.info(
+                    "[호가보정] %s buy %d → %d (tick=%d method=%s)",
+                    stock_code, raw_price, order_price, get_tick_size(order_price), buy_method,
+                )
+        else:
+            order_price = raw_price
 
         # RiskManager 승인
         approval = self.risk.approve_buy_order(
@@ -182,6 +195,11 @@ class OrderManager:
             "order_price": order_price,
             "entry_price": entry_price,
             "mode": mode,
+            "requested_mode": (self.gate._runtime_mode or "").lower() or mode.lower(),
+            "resolved_mode": mode,
+            "api_called": mode != TRADE_MODE_PAPER,
+            "mock_order_called": mode == TRADE_MODE_MOCK,
+            "real_order_called": mode == TRADE_MODE_REAL,
         }
         logger.info(
             "[주문 전] 매수 | 종목=%s(%s) | 수량=%d | 주문가=%d | 매수가=%d | 모드=%s | 예상금액=%s원",
@@ -267,7 +285,18 @@ class OrderManager:
             if self._api is not None:
                 try:
                     info = self._api.get_current_price(stock_code)
-                    sell_price = int(info.get("current_price", 0) * (1 + self._sell_adj))
+                    raw_sell = int(info.get("current_price", 0) * (1 + self._sell_adj))
+                    tick_cfg = self.cfg.get("order_price", {})
+                    if tick_cfg.get("tick_adjust_enabled", True):
+                        sell_method = tick_cfg.get("sell_tick_method", "ceil")
+                        sell_price = adjust_price_to_tick(raw_sell, side="sell", method=sell_method)
+                        if sell_price != raw_sell and tick_cfg.get("log_tick_adjustment", True):
+                            logger.info(
+                                "[호가보정] %s sell %d → %d (tick=%d method=%s)",
+                                stock_code, raw_sell, sell_price, get_tick_size(sell_price), sell_method,
+                            )
+                    else:
+                        sell_price = raw_sell
                 except Exception as e:
                     logger.warning("매도 현재가 조회 실패 [%s]: %s", stock_code, str(e))
                     sell_price = 0
@@ -317,6 +346,11 @@ class OrderManager:
             "sell_price": sell_price,
             "reason": reason,
             "mode": mode,
+            "requested_mode": (self.gate._runtime_mode or "").lower() or mode.lower(),
+            "resolved_mode": mode,
+            "api_called": mode != TRADE_MODE_PAPER,
+            "mock_order_called": mode == TRADE_MODE_MOCK,
+            "real_order_called": mode == TRADE_MODE_REAL,
         }
         logger.info(
             "[주문 전] 매도 | 종목=%s(%s) | 수량=%d | 가격=%d | 사유=%s | 모드=%s",
@@ -418,6 +452,7 @@ class OrderManager:
         order_price: int,
         current_price: int,
         side: str = "buy",
+        allow_additional_buy: bool = False,
     ) -> Dict:
         """주문 전 검증을 포함한 주문 실행.
 
@@ -453,13 +488,20 @@ class OrderManager:
 
         order_record = {
             "datetime": now.isoformat(),
-            "requested_mode": (self.gate._runtime_mode or "").upper() or mode,
+            "requested_mode": (self.gate._runtime_mode or "").lower() or mode.lower(),
             "resolved_mode": mode,
             "trade_mode": mode,
             "order_session": order_session,
             "api_called": False,
             "mock_order_called": False,
             "real_order_called": False,
+            "order_rejected": False,
+            "error_category": "",
+            "is_mock_supported": True,
+            "is_real_safe_to_use": False,
+            "ord_dvsn": "",
+            "tr_id": "",
+            "raw_msg": "",
             "stock_code": stock_code,
             "stock_name": stock_name,
             "quantity": quantity,
@@ -500,7 +542,7 @@ class OrderManager:
                 stock_name=stock_name,
                 price=float(current_price),
                 quantity=quantity,
-                current_positions=self.pos_mgr.get_all_positions(),
+                current_positions={} if allow_additional_buy else self.pos_mgr.get_all_positions(),
             )
             if not approval.approved:
                 order_record["rejected_reason"] = f"RiskManager: {approval.reason}"
@@ -534,7 +576,7 @@ class OrderManager:
             stock_name=stock_name,
             price=float(current_price),
             quantity=quantity,
-            current_positions=self.pos_mgr.get_all_positions(),
+            current_positions={} if allow_additional_buy else self.pos_mgr.get_all_positions(),
         )
         if not approval.approved:
             order_record["rejected_reason"] = f"RiskManager: {approval.reason}"
@@ -554,6 +596,16 @@ class OrderManager:
 
             rt_cd = resp.get("rt_cd", "")
             order_no = resp.get("output", {}).get("ODNO", "")
+            error_category = resp.get("error_category", "")
+            raw_msg = resp.get("raw_msg", resp.get("msg1", ""))
+
+            # resp에서 추가 분류 필드 반영
+            order_record["error_category"] = error_category
+            order_record["is_mock_supported"] = resp.get("is_mock_supported", True)
+            order_record["is_real_safe_to_use"] = resp.get("is_real_safe_to_use", False)
+            order_record["ord_dvsn"] = resp.get("ord_dvsn", "")
+            order_record["tr_id"] = resp.get("tr_id", "")
+            order_record["raw_msg"] = raw_msg
 
             if rt_cd == "0":
                 if side == "buy":
@@ -570,14 +622,31 @@ class OrderManager:
                     "[%s] api_called=True real_order_called=%s %s %d주 @ %d원 주문번호=%s",
                     mode, mode == "REAL", stock_code, quantity, order_price, order_no,
                 )
+            elif error_category == "MOCK_UNSUPPORTED_ORDER_TYPE":
+                # MOCK 서버가 해당 주문유형을 미지원 — 코드 오류 아님
+                order_record.update({
+                    "order_rejected": True,
+                    "order_result": "MOCK_UNSUPPORTED_ORDER_TYPE",
+                    "rejected_reason": (
+                        "한국투자증권 모의투자 서버가 해당 시간외 주문유형을 지원하지 않음 "
+                        f"(세션={order_session} ORD_DVSN={resp.get('ord_dvsn', '')} "
+                        f"TR_ID={resp.get('tr_id', '')} msg={raw_msg})"
+                    ),
+                })
+                logger.warning(
+                    "[%s] MOCK_UNSUPPORTED_ORDER_TYPE %s 세션=%s ORD_DVSN=%s msg=%s — 코드 정상, MOCK 서버 제약",
+                    mode, stock_code, order_session, resp.get("ord_dvsn", ""), raw_msg,
+                )
             else:
-                msg = resp.get("msg1", "")
-                order_record["rejected_reason"] = f"API거부: rt_cd={rt_cd} {msg}"
-                order_record["order_result"] = f"REJECTED:{rt_cd}"
+                order_record.update({
+                    "order_rejected": True,
+                    "rejected_reason": f"API거부: rt_cd={rt_cd} {raw_msg}",
+                    "order_result": f"REJECTED:{rt_cd}",
+                })
                 self._failed_tickers.add(stock_code)
                 logger.warning(
                     "[%s] 주문거부 api_called=True %s rt_cd=%s msg=%s",
-                    mode, stock_code, rt_cd, msg,
+                    mode, stock_code, rt_cd, raw_msg,
                 )
         except RuntimeError as e:
             order_record["rejected_reason"] = f"SafetyGate: {e}"
