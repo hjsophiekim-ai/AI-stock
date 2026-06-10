@@ -234,13 +234,19 @@ kis:
   token_path: /oauth2/tokenP
   app_key_env: KIS_APP_KEY
   app_secret_env: KIS_APP_SECRET
+  real_app_key_env: KIS_REAL_APP_KEY
+  real_app_secret_env: KIS_REAL_APP_SECRET
+  mock_app_key_env: KIS_MOCK_APP_KEY
+  mock_app_secret_env: KIS_MOCK_APP_SECRET
   account_no_env: KIS_ACCOUNT_NO
   account_product_code_env: KIS_ACCOUNT_PRODUCT_CODE
   mock_account_no_env: KIS_MOCK_ACCOUNT_NO
   mock_account_product_code_env: KIS_MOCK_ACCOUNT_PRODUCT_CODE
   request_timeout_seconds: 10
   rate_limit_sleep_seconds: 0.25
-  token_cache_file: data/token_cache.json
+  token_cache_file: ''
+  real_token_cache_file: data/real_token_cache.json
+  mock_token_cache_file: data/mock_token_cache.json
 order:
   default_order_type: limit
   buy_price_adjustment_rate: 0.001

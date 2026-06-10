@@ -11,12 +11,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from env_service import inject_to_os_env
 
 
-def _get_api_client(config_path: Optional[str] = None):
+def _get_api_client(config_path: Optional[str] = None, runtime_mode: Optional[str] = None):
     """KISApiClient 인스턴스 생성."""
     inject_to_os_env()
     config_path = config_path or str(PROJECT_ROOT / "config.yaml")
     from kis_api import KISApiClient
-    return KISApiClient(config_path)
+    return KISApiClient(config_path, runtime_mode=runtime_mode)
 
 
 def test_env_vars() -> Dict:

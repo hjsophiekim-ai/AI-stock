@@ -70,16 +70,36 @@ class VerificationResult:
         self.data: Dict[str, Any] = {}
         self.ts: str = datetime.now().isoformat()
 
-    def ok(self, msg: str = "", **data) -> "VerificationResult":
+    def ok(
+        self,
+        msg: str = "",
+        detail: Optional[str] = None,
+        conditions: Optional[Dict[str, Any]] = None,
+        **data,
+    ) -> "VerificationResult":
         self.status = STATUS_OK
         self.message = msg
+        if detail is not None:
+            self.detail = str(detail)
+        if conditions is not None:
+            data["conditions"] = conditions
         self.data.update(data)
         return self
 
-    def fail(self, msg: str = "", detail: str = "") -> "VerificationResult":
+    def fail(
+        self,
+        msg: str = "",
+        detail: Optional[str] = None,
+        conditions: Optional[Dict[str, Any]] = None,
+        **data,
+    ) -> "VerificationResult":
         self.status = STATUS_FAIL
         self.message = msg
-        self.detail = detail
+        if detail is not None:
+            self.detail = str(detail)
+        if conditions is not None:
+            data["conditions"] = conditions
+        self.data.update(data)
         return self
 
     def skip(self, msg: str = "") -> "VerificationResult":
@@ -87,9 +107,20 @@ class VerificationResult:
         self.message = msg
         return self
 
-    def warn(self, msg: str = "") -> "VerificationResult":
+    def warn(
+        self,
+        msg: str = "",
+        detail: Optional[str] = None,
+        conditions: Optional[Dict[str, Any]] = None,
+        **data,
+    ) -> "VerificationResult":
         self.status = STATUS_WARN
         self.message = msg
+        if detail is not None:
+            self.detail = str(detail)
+        if conditions is not None:
+            data["conditions"] = conditions
+        self.data.update(data)
         return self
 
     def to_dict(self) -> Dict:
@@ -173,6 +204,10 @@ class SystemVerifier:
         self._started_at = datetime.now()
         self._ai_pipeline_ready: bool = False
         self._strategy_ready: bool = False
+        self._mock_orderable_cash: int = 0
+        self._mock_order_diagnosis: Dict[str, Any] = {}
+        self._real_dry_run_ok: bool = False
+        self._real_actual_order_executed: bool = False
 
     # ── 로깅 ──────────────────────────────────
     def _log(self, msg: str) -> None:
@@ -418,15 +453,18 @@ class SystemVerifier:
         # 환경변수 os.environ에 주입
         for k, v in self._env.items():
             os.environ[k] = v
+        from mock_order_diagnosis import _mock_config_path
+        from safety_gate import SafetyGate
+        mock_cfg_path = _mock_config_path(self.config_path)
 
         # 모의 인증
         r = VerificationResult("MOCK_토큰발급")
         try:
             from kis_auth import KISAuth
-            auth = KISAuth(self.config_path)
+            auth = KISAuth(mock_cfg_path)
             token = auth.get_access_token()
             if token and len(token) > 10:
-                r.ok(f"토큰 {len(token)}자 발급")
+                r.ok(f"토큰 {len(token)}자 발급", token_source=auth.token_source)
                 self._token_ok = True
             else:
                 r.fail("토큰 빈 문자열")
@@ -442,7 +480,7 @@ class SystemVerifier:
             r = VerificationResult("MOCK_현재가조회")
             try:
                 from kis_api import KISApiClient
-                api = KISApiClient(self.config_path)
+                api = KISApiClient(mock_cfg_path, gate=SafetyGate(mock_cfg_path, runtime_mode="mock"))
                 info = api.get_current_price("005930")
                 price = int(info.get("current_price", 0))
                 name_str = info.get("stock_name", "삼성전자")
@@ -459,7 +497,7 @@ class SystemVerifier:
             r = VerificationResult("MOCK_잔고조회")
             try:
                 from kis_api import KISApiClient
-                api = KISApiClient(self.config_path)
+                api = KISApiClient(mock_cfg_path, gate=SafetyGate(mock_cfg_path, runtime_mode="mock"))
                 bal = api.get_account_balance()
                 rt_cd = bal.get("rt_cd", "")
                 msg1 = bal.get("msg1", "")
@@ -480,12 +518,18 @@ class SystemVerifier:
             r = VerificationResult("MOCK_주문가능금액")
             try:
                 from kis_api import KISApiClient
-                api = KISApiClient(self.config_path)
+                api = KISApiClient(mock_cfg_path, gate=SafetyGate(mock_cfg_path, runtime_mode="mock"))
                 cash = api.get_orderable_cash()
+                self._mock_orderable_cash = int(float(cash or 0))
                 r.ok(f"{cash:,.0f}원", orderable_cash=cash)
             except Exception as e:
                 r.fail(str(e)[:120])
             self._record(r)
+
+        try:
+            os.unlink(mock_cfg_path)
+        except Exception:
+            pass
 
         # REAL 토큰 테스트 (키가 있을 때만, 주문은 절대 안 함)
         r = VerificationResult("REAL_토큰발급")
@@ -881,50 +925,44 @@ class SystemVerifier:
             self._record(VerificationResult("MOCK_주문").skip("토큰 발급 실패로 SKIP"))
             return
 
-        # --mode mock 은 runtime_mode로 override → live_trade/use_mock config와 무관하게 실행
         r = VerificationResult("MOCK_주문")
         rc, out, err = _run_cmd(
-            [sys.executable, "src/force_auto_trade.py",
-             "--budget", "300000", "--mode", "mock",
-             "--min-orders", "1", "--max-orders", "100"],
+            [sys.executable, "src/mock_order_diagnosis.py",
+             "--stock-code", "015760", "--quantity", "1"],
             timeout=180,
         )
         combined = out + err
-        # 성공 신호
-        order_signals = [
-            "주문번호", "odno", "rt_cd", "MOCK", "주문 성공", "완료",
-            "resolved_mode", "mock_order_called",
-        ]
-        # MOCK 서버 미지원 — 코드 정상, WARN으로 분류
-        mock_unsupported_signals = [
-            "MOCK_UNSUPPORTED_ORDER_TYPE",
-            "모의투자에서 제공하지 않는 주문유형",
-            "판정: MOCK_UNSUPPORTED",
-        ]
-        # 거래 없음 (후보 없음 등 — 인프라 문제 아님)
-        warn_signals = ["후보 종목 없음", "예측 파일 없음", "거래없음 보고서"]
-        # 치명적 오류
-        fail_signals = ["traceback", "exception", "force_trade.enabled=false"]
+        parsed = None
+        try:
+            start = out.find("{")
+            end = out.rfind("}")
+            if start >= 0 and end >= start:
+                parsed = json.loads(out[start:end + 1])
+                self._mock_order_diagnosis = parsed
+                self._mock_orderable_cash = int(float(parsed.get("orderable_cash", self._mock_orderable_cash) or 0))
+        except Exception:
+            parsed = None
 
-        if any(s.lower() in combined.lower() for s in fail_signals):
-            err_short = combined.strip()[:300]
-            r.fail(f"MOCK 주문 오류: rc={rc}", err_short)
-        elif any(s.lower() in combined.lower() for s in mock_unsupported_signals):
-            r.warn(
-                "MOCK 주문 — 모의투자 서버가 해당 시간외 주문유형을 미지원 (MOCK_UNSUPPORTED_ORDER_TYPE). "
-                "프로그램 로직 정상. 공식 문서에서 ORD_DVSN 코드 재확인 필요."
+        if parsed and parsed.get("success"):
+            r.ok(
+                "MOCK 1주 주문 진단 성공",
+                order_no=parsed.get("order_no"),
+                orderable_cash=parsed.get("orderable_cash"),
+                token_source=parsed.get("token_source"),
+                token_recovered=parsed.get("token_recovered"),
+                report=parsed.get("json_path"),
             )
-        elif any(s.lower() in combined.lower() for s in order_signals):
-            r.ok("MOCK 주문 완료 (API 호출 포함)", rc=rc)
-        elif any(s.lower() in combined.lower() for s in warn_signals):
-            r.warn("MOCK 주문 0건 — 후보 없음 또는 예산 부족 (장 마감 가능성)")
-            r.status = STATUS_WARN
-        elif rc == 0:
-            r.ok(f"정상 종료 (rc=0) | {combined.strip()[-80:]}")
+        elif parsed:
+            r.warn(
+                f"MOCK 1주 주문 진단 실패 rc={rc}",
+                detail=parsed.get("msg", combined[-1000:]),
+                orderable_cash=parsed.get("orderable_cash"),
+                token_source=parsed.get("token_source"),
+                token_recovered=parsed.get("token_recovered"),
+                report=parsed.get("json_path"),
+            )
         else:
-            err_short = combined.strip()[:300]
-            r.warn(f"rc={rc} — 장 마감 또는 모의계좌 오류 가능성 | {err_short[:100]}")
-            r.status = STATUS_WARN
+            r.warn(f"MOCK 진단 출력 파싱 실패 rc={rc}", detail=combined[-1000:])
         self._record(r)
 
     # ──────────────────────────────────────────
@@ -1121,10 +1159,17 @@ class SystemVerifier:
         r1 = VerificationResult("KIS_get_positions")
         try:
             from kis_api import KISApiClient
-            api = KISApiClient(str(PROJECT_ROOT / "config.yaml"))
+            from mock_order_diagnosis import _mock_config_path
+            from safety_gate import SafetyGate
+            mock_cfg_path = _mock_config_path(str(PROJECT_ROOT / "config.yaml"))
+            api = KISApiClient(mock_cfg_path, gate=SafetyGate(mock_cfg_path, runtime_mode="mock"))
             import pandas as pd
             df = api.get_positions()
             r1.ok(f"MOCK 계좌 보유 종목 {len(df)}개 조회", count=len(df))
+            try:
+                os.unlink(mock_cfg_path)
+            except Exception:
+                pass
         except Exception as e:
             r1.warn(f"get_positions 오류: {e}")
         self._record(r1)
@@ -1438,6 +1483,10 @@ class SystemVerifier:
             "real_keys_ok": self._real_keys_ok,
             "mock_token_ok": self._token_ok,
             "real_token_ok": self._real_token_ok,
+            "mock_orderable_cash": self._mock_orderable_cash,
+            "mock_order_diagnosis": self._mock_order_diagnosis,
+            "real_dry_run_ok": self._real_dry_run_ok,
+            "real_actual_order_executed": self._real_actual_order_executed,
             "verdict": verdict,
             "next_actions": actions,
             "results": {k: v.to_dict() for k, v in self.results.items()},
@@ -1469,6 +1518,10 @@ class SystemVerifier:
             f"  REAL 키: {'완비' if self._real_keys_ok else '누락'}",
             f"  MOCK 토큰: {'발급됨' if self._token_ok else '미발급'}",
             f"  REAL 토큰: {'발급됨' if self._real_token_ok else '미발급/SKIP'}",
+            f"  MOCK 주문가능금액: {self._mock_orderable_cash:,}원",
+            f"  MOCK 1주 주문 진단: {'성공' if self._mock_order_diagnosis.get('success') else '실패/미실행'}",
+            f"  REAL dry-run: {'OK' if self._real_dry_run_ok else 'WARN/FAIL'}",
+            f"  REAL 실제 주문 실행 여부: {'YES' if self._real_actual_order_executed else 'NO'}",
             "",
             "[ 최종 판정 ]",
             f"  >>> {verdict} <<<",
@@ -1606,12 +1659,15 @@ class SystemVerifier:
         print(f"|  MOCK 잔고      : {_icon('MOCK_잔고조회')}{'':<32}|")
         print(f"|  MOCK 주문가능  : {_icon('MOCK_주문가능금액')}{'':<32}|")
         print(f"|  REAL token     : {_icon('REAL_토큰발급')}{'':<32}|")
+        print(f"|  MOCK cash      : {self._mock_orderable_cash:>12,}원{'':<24}|")
         print(sep)
         print(f"|  {'[Trading]':<56}|")
         print(f"|  후보생성       : {_icon('top20_파일')}{'':<32}|")
         print(f"|  예산배분       : {_icon('예산배분')}{'':<32}|")
         print(f"|  PAPER 주문     : {_icon('PAPER_주문')}{'':<32}|")
         print(f"|  MOCK 주문      : {_icon('MOCK_주문')}{'':<32}|")
+        print(f"|  REAL dry-run   : {_icon('REAL_order_test_dry_run')}{'':<32}|")
+        print(f"|  REAL actual    : {'NO':<38}|")
         print(f"|  매도감시       : {_icon('매도감시_실행')}{'':<32}|")
         print(f"|  강제청산 안전  : {_icon('강제청산_안전장치')}{'':<32}|")
         print(sep)
@@ -1700,6 +1756,8 @@ class SystemVerifier:
 
         readiness_path = PROJECT_ROOT / "src" / "real_order_readiness_check.py"
         test_path = PROJECT_ROOT / "src" / "real_order_test.py"
+        diagnosis_path = PROJECT_ROOT / "src" / "real_order_diagnosis.py"
+        verify_path = PROJECT_ROOT / "src" / "real_order_verify.py"
         self._record(
             VerificationResult("real_order_readiness_check.py").ok(str(readiness_path))
             if readiness_path.exists()
@@ -1710,10 +1768,22 @@ class SystemVerifier:
             if test_path.exists()
             else VerificationResult("real_order_test.py").fail("missing")
         )
+        self._record(
+            VerificationResult("real_order_diagnosis.py").ok(str(diagnosis_path))
+            if diagnosis_path.exists()
+            else VerificationResult("real_order_diagnosis.py").fail("missing")
+        )
+        self._record(
+            VerificationResult("real_order_verify.py").ok(str(verify_path))
+            if verify_path.exists()
+            else VerificationResult("real_order_verify.py").fail("missing")
+        )
 
         try:
             import real_order_readiness_check  # type: ignore  # noqa: F401
             import real_order_test  # type: ignore  # noqa: F401
+            import real_order_diagnosis  # type: ignore  # noqa: F401
+            import real_order_verify  # type: ignore  # noqa: F401
             from safety_gate import SafetyGate  # type: ignore
 
             self._record(VerificationResult("REAL_order_modules_import").ok("import ok"))
@@ -1733,6 +1803,28 @@ class SystemVerifier:
         except Exception as exc:
             self._record(VerificationResult("REAL_order_modules_import").fail(str(exc)))
 
+        try:
+            from kis_api import KISApiClient  # type: ignore
+            from real_order_utils import validate_real_order_payload  # type: ignore
+
+            gate = SafetyGate(config_path=str(PROJECT_ROOT / self.config_path), runtime_mode="real")
+            api = KISApiClient(str(PROJECT_ROOT / self.config_path), gate=gate)
+            req = api.build_cash_order_request("005930", 1, 70000, include_hashkey=True)
+            valid, errors = validate_real_order_payload(req.get("body", {}))
+            self._record(
+                VerificationResult("REAL_order_payload_validation").ok("payload valid")
+                if valid
+                else VerificationResult("REAL_order_payload_validation").fail("; ".join(errors))
+            )
+            hash_ready = req.get("hashkey_ready")
+            self._record(
+                VerificationResult("REAL_hashkey_generation").ok("hashkey generated")
+                if hash_ready is True
+                else VerificationResult("REAL_hashkey_generation").warn("hashkey not generated; REAL order will be blocked")
+            )
+        except Exception as exc:
+            self._record(VerificationResult("REAL_hashkey_generation").warn(str(exc)[:160]))
+
         rc, out, err = _run_cmd(
             [sys.executable, "src/real_order_test.py", "--stock-code", "005930", "--quantity", "1", "--dry-run"],
             timeout=45,
@@ -1740,8 +1832,32 @@ class SystemVerifier:
         r = VerificationResult("REAL_order_test_dry_run")
         if rc == 0:
             r.ok("dry-run completed; no real order placed")
+            self._real_dry_run_ok = True
         else:
             r.warn(f"dry-run returned rc={rc}; no real order placed", detail=(out + "\n" + err)[-1000:])
+        self._record(r)
+
+        rc, out, err = _run_cmd(
+            [sys.executable, "src/real_order_diagnosis.py", "--stock-code", "005930", "--quantity", "1"],
+            timeout=60,
+        )
+        r = VerificationResult("REAL_order_diagnosis_dry_run")
+        if rc == 0:
+            r.ok("diagnosis completed; no real order placed")
+            self._real_dry_run_ok = True
+        else:
+            r.warn(f"diagnosis returned rc={rc}; no real order placed", detail=(out + "\n" + err)[-1000:])
+        self._record(r)
+
+        rc, out, err = _run_cmd(
+            [sys.executable, "src/real_order_verify.py", "--stock-code", "005930"],
+            timeout=60,
+        )
+        r = VerificationResult("REAL_order_verify_query")
+        if rc == 0:
+            r.ok("order inquiry completed; no real order placed")
+        else:
+            r.warn(f"order inquiry returned rc={rc}; no real order placed", detail=(out + "\n" + err)[-1000:])
         self._record(r)
 
         cfg = self._cfg or {}
@@ -1752,6 +1868,107 @@ class SystemVerifier:
             r.ok("REAL bulk order disabled by default")
         else:
             r.warn("REAL bulk order flags are enabled; use advanced option only")
+        self._record(r)
+
+        self._real_actual_order_executed = False
+        self._record(VerificationResult("REAL_actual_order_executed").ok("NO"))
+
+    def verify_mode_url_consistency(self) -> None:
+        self._section("13f. MOCK/REAL mode-url consistency")
+
+        try:
+            from kis_api import KISApiClient  # type: ignore
+            from kis_auth import KISAuth  # type: ignore
+            from safety_gate import SafetyGate  # type: ignore
+        except Exception as exc:
+            self._record(VerificationResult("mode_url_import").fail(str(exc)))
+            return
+
+        config_path = str(PROJECT_ROOT / self.config_path)
+        checks = [
+            ("mock", "MOCK", "openapivts.koreainvestment.com:29443", "MOCK_APP_KEY"),
+            ("real", "REAL", "openapi.koreainvestment.com:9443", "REAL_APP_KEY"),
+        ]
+        for requested, expected_mode, expected_host, expected_key_type in checks:
+            r = VerificationResult(f"{expected_mode}_mode_url_consistency")
+            try:
+                auth = KISAuth(config_path, runtime_mode=requested)
+                gate = SafetyGate(config_path, runtime_mode=requested)
+                if requested == "real" and gate.mode != "REAL":
+                    r.warn(
+                        "REAL is blocked by safety conditions; auth URL still checked",
+                        token_url=auth.token_url,
+                        key_type_used=auth.key_type_used,
+                        resolved_mode=gate.mode,
+                    )
+                    self._record(r)
+                    continue
+                api = KISApiClient(config_path, gate=gate)
+                meta = api.diagnostic_metadata()
+                token_url = str(meta.get("token_url", ""))
+                base_url = str(meta.get("base_url", ""))
+                key_type = str(meta.get("key_type_used", ""))
+                mode_ok = str(meta.get("resolved_mode", "")) == expected_mode
+                url_ok = expected_host in token_url and expected_host in base_url
+                key_ok = key_type in {expected_key_type, "GENERIC_APP_KEY_FALLBACK"}
+                if mode_ok and url_ok and key_ok and meta.get("mode_url_valid") is True:
+                    r.ok(
+                        f"{expected_mode} token/base URL OK",
+                        token_url=token_url,
+                        base_url=base_url,
+                        key_type_used=key_type,
+                        token_cache_file=meta.get("token_cache_file"),
+                    )
+                else:
+                    r.fail(
+                        f"{expected_mode} mode/url/key mismatch",
+                        token_url=token_url,
+                        base_url=base_url,
+                        key_type_used=key_type,
+                        resolved_mode=meta.get("resolved_mode"),
+                    )
+            except Exception as exc:
+                r.fail(str(exc))
+            self._record(r)
+
+    def verify_order_result_csv_columns(self) -> None:
+        self._section("13g. order result CSV diagnostics columns")
+
+        required = {
+            "base_url",
+            "token_url",
+            "key_type_used",
+            "token_cache_file",
+            "token_source",
+            "app_key_mode_valid",
+            "mode_url_valid",
+        }
+        reports_dir = PROJECT_ROOT / "reports"
+        orders_dir = reports_dir / "orders"
+        candidates = []
+        if reports_dir.exists():
+            candidates.extend(reports_dir.glob("orders_*.csv"))
+            candidates.extend(reports_dir.glob("strategy_orders_*.csv"))
+        if orders_dir.exists():
+            candidates.extend(orders_dir.glob("orders_*.csv"))
+
+        r = VerificationResult("주문_CSV_진단컬럼")
+        if not candidates:
+            self._record(r.warn("no order CSV found yet; columns will be checked after next order run"))
+            return
+
+        latest = max(candidates, key=lambda p: p.stat().st_mtime)
+        try:
+            import pandas as pd
+
+            df = pd.read_csv(latest, nrows=5)
+            missing = sorted(required - set(df.columns))
+            if missing:
+                r.fail(f"missing columns: {', '.join(missing)}", file=str(latest))
+            else:
+                r.ok("diagnostic columns present", file=str(latest))
+        except Exception as exc:
+            r.warn(str(exc), file=str(latest))
         self._record(r)
 
     def run_all(self) -> None:
@@ -1781,6 +1998,8 @@ class SystemVerifier:
         self.verify_strategy_features()
         self.verify_sell_policy_features()
         self.verify_real_single_order_safety()
+        self.verify_mode_url_consistency()
+        self.verify_order_result_csv_columns()
         self.verify_streamlit_app()
 
         # 보고서 생성

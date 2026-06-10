@@ -250,6 +250,33 @@ def run_real_single_order_test(stock_code: str, quantity: int = 1, price: int = 
         return {"success": False, "message": str(e)}
 
 
+def run_real_order_diagnosis(stock_code: str, quantity: int = 1, price: int = 0) -> Dict:
+    inject_to_os_env()
+    try:
+        from real_order_diagnosis import run_real_order_diagnosis as _run
+        return _run(
+            stock_code=stock_code,
+            quantity=quantity,
+            price=price,
+            config_path=str(PROJECT_ROOT / "config.yaml"),
+        )
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+def run_real_order_verify(stock_code: str = "", order_no: str = "") -> Dict:
+    inject_to_os_env()
+    try:
+        from real_order_verify import run_real_order_verify as _run
+        return _run(
+            stock_code=stock_code,
+            order_no=order_no,
+            config_path=str(PROJECT_ROOT / "config.yaml"),
+        )
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
 def list_sell_policies() -> List[Dict]:
     try:
         from sell_policy import list_sell_policies as _list

@@ -200,7 +200,10 @@ class OrderManager:
             "api_called": mode != TRADE_MODE_PAPER,
             "mock_order_called": mode == TRADE_MODE_MOCK,
             "real_order_called": mode == TRADE_MODE_REAL,
+            "token_source": getattr(self._api.auth, "token_source", "") if self._api else "",
         }
+        if self._api is not None:
+            order_info.update(self._api.diagnostic_metadata())
         logger.info(
             "[주문 전] 매수 | 종목=%s(%s) | 수량=%d | 주문가=%d | 매수가=%d | 모드=%s | 예상금액=%s원",
             stock_code, stock_name, quantity, order_price, entry_price, mode,
@@ -223,13 +226,17 @@ class OrderManager:
                 resp = self._api.place_cash_buy_order(stock_code, quantity, order_price, "limit", cur_session)
                 rt_cd = resp.get("rt_cd", "")
                 order_no = resp.get("output", {}).get("ODNO", "")
-                if rt_cd == "0":
+                if rt_cd == "0" and order_no:
                     self.pos_mgr.update_position_after_buy(
                         stock_code, stock_name, quantity, entry_price, now
                     )
                     order_info.update({"success": True, "order_no": order_no, "api_response": resp})
                     logger.info("[주문 성공] 매수 %s %d주 @ %d원 (주문번호=%s)", stock_code, quantity, order_price, order_no)
                     return order_info
+                elif rt_cd == "0" and not order_no:
+                    msg = "KIS response rt_cd=0 but order_no is empty; treat as order receipt failure"
+                    logger.warning("[주문 실패] 매수 %s: %s", stock_code, msg)
+                    return {"success": False, "reason": msg, "api_response": resp, **order_info}
                 else:
                     msg = resp.get("msg1", "")
                     logger.warning("[주문 실패] 매수 %s 시도%d: rt_cd=%s msg=%s", stock_code, attempt+1, rt_cd, msg)
@@ -351,7 +358,10 @@ class OrderManager:
             "api_called": mode != TRADE_MODE_PAPER,
             "mock_order_called": mode == TRADE_MODE_MOCK,
             "real_order_called": mode == TRADE_MODE_REAL,
+            "token_source": getattr(self._api.auth, "token_source", "") if self._api else "",
         }
+        if self._api is not None:
+            order_info.update(self._api.diagnostic_metadata())
         logger.info(
             "[주문 전] 매도 | 종목=%s(%s) | 수량=%d | 가격=%d | 사유=%s | 모드=%s",
             stock_code, stock_name, quantity, sell_price, reason, mode,
@@ -369,11 +379,15 @@ class OrderManager:
                 resp = self._api.place_cash_sell_order(stock_code, quantity, sell_price, "limit", sell_session)
                 rt_cd = resp.get("rt_cd", "")
                 order_no = resp.get("output", {}).get("ODNO", "")
-                if rt_cd == "0":
+                if rt_cd == "0" and order_no:
                     self.pos_mgr.update_position_after_sell(stock_code, sell_price, reason, now, quantity=quantity)
                     order_info.update({"success": True, "order_no": order_no})
                     logger.info("[주문 성공] 매도 %s %d주 @ %d원 (주문번호=%s)", stock_code, quantity, sell_price, order_no)
                     return order_info
+                elif rt_cd == "0" and not order_no:
+                    msg = "KIS response rt_cd=0 but order_no is empty; treat as order receipt failure"
+                    logger.warning("[주문 실패] 매도 %s: %s", stock_code, msg)
+                    return {"success": False, "reason": msg, "api_response": resp, **order_info}
                 else:
                     logger.warning("[주문 실패] 매도 %s 시도%d: %s", stock_code, attempt+1, resp.get("msg1", ""))
             except Exception as e:
@@ -495,6 +509,13 @@ class OrderManager:
             "api_called": False,
             "mock_order_called": False,
             "real_order_called": False,
+            "token_source": "",
+            "base_url": "",
+            "token_url": "",
+            "key_type_used": "",
+            "token_cache_file": "",
+            "app_key_mode_valid": False,
+            "mode_url_valid": False,
             "order_rejected": False,
             "error_category": "",
             "is_mock_supported": True,
@@ -569,6 +590,9 @@ class OrderManager:
             order_record["mock_order_called"] = True
         if mode == TRADE_MODE_REAL:
             order_record["real_order_called"] = True
+        order_record["token_source"] = getattr(self._api.auth, "token_source", "") if self._api else ""
+        if self._api is not None:
+            order_record.update(self._api.diagnostic_metadata())
 
         # RiskManager 승인
         approval = self.risk.approve_buy_order(
@@ -598,6 +622,10 @@ class OrderManager:
             order_no = resp.get("output", {}).get("ODNO", "")
             error_category = resp.get("error_category", "")
             raw_msg = resp.get("raw_msg", resp.get("msg1", ""))
+            order_record["token_source"] = getattr(self._api.auth, "token_source", "") if self._api else ""
+            for key in ["base_url", "token_url", "key_type_used", "token_cache_file", "token_source", "app_key_mode_valid", "mode_url_valid"]:
+                if key in resp:
+                    order_record[key] = resp.get(key)
 
             # resp에서 추가 분류 필드 반영
             order_record["error_category"] = error_category
@@ -607,7 +635,7 @@ class OrderManager:
             order_record["tr_id"] = resp.get("tr_id", "")
             order_record["raw_msg"] = raw_msg
 
-            if rt_cd == "0":
+            if rt_cd == "0" and order_no:
                 if side == "buy":
                     self.pos_mgr.update_position_after_buy(
                         stock_code, stock_name, quantity, current_price, now,
@@ -622,6 +650,15 @@ class OrderManager:
                     "[%s] api_called=True real_order_called=%s %s %d주 @ %d원 주문번호=%s",
                     mode, mode == "REAL", stock_code, quantity, order_price, order_no,
                 )
+            elif rt_cd == "0" and not order_no:
+                order_record.update({
+                    "order_rejected": True,
+                    "rejected_reason": "KIS response rt_cd=0 but order_no is empty; order receipt failed",
+                    "order_result": "ORDER_NO_EMPTY",
+                    "error_category": error_category or "KIS_REAL_ORDER_REJECTED",
+                })
+                self._failed_tickers.add(stock_code)
+                logger.warning("[%s] 주문번호 없음: %s", mode, stock_code)
             elif error_category == "MOCK_UNSUPPORTED_ORDER_TYPE":
                 # MOCK 서버가 해당 주문유형을 미지원 — 코드 오류 아님
                 order_record.update({

@@ -47,7 +47,9 @@ class SafetyGate:
         runtime_mode: Optional[str] = None,
     ) -> None:
         self.cfg = load_config(config_path)
-        self._runtime_mode: Optional[str] = runtime_mode  # 'paper' | 'mock' | 'real' | None
+        normalized_runtime = (runtime_mode or "").strip().lower() or None
+        self._runtime_mode: Optional[str] = normalized_runtime  # 'paper' | 'mock' | 'real' | None
+        self.runtime_mode: Optional[str] = normalized_runtime
         self._live_trade: bool = bool(self.cfg.get("live_trade", False))
         self._use_mock: bool = bool(self.cfg.get("kis", {}).get("use_mock", True))
         self._confirm: bool = bool(
@@ -62,6 +64,9 @@ class SafetyGate:
             self.cfg.get("force_trade", {}).get("test_order_amount", 10_000)
         )
         self.mode: str = self._determine_mode()
+        self.is_mock: bool = self.mode == TRADE_MODE_MOCK
+        self.is_real: bool = self.mode == TRADE_MODE_REAL
+        self.is_paper: bool = self.mode == TRADE_MODE_PAPER
         self._log_startup()
 
     def _determine_mode(self) -> str:

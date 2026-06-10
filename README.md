@@ -957,6 +957,76 @@ python src/real_order_test.py --stock-code 005930 --quantity 1 --dry-run
 python src/real_order_test.py --stock-code 005930 --quantity 1 --execute
 ```
 
+### 실전 주문 500 오류 진단
+
+실전 주문 API가 `500 Server Error`를 반환하고 주문번호가 없으면 실제 주문 접수 실패로 판단합니다. 이 경우 한국투자증권 앱에서 미체결/체결내역을 반드시 확인한 뒤 아래 진단 명령을 실행하세요.
+
+```bash
+python src/real_order_diagnosis.py --stock-code 034020 --quantity 1
+python src/real_order_test.py --stock-code 034020 --quantity 1 --dry-run
+python src/real_order_verify.py --stock-code 034020
+```
+
+### MOCK 주문이 REAL 토큰 URL을 호출하는 문제 해결
+
+앱에서 MOCK을 선택했는데 내부 `SafetyGate`, `KISApiClient`, `kis_auth`가 `config.yaml`의 REAL 상태를 따라가면 모의투자 주문이 실전 토큰 URL(`openapi.koreainvestment.com:9443`)을 호출할 수 있습니다. 주문 흐름은 이제 UI의 `runtime_mode`를 최우선으로 전달합니다.
+
+전달 경로:
+
+```text
+app/pages/4_예산배분_및_주문.py
+-> app/services/trading_service.py
+-> src/strategy_executor.py
+-> src/buy_candidate_list.py
+-> OrderManager(runtime_mode/gate)
+-> KISApiClient(runtime_mode/gate)
+-> get_access_token(mode)
+```
+
+MOCK 모드는 반드시 아래 값만 사용합니다.
+
+- token URL: `https://openapivts.koreainvestment.com:29443/oauth2/tokenP`
+- base URL: `https://openapivts.koreainvestment.com:29443`
+- key: `KIS_MOCK_APP_KEY`, `KIS_MOCK_APP_SECRET`
+- token cache: `data/mock_token_cache.json`
+
+REAL 모드는 반드시 아래 값만 사용합니다.
+
+- token URL: `https://openapi.koreainvestment.com:9443/oauth2/tokenP`
+- base URL: `https://openapi.koreainvestment.com:9443`
+- key: `KIS_REAL_APP_KEY`, `KIS_REAL_APP_SECRET`
+- token cache: `data/real_token_cache.json`
+
+검증 명령:
+
+```bash
+python src/full_system_verification.py
+python src/mock_order_diagnosis.py --stock-code 015760 --quantity 1
+```
+
+### MOCK 주문 진단
+
+모의투자 주문 경로는 아래 명령으로 1주 주문을 직접 진단합니다. 이 명령은 `requested_mode=mock`, `resolved_mode=MOCK`만 사용하며 REAL 토큰이나 REAL 주문 API를 사용하지 않습니다.
+
+```bash
+python src/mock_order_diagnosis.py --stock-code 015760 --quantity 1
+```
+
+MOCK 응답에서 `기간이 만료된 token 입니다.`가 감지되면 `data/mock_token_cache.json`과 레거시 `data/token_cache.json`을 삭제하고 MOCK 토큰을 새로 발급한 뒤 1회만 재시도합니다. 결과에는 `token_source`와 `token_recovered`가 기록됩니다.
+
+보고서는 `reports/mock_order_diagnosis_YYYYMMDD_HHMMSS.json`, `reports/mock_order_diagnosis_YYYYMMDD_HHMMSS.txt`에 저장됩니다.
+
+진단 보고서는 `reports/real_order_diagnosis_YYYYMMDD_HHMMSS.txt`, `reports/real_order_diagnosis_YYYYMMDD_HHMMSS.json`에 저장됩니다. 주문/체결 조회 결과는 `reports/real_order_verify_YYYYMMDD_HHMMSS.csv`에 저장됩니다.
+
+확인 항목:
+- REAL 주문 payload의 `CANO`, `ACNT_PRDT_CD`, `PDNO`, `ORD_DVSN`, `ORD_QTY`, `ORD_UNPR`
+- `TTTC0802U` TR_ID와 `ORD_DVSN=00`
+- REAL POST 주문용 `hashkey` 생성 여부
+- 500 응답의 `response.text`와 가능한 경우 `response.json`
+- 주문번호 반환 여부와 실제 주문/체결 조회 결과
+
+REAL 주문 500 오류가 발생하면 자동 재시도는 최대 1회로 제한됩니다. 중복주문 위험이 있으므로 주문번호가 없더라도 한국투자증권 앱에서 접수 여부를 확인하세요. 매도 관련 문구는 수익 보장이 아니라 “+2% 익절 목표 전략”으로 이해해야 합니다.
+
 주의:
 
 - `--execute`는 조건이 모두 충족된 경우 실제 자금으로 주문을 시도합니다.

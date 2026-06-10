@@ -17,6 +17,14 @@ from dotenv import load_dotenv
 
 from kis_auth import KISAuth
 from price_tick import adjust_price_to_tick, get_tick_size, is_valid_tick_price
+from real_order_utils import (
+    ERROR_HASHKEY,
+    ERROR_INVALID_PAYLOAD,
+    classify_order_error,
+    make_order_preview,
+    save_diagnosis_report,
+    validate_real_order_payload,
+)
 from safety_gate import SafetyGate, TRADE_MODE_REAL, TRADE_MODE_MOCK
 from trading_calendar import (
     SESSION_PRE_MARKET, SESSION_REGULAR, SESSION_CLOSING_AUCTION,
@@ -40,12 +48,13 @@ class KISApiClient:
         self,
         config_path: str = "config.yaml",
         gate: Optional["SafetyGate"] = None,
+        runtime_mode: Optional[str] = None,
     ) -> None:
         self._config_path = config_path
         self.cfg = load_config(config_path)
-        self.auth = KISAuth(config_path)
         # 외부 gate 주입 허용 — runtime_mode가 적용된 gate를 공유하기 위해
-        self.gate = gate if gate is not None else SafetyGate(config_path)
+        self.gate = gate if gate is not None else SafetyGate(config_path, runtime_mode=runtime_mode)
+        self.auth = KISAuth(config_path, runtime_mode=self.gate.mode.lower())
         self._base_url = self.gate.get_base_url()
         # REAL 모드에서만 실전 TR_ID 사용, MOCK/PAPER는 모의투자 TR_ID
         self._use_mock = (self.gate.mode != "REAL")
@@ -55,6 +64,23 @@ class KISApiClient:
         self._account_no, self._product_code = self.auth.get_account_info()
         self._api_error_count: int = 0
         self._max_api_errors = self.cfg.get("safety", {}).get("max_api_error_count", 5)
+        self.validate_mode_url_consistency()
+
+    def validate_mode_url_consistency(self) -> bool:
+        if self.gate.mode == "MOCK" and "openapivts.koreainvestment.com:29443" not in self._base_url:
+            raise RuntimeError(f"MOCK mode cannot use KIS base_url: {self._base_url}")
+        if self.gate.mode == "REAL" and "openapi.koreainvestment.com:9443" not in self._base_url:
+            raise RuntimeError(f"REAL mode cannot use KIS base_url: {self._base_url}")
+        return True
+
+    def diagnostic_metadata(self) -> Dict:
+        meta = self.auth.diagnostic_metadata()
+        meta.update({
+            "base_url": self._base_url,
+            "mode_url_valid": True,
+            "resolved_mode": self.gate.mode,
+        })
+        return meta
 
     # ------------------------------------------------------------------
     # 내부 공통 요청
@@ -72,13 +98,26 @@ class KISApiClient:
             응답 JSON 딕셔너리
         """
         url = f"{self._base_url}{path}"
+        self.validate_mode_url_consistency()
         headers = self.auth.build_auth_headers(tr_id)
+        token_refreshed = False
         for attempt in range(self._max_retry):
             try:
                 time.sleep(self._sleep)
                 resp = requests.get(url, headers=headers, params=params, timeout=self._timeout)
                 resp.raise_for_status()
                 data = resp.json()
+                if self._is_token_expired_response(data) and not token_refreshed:
+                    logger.warning("KIS token expired for GET tr_id=%s; refreshing token and retrying once", tr_id)
+                    self.auth.invalidate_token_cache()
+                    headers = self.auth.build_auth_headers(tr_id)
+                    token_refreshed = True
+                    continue
+                if self._is_wrong_app_key_response(data):
+                    raise RuntimeError(
+                        f"APP_KEY_MODE_INVALID mode={self.gate.mode} token_url={self.auth.token_url} "
+                        f"key_type_used={self.auth.key_type_used} msg={data.get('msg1', '')}"
+                    )
                 self._handle_response_error(data, tr_id)
                 self._api_error_count = 0
                 return data
@@ -109,13 +148,125 @@ class KISApiClient:
             응답 JSON 딕셔너리
         """
         url = f"{self._base_url}{path}"
+        self.validate_mode_url_consistency()
         headers = self.auth.build_auth_headers(tr_id)
-        for attempt in range(self._max_retry):
+        token_refreshed = False
+        is_real_order_post = self.gate.mode == TRADE_MODE_REAL and path.startswith("/uapi/domestic-stock/v1/trading/order")
+
+        if is_real_order_post:
+            valid, errors = validate_real_order_payload(body)
+            if not valid:
+                preview = make_order_preview(url=url, tr_id=tr_id, body=body, headers=headers, hashkey_ready=False)
+                error_category = classify_order_error(payload_errors=errors, hashkey_ready=True)
+                result = {
+                    "rt_cd": "PAYLOAD_INVALID",
+                    "msg1": "; ".join(errors),
+                    "request_url": url,
+                    "tr_id": tr_id,
+                    "error_category": error_category or ERROR_INVALID_PAYLOAD,
+                    "diagnostic": preview,
+                    **self.diagnostic_metadata(),
+                }
+                save_diagnosis_report({**result, "run_at": datetime.now().isoformat()}, prefix="real_order_diagnosis")
+                return result
+            try:
+                hashkey = self.auth.generate_hashkey(body)
+                headers["hashkey"] = hashkey
+            except Exception as exc:
+                preview = make_order_preview(url=url, tr_id=tr_id, body=body, headers=headers, hashkey_ready=False)
+                result = {
+                    "rt_cd": "HASHKEY_FAILED",
+                    "msg1": str(exc),
+                    "request_url": url,
+                    "tr_id": tr_id,
+                    "error_category": ERROR_HASHKEY,
+                    "diagnostic": preview,
+                    **self.diagnostic_metadata(),
+                }
+                save_diagnosis_report({**result, "run_at": datetime.now().isoformat()}, prefix="real_order_diagnosis")
+                logger.error("REAL order blocked because hashkey generation failed: %s", exc)
+                return result
+
+        attempts = int(self._max_retry)
+        if is_real_order_post:
+            attempts = min(max(attempts, 1), 2)
+            if attempts > 1:
+                logger.warning("REAL order POST retry is limited to one retry to reduce duplicate-order risk.")
+
+        for attempt in range(attempts):
             try:
                 time.sleep(self._sleep)
                 resp = requests.post(url, headers=headers, json=body, timeout=self._timeout)
-                resp.raise_for_status()
-                data = resp.json()
+                status_code = int(resp.status_code)
+                response_text = resp.text or ""
+                try:
+                    data = resp.json()
+                except ValueError:
+                    data = {}
+                if status_code >= 400:
+                    error_category = classify_order_error(
+                        status_code=status_code,
+                        response_text=response_text,
+                        response_json=data,
+                        hashkey_ready=bool(headers.get("hashkey")) if is_real_order_post else None,
+                    )
+                    diagnostic = make_order_preview(
+                        url=url,
+                        tr_id=tr_id,
+                        body=body,
+                        headers=headers,
+                        hashkey_ready=bool(headers.get("hashkey")) if is_real_order_post else None,
+                    )
+                    result = {
+                        "rt_cd": f"HTTP_{status_code}",
+                        "msg1": data.get("msg1") or response_text[:500] or f"HTTP {status_code}",
+                        "http_status_code": status_code,
+                        "response_text": response_text,
+                        "response_json": data,
+                        "request_url": url,
+                        "tr_id": tr_id,
+                        "error_category": error_category,
+                        "diagnostic": diagnostic,
+                        **self.diagnostic_metadata(),
+                    }
+                    save_diagnosis_report({**result, "run_at": datetime.now().isoformat()}, prefix="real_order_diagnosis")
+                    logger.error(
+                        "POST request failed status=%s tr_id=%s category=%s response=%s",
+                        status_code,
+                        tr_id,
+                        error_category,
+                        response_text[:1000],
+                    )
+                    if attempt < attempts - 1:
+                        logger.warning("Retrying REAL order POST once only; verify broker app to avoid duplicate orders.")
+                        time.sleep(1.5 ** attempt)
+                        continue
+                    return result
+                if self._is_token_expired_response(data) and not token_refreshed:
+                    logger.warning("KIS token expired for POST tr_id=%s; refreshing token and retrying once", tr_id)
+                    self.auth.invalidate_token_cache()
+                    headers = self.auth.build_auth_headers(tr_id)
+                    if is_real_order_post:
+                        try:
+                            headers["hashkey"] = self.auth.generate_hashkey(body)
+                        except Exception as exc:
+                            return {
+                                "rt_cd": "HASHKEY_FAILED",
+                                "msg1": str(exc),
+                                "request_url": url,
+                                "tr_id": tr_id,
+                                "error_category": ERROR_HASHKEY,
+                                **self.diagnostic_metadata(),
+                            }
+                    token_refreshed = True
+                    continue
+                if self._is_wrong_app_key_response(data):
+                    return {
+                        "rt_cd": data.get("rt_cd", "APP_KEY_MODE_INVALID"),
+                        "msg1": data.get("msg1", "해당 앱키는 현재 모드용 앱키가 아닙니다."),
+                        "error_category": "APP_KEY_MODE_INVALID",
+                        **self.diagnostic_metadata(),
+                    }
                 self._handle_response_error(data, tr_id)
                 self._api_error_count = 0
                 return data
@@ -125,12 +276,22 @@ class KISApiClient:
                     "POST 요청 실패 (시도 %d/%d) tr_id=%s: %s",
                     attempt + 1, self._max_retry, tr_id, str(e)
                 )
-                if attempt < self._max_retry - 1:
+                if attempt < attempts - 1:
                     time.sleep(1.5 ** attempt)
                 else:
                     self._check_api_error_threshold()
                     raise
         return {}
+
+    @staticmethod
+    def _is_token_expired_response(data: Dict) -> bool:
+        msg = " ".join(str(data.get(k, "")) for k in ("msg1", "msg_cd", "message", "error_description"))
+        return "기간이 만료된 token" in msg or "만료된 token" in msg or "expired token" in msg.lower()
+
+    @staticmethod
+    def _is_wrong_app_key_response(data: Dict) -> bool:
+        msg = " ".join(str(data.get(k, "")) for k in ("msg1", "msg_cd", "message", "error_description"))
+        return "해당 앱키는 모의투자용 앱키가 아닙니다" in msg or "모의투자용 앱키" in msg
 
     def _handle_response_error(self, data: Dict, tr_id: str) -> None:
         """API 응답 오류 코드 처리."""
@@ -407,6 +568,7 @@ class KISApiClient:
             "is_real_safe_to_use": resolved.get("is_confirmed_for_real", False),
             "raw_msg": raw_msg,
         })
+        enriched.update(self.diagnostic_metadata())
         return enriched
 
     def resolve_order_division(self, order_session: str, side: str = "buy") -> Dict:
@@ -539,6 +701,90 @@ class KISApiClient:
         except Exception as e:
             logger.warning("주문가능금액 조회 실패: %s", str(e))
             return 0.0
+
+    def build_cash_order_request(
+        self,
+        stock_code: str,
+        quantity: int,
+        price: int,
+        side: str = "buy",
+        order_type: str = "limit",
+        order_session: Optional[str] = None,
+        ord_dvsn_override: Optional[str] = None,
+        include_hashkey: bool = True,
+    ) -> Dict:
+        """Build and validate the exact cash-order request without sending it."""
+        if order_session is None:
+            cal = TradingCalendar(self._config_path)
+            order_session = cal.get_market_session()
+
+        resolved = self.resolve_order_division(order_session, side)
+        if order_type == "market":
+            ord_dvsn = "01"
+            send_price = 0
+        elif ord_dvsn_override is not None:
+            ord_dvsn = ord_dvsn_override
+            send_price = int(price)
+        else:
+            ord_dvsn = resolved["ord_dvsn"]
+            send_price = int(price)
+
+        original_price = int(send_price)
+        if order_type == "limit":
+            tick_cfg = self.cfg.get("order_price", {})
+            if tick_cfg.get("tick_adjust_enabled", True):
+                method = (
+                    tick_cfg.get("buy_tick_method", "floor")
+                    if side == "buy"
+                    else tick_cfg.get("sell_tick_method", "ceil")
+                )
+                send_price = adjust_price_to_tick(original_price, side=side, method=method)
+
+        body = {
+            "CANO": self._account_no,
+            "ACNT_PRDT_CD": self._product_code,
+            "PDNO": str(stock_code).strip().zfill(6),
+            "ORD_DVSN": ord_dvsn,
+            "ORD_QTY": str(int(quantity)),
+            "ORD_UNPR": str(int(send_price)),
+        }
+        tr_id = resolved["tr_id"]
+        path = "/uapi/domestic-stock/v1/trading/order-cash"
+        url = f"{self._base_url}{path}"
+        headers = self.auth.build_auth_headers(tr_id)
+        hashkey_ready = None
+        if include_hashkey and self.gate.mode == TRADE_MODE_REAL:
+            try:
+                headers["hashkey"] = self.auth.generate_hashkey(body)
+                hashkey_ready = True
+            except Exception as exc:
+                hashkey_ready = False
+                headers["hashkey_error"] = str(exc)
+
+        valid, errors = validate_real_order_payload(body)
+        preview = make_order_preview(
+            url=url,
+            tr_id=tr_id,
+            body=body,
+            headers=headers,
+            hashkey_ready=hashkey_ready,
+        )
+        return {
+            "path": path,
+            "request_url": url,
+            "headers": headers,
+            "body": body,
+            "preview": preview,
+            "payload_validation_ok": valid,
+            "payload_errors": errors,
+            "hashkey_ready": hashkey_ready,
+            "resolved": resolved,
+            "original_price": original_price,
+            "adjusted_price": send_price,
+            "tick_size": get_tick_size(send_price) if send_price > 0 else 0,
+            "tick_valid": is_valid_tick_price(send_price) if send_price > 0 else True,
+            **self.diagnostic_metadata(),
+        }
 
     # ------------------------------------------------------------------
     # 주문 (SafetyGate 통과 후 실행)

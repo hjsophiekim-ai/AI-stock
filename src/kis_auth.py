@@ -1,14 +1,6 @@
-"""한국투자증권 Open API 인증 모듈.
+"""KIS Open API authentication with strict MOCK/REAL mode isolation."""
 
-접근토큰 발급·캐싱·갱신을 담당합니다.
-민감정보(APP_KEY, APP_SECRET)는 절대 로그에 남기지 않습니다.
-
-공식 문서 기준 재확인 필요:
-  - 토큰 발급 endpoint: POST /oauth2/tokenP
-  - 토큰 유효기간: 약 24시간 (86400초)
-  - 모의투자 URL: https://openapivts.koreainvestment.com:29443
-  - 실전투자 URL: https://openapi.koreainvestment.com:9443
-"""
+from __future__ import annotations
 
 import json
 import os
@@ -24,134 +16,145 @@ from utils import ensure_dir, load_config, setup_logger
 load_dotenv()
 logger = setup_logger(__name__, "logs/api.log")
 
-# 토큰 만료 여유시간 (초): 만료 60분 전에 재발급
 TOKEN_REFRESH_MARGIN_SEC = 3600
+MOCK_BASE_URL = "https://openapivts.koreainvestment.com:29443"
+REAL_BASE_URL = "https://openapi.koreainvestment.com:9443"
 
 
 class KISAuth:
-    """KIS API 인증 토큰 관리.
+    """Issue and cache KIS tokens for exactly one selected mode."""
 
-    토큰을 파일에 캐싱하여 불필요한 재발급 요청을 방지합니다.
-    """
-
-    def __init__(self, config_path: str = "config.yaml") -> None:
+    def __init__(self, config_path: str = "config.yaml", runtime_mode: Optional[str] = None) -> None:
         self.cfg = load_config(config_path)
-        self._app_key, self._app_secret = self._load_credentials()
-        self._base_url = self.get_base_url()
-        self._token_cache_path = Path(
-            self.cfg.get("kis", {}).get("token_cache_file", "data/token_cache.json")
-        )
-        self._timeout = self.cfg.get("kis", {}).get("request_timeout_seconds", 10)
+        self._timeout = int(self.cfg.get("kis", {}).get("request_timeout_seconds", 10))
         self._access_token: Optional[str] = None
         self._expires_at: float = 0.0
+        self.token_source: str = ""
 
-    def get_base_url(self) -> str:
-        """현재 설정(use_mock)에 맞는 KIS API 기본 URL 반환."""
+        self.mode: str = self._resolve_mode(runtime_mode)
+        self._base_url: str = ""
+        self._token_cache_path: Path = Path("data/mock_token_cache.json")
+        self._app_key: str = ""
+        self._app_secret: str = ""
+        self.key_type_used: str = ""
+        self.app_key_mode_valid: bool = False
+        self._configure_for_mode(self.mode)
+
+    def _resolve_mode(self, runtime_mode: Optional[str]) -> str:
+        mode = (runtime_mode or "").strip().lower()
+        if mode in {"mock", "real", "paper"}:
+            return mode.upper()
+        return "MOCK" if bool(self.cfg.get("kis", {}).get("use_mock", True)) else "REAL"
+
+    def _configure_for_mode(self, mode: str) -> None:
+        self.mode = mode.upper()
         kis = self.cfg.get("kis", {})
-        use_mock = kis.get("use_mock", True)
-        if use_mock:
-            return kis.get("base_url_mock", "https://openapivts.koreainvestment.com:29443")
-        return kis.get("base_url_real", "https://openapi.koreainvestment.com:9443")
+        if self.mode == "REAL":
+            self._base_url = kis.get("base_url_real", REAL_BASE_URL)
+            self._token_cache_path = Path(kis.get("real_token_cache_file", "data/real_token_cache.json"))
+        else:
+            self._base_url = kis.get("base_url_mock", MOCK_BASE_URL)
+            self._token_cache_path = Path(kis.get("mock_token_cache_file", "data/mock_token_cache.json"))
 
-    def _load_credentials(self) -> Tuple[str, str]:
-        """환경변수에서 App Key, App Secret 로드.
+        self._app_key, self._app_secret, self.key_type_used = self._load_credentials_for_mode(self.mode)
+        self.app_key_mode_valid = (
+            self.mode == "MOCK" and self.key_type_used in {"MOCK_APP_KEY", "GENERIC_APP_KEY_FALLBACK"}
+        ) or (
+            self.mode == "REAL" and self.key_type_used in {"REAL_APP_KEY", "GENERIC_APP_KEY_FALLBACK"}
+        )
+        self.validate_mode_url_consistency()
 
-        민감정보를 로그에 남기지 않습니다.
-
-        Returns:
-            (app_key, app_secret) 튜플
-
-        Raises:
-            EnvironmentError: 환경변수 미설정 시
-        """
+    def _load_credentials_for_mode(self, mode: str) -> Tuple[str, str, str]:
         kis = self.cfg.get("kis", {})
-        key_env = kis.get("app_key_env", "KIS_APP_KEY")
-        secret_env = kis.get("app_secret_env", "KIS_APP_SECRET")
+        if mode == "REAL":
+            key_env = kis.get("real_app_key_env", "KIS_REAL_APP_KEY")
+            secret_env = kis.get("real_app_secret_env", "KIS_REAL_APP_SECRET")
+            key_type = "REAL_APP_KEY"
+        else:
+            key_env = kis.get("mock_app_key_env", "KIS_MOCK_APP_KEY")
+            secret_env = kis.get("mock_app_secret_env", "KIS_MOCK_APP_SECRET")
+            key_type = "MOCK_APP_KEY"
+
         app_key = os.getenv(key_env, "")
         app_secret = os.getenv(secret_env, "")
         if not app_key or not app_secret:
-            logger.warning(
-                f"환경변수 {key_env} 또는 {secret_env}가 설정되지 않았습니다. "
-                ".env 파일을 확인하세요."
-            )
-        return app_key, app_secret
+            fallback_key_env = kis.get("app_key_env", "KIS_APP_KEY")
+            fallback_secret_env = kis.get("app_secret_env", "KIS_APP_SECRET")
+            fallback_key = os.getenv(fallback_key_env, "")
+            fallback_secret = os.getenv(fallback_secret_env, "")
+            if fallback_key and fallback_secret:
+                logger.warning("%s mode is using generic KIS_APP_KEY fallback.", mode)
+                return fallback_key, fallback_secret, "GENERIC_APP_KEY_FALLBACK"
+
+        if not app_key or not app_secret:
+            logger.warning("Missing KIS credentials for %s mode: %s / %s", mode, key_env, secret_env)
+        return app_key, app_secret, key_type
+
+    def get_base_url(self) -> str:
+        return self._base_url
+
+    @property
+    def token_url(self) -> str:
+        return f"{self._base_url}/oauth2/tokenP"
+
+    @property
+    def token_cache_file(self) -> str:
+        return str(self._token_cache_path)
 
     def get_account_info(self) -> Tuple[str, str]:
-        """현재 모드에 맞는 계좌번호와 상품코드 반환.
-
-        Returns:
-            (account_no, product_code) 튜플
-        """
         kis = self.cfg.get("kis", {})
-        use_mock = kis.get("use_mock", True)
-        if use_mock:
-            account_no = os.getenv(
-                kis.get("mock_account_no_env", "KIS_MOCK_ACCOUNT_NO"), ""
-            )
-            product_code = os.getenv(
-                kis.get("mock_account_product_code_env", "KIS_MOCK_ACCOUNT_PRODUCT_CODE"), "01"
-            )
+        if self.mode == "MOCK":
+            account_no = os.getenv(kis.get("mock_account_no_env", "KIS_MOCK_ACCOUNT_NO"), "")
+            product_code = os.getenv(kis.get("mock_account_product_code_env", "KIS_MOCK_ACCOUNT_PRODUCT_CODE"), "01")
         else:
-            account_no = os.getenv(
-                kis.get("account_no_env", "KIS_ACCOUNT_NO"), ""
-            )
-            product_code = os.getenv(
-                kis.get("account_product_code_env", "KIS_ACCOUNT_PRODUCT_CODE"), "01"
-            )
+            account_no = os.getenv(kis.get("account_no_env", "KIS_ACCOUNT_NO"), "")
+            product_code = os.getenv(kis.get("account_product_code_env", "KIS_ACCOUNT_PRODUCT_CODE"), "01")
         return account_no, product_code
 
-    def _get_cached_token(self) -> Optional[str]:
-        """파일 캐시에서 유효한 토큰 로드.
+    def validate_mode_url_consistency(self) -> None:
+        if self.mode == "MOCK" and "openapivts.koreainvestment.com:29443" not in self._base_url:
+            raise RuntimeError(f"MOCK mode cannot use non-MOCK KIS URL: {self._base_url}")
+        if self.mode == "REAL" and "openapi.koreainvestment.com:9443" not in self._base_url:
+            raise RuntimeError(f"REAL mode cannot use non-REAL KIS URL: {self._base_url}")
 
-        Returns:
-            유효한 토큰 문자열, 없으면 None
-        """
+    def _get_cached_token(self) -> Optional[str]:
         if not self._token_cache_path.exists():
             return None
         try:
             with open(self._token_cache_path, "r", encoding="utf-8") as f:
                 cache = json.load(f)
             expires_at = float(cache.get("expires_at", 0))
-            if time.time() < expires_at - TOKEN_REFRESH_MARGIN_SEC:
-                token = cache.get("access_token", "")
-                if token:
-                    logger.debug("캐시에서 유효한 토큰 로드 성공")
-                    return token
-        except Exception as e:
-            logger.debug(f"토큰 캐시 읽기 실패 (무시): {e}")
+            token = cache.get("access_token", "")
+            if token and time.time() < expires_at - TOKEN_REFRESH_MARGIN_SEC:
+                self.token_source = "mock_token_cache" if self.mode == "MOCK" else "real_token_cache"
+                return token
+        except Exception as exc:
+            logger.debug("Ignoring token cache read failure: %s", exc)
         return None
 
     def _save_token(self, access_token: str, expires_in: int) -> None:
-        """토큰을 파일 캐시에 저장. 민감정보 제외."""
         try:
             ensure_dir(str(self._token_cache_path.parent))
-            cache = {
-                "access_token": access_token,
-                "expires_at": time.time() + expires_in,
-                "saved_at": time.time(),
-            }
             with open(self._token_cache_path, "w", encoding="utf-8") as f:
-                json.dump(cache, f)
-        except Exception as e:
-            logger.warning(f"토큰 캐시 저장 실패 (무시): {e}")
+                json.dump(
+                    {
+                        "access_token": access_token,
+                        "expires_at": time.time() + expires_in,
+                        "saved_at": time.time(),
+                        "mode": self.mode,
+                        "token_url": self.token_url,
+                        "key_type_used": self.key_type_used,
+                    },
+                    f,
+                )
+        except Exception as exc:
+            logger.warning("Token cache save failed: %s", exc)
 
     def _request_new_token(self) -> str:
-        """KIS API에서 신규 접근토큰 발급.
-
-        공식 문서 기준 재확인 필요:
-          POST /oauth2/tokenP
-
-        Returns:
-            access_token 문자열
-
-        Raises:
-            RuntimeError: 토큰 발급 실패 시
-        """
+        self.validate_mode_url_consistency()
         if not self._app_key or not self._app_secret:
-            raise RuntimeError(
-                "API 키 미설정. .env 파일에 KIS_APP_KEY와 KIS_APP_SECRET을 설정하세요."
-            )
-        url = f"{self._base_url}/oauth2/tokenP"
+            raise RuntimeError(f"KIS {self.mode} credentials are missing")
+
         payload = {
             "grant_type": "client_credentials",
             "appkey": self._app_key,
@@ -159,66 +162,70 @@ class KISAuth:
         }
         headers = {"content-type": "application/json; charset=utf-8"}
         try:
-            resp = requests.post(
-                url, json=payload, headers=headers, timeout=self._timeout
-            )
+            resp = requests.post(self.token_url, json=payload, headers=headers, timeout=self._timeout)
             resp.raise_for_status()
             data = resp.json()
-            token = data.get("access_token", "")
-            if not token:
-                raise RuntimeError(
-                    f"토큰 발급 응답에 access_token 없음: {list(data.keys())}"
-                )
-            expires_in = int(data.get("expires_in", 86400))
-            self._access_token = token
-            self._expires_at = time.time() + expires_in
-            self._save_token(token, expires_in)
-            logger.info("KIS 접근토큰 발급 성공 (유효기간: %d초)", expires_in)
-            return token
-        except requests.exceptions.RequestException as e:
-            logger.error("KIS 토큰 발급 네트워크 오류: %s", str(e))
-            raise RuntimeError(f"KIS 토큰 발급 실패 (네트워크): {e}") from e
-        except Exception as e:
-            logger.error("KIS 토큰 발급 오류: %s", str(e))
-            raise RuntimeError(f"KIS 토큰 발급 실패: {e}") from e
+        except requests.exceptions.RequestException as exc:
+            text = ""
+            response = getattr(exc, "response", None)
+            if response is not None:
+                text = getattr(response, "text", "") or ""
+            logger.error(
+                "KIS token request failed mode=%s token_url=%s key_type=%s response=%s",
+                self.mode,
+                self.token_url,
+                self.key_type_used,
+                text[:500],
+            )
+            raise RuntimeError(f"KIS token request failed ({self.mode}): {exc}") from exc
 
-    def get_access_token(self) -> str:
-        """유효한 접근토큰 반환. 만료 시 자동 재발급.
+        token = data.get("access_token", "")
+        if not token:
+            msg = data.get("msg1") or data.get("error_description") or str(list(data.keys()))
+            raise RuntimeError(f"KIS token response did not include access_token: {msg}")
+        expires_in = int(data.get("expires_in", 86400))
+        self._access_token = token
+        self._expires_at = time.time() + expires_in
+        self._save_token(token, expires_in)
+        self.token_source = "fresh_mock_token" if self.mode == "MOCK" else "fresh_real_token"
+        logger.info("KIS token issued mode=%s key_type=%s cache=%s", self.mode, self.key_type_used, self._token_cache_path)
+        return token
 
-        Returns:
-            유효한 access_token 문자열
-        """
-        # 1. 인메모리 토큰 유효성 확인
-        if (
-            self._access_token
-            and time.time() < self._expires_at - TOKEN_REFRESH_MARGIN_SEC
-        ):
+    def get_access_token(self, mode: Optional[str] = None) -> str:
+        if mode:
+            resolved = self._resolve_mode(mode)
+            if resolved != self.mode:
+                self._access_token = None
+                self._expires_at = 0.0
+                self._configure_for_mode(resolved)
+
+        if self._access_token and time.time() < self._expires_at - TOKEN_REFRESH_MARGIN_SEC:
             return self._access_token
-        # 2. 파일 캐시 확인
         cached = self._get_cached_token()
         if cached:
             self._access_token = cached
             return cached
-        # 3. 신규 발급
         return self._request_new_token()
 
-    def build_auth_headers(
-        self,
-        tr_id: str,
-        extra_headers: Optional[Dict] = None,
-    ) -> Dict[str, str]:
-        """공통 인증 요청 헤더 생성.
+    def invalidate_token_cache(self, include_legacy_mock: bool = True) -> None:
+        self._access_token = None
+        self._expires_at = 0.0
+        paths = {self._token_cache_path}
+        if include_legacy_mock and self.mode == "MOCK":
+            paths.add(Path("data/mock_token_cache.json"))
+            paths.add(Path("data/token_cache.json"))
+        for path in paths:
+            try:
+                if path.exists():
+                    path.unlink()
+                    logger.info("KIS token cache deleted: %s", path)
+            except Exception as exc:
+                logger.warning("KIS token cache delete failed: %s (%s)", path, exc)
 
-        Args:
-            tr_id: 거래 ID (각 API마다 다름)
-            extra_headers: 추가 헤더 딕셔너리
-
-        Returns:
-            headers 딕셔너리
-        """
+    def build_auth_headers(self, tr_id: str, extra_headers: Optional[Dict] = None) -> Dict[str, str]:
         headers = {
             "content-type": "application/json; charset=utf-8",
-            "authorization": f"Bearer {self.get_access_token()}",
+            "authorization": f"Bearer {self.get_access_token(self.mode.lower())}",
             "appkey": self._app_key,
             "appsecret": self._app_secret,
             "tr_id": tr_id,
@@ -227,3 +234,33 @@ class KISAuth:
         if extra_headers:
             headers.update(extra_headers)
         return headers
+
+    def generate_hashkey(self, body: Dict) -> str:
+        if not self._app_key or not self._app_secret:
+            raise RuntimeError("KIS appkey/appsecret is missing; cannot generate hashkey")
+        url = f"{self._base_url}/uapi/hashkey"
+        headers = {
+            "content-type": "application/json; charset=utf-8",
+            "appkey": self._app_key,
+            "appsecret": self._app_secret,
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=self._timeout)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"KIS hashkey generation failed: {exc}") from exc
+        hashkey = data.get("HASH") or data.get("hash") or data.get("hashkey") or ""
+        if not hashkey:
+            raise RuntimeError(f"KIS hashkey response did not include HASH: {list(data.keys())}")
+        return str(hashkey)
+
+    def diagnostic_metadata(self) -> Dict[str, object]:
+        return {
+            "base_url": self._base_url,
+            "token_url": self.token_url,
+            "key_type_used": self.key_type_used,
+            "token_cache_file": str(self._token_cache_path),
+            "token_source": self.token_source,
+            "app_key_mode_valid": self.app_key_mode_valid,
+        }

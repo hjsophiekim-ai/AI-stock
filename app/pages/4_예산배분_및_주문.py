@@ -19,6 +19,8 @@ from trading_service import (
     list_sell_policies,
     run_paper_order,
     run_real_order_readiness_check,
+    run_real_order_diagnosis,
+    run_real_order_verify,
     run_real_single_order_test,
 )
 from prediction_service import get_today_str
@@ -180,6 +182,8 @@ if order_mode == "REAL":
         st.error("실전 전체 리스트 매수는 비활성화되어 있습니다. 먼저 개별 종목 1주 테스트를 완료하세요.")
 else:
     real_bulk_ok = True
+    if order_mode == "MOCK":
+        st.info("MOCK 주문은 모의투자 서버 openapivts와 KIS_MOCK_APP_KEY만 사용해야 합니다.")
 
 col_buy, col_preview = st.columns(2)
 with col_buy:
@@ -204,6 +208,17 @@ with col_buy:
                 _render_budget_metrics(result)
                 if result.get("allocation_preview"):
                     st.dataframe(pd.DataFrame(result["allocation_preview"]), use_container_width=True)
+                orders = result.get("order_results") or result.get("orders") or []
+                if orders:
+                    meta_cols = [
+                        "requested_mode", "resolved_mode", "base_url", "token_url",
+                        "key_type_used", "mock_order_called", "real_order_called",
+                        "order_no", "success", "rejected_reason",
+                    ]
+                    meta_df = pd.DataFrame(orders)
+                    show_cols = [c for c in meta_cols if c in meta_df.columns]
+                    if show_cols:
+                        st.dataframe(meta_df[show_cols], use_container_width=True)
                 st.json(result)
 
 with col_preview:
@@ -300,6 +315,31 @@ if submitted:
             st.success(f"주문 성공: {result.get('order_no', '')}")
         else:
             st.error(f"주문 실패: {result.get('rejected_reason') or result.get('reason') or result.get('message', '')}")
+            if single_mode == "REAL":
+                st.warning("주문번호가 없으면 실제 주문 접수 실패로 판단합니다. 한국투자증권 앱의 미체결/체결내역도 확인하세요.")
+                if st.button("실전 주문 실패 원인 진단", key="real_order_failure_diagnosis"):
+                    diagnosis = run_real_order_diagnosis(stock_code, int(quantity), int(order_price))
+                    st.write("진단 결과")
+                    st.json({
+                        "verdict": diagnosis.get("verdict"),
+                        "error_category": diagnosis.get("error_category"),
+                        "hashkey_generation_ok": diagnosis.get("hashkey_generation_ok"),
+                        "payload_validation_ok": diagnosis.get("payload_validation_ok"),
+                        "payload_errors": diagnosis.get("payload_errors"),
+                        "orderable_cash": diagnosis.get("orderable_cash"),
+                        "recent_order_check": diagnosis.get("recent_order_check"),
+                        "txt_path": diagnosis.get("txt_path"),
+                        "json_path": diagnosis.get("json_path"),
+                    })
+                verify_order_no = ""
+                if isinstance(result, dict):
+                    verify_order_no = (
+                        result.get("result", {}).get("order_no", "")
+                        if isinstance(result.get("result"), dict)
+                        else result.get("order_no", "")
+                    )
+                if st.button("실전 주문내역 확인", key="real_order_verify_after_failure"):
+                    st.json(run_real_order_verify(stock_code=stock_code, order_no=verify_order_no))
         st.json(result)
 
 st.divider()

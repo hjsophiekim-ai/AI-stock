@@ -22,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 def _mask(value: str) -> str:
     if not value:
         return ""
-    return value[:4] + "*" * max(0, len(value) - 8) + value[-4:]
+    return value[:4] + "*" * max(0, len(value) - 4)
 
 
 def _real_api_config_path(config_path: str) -> str:
