@@ -21,6 +21,130 @@ MOCK_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 REAL_BASE_URL = "https://openapi.koreainvestment.com:9443"
 
 
+def fingerprint_key(value: str) -> str:
+    """API 키 일부만 표시 (로그/CSV 전용, 전체 키 절대 출력 금지)."""
+    if not value:
+        return "MISSING"
+    if len(value) <= 10:
+        return value[:2] + "****"
+    return value[:6] + "****" + value[-4:]
+
+
+def get_kis_credentials(mode: str) -> dict:
+    """모드별 KIS 인증 정보를 단일 함수로 반환 (엄격한 모드-키 분리).
+
+    MOCK 모드에서는 절대 KIS_REAL_APP_KEY를 읽지 않는다.
+    REAL 모드에서는 절대 KIS_MOCK_APP_KEY를 읽지 않는다.
+    KIS_MOCK_APP_KEY가 존재하면 MOCK에서 fallback(KIS_APP_KEY)을 사용하지 않는다.
+    """
+    load_dotenv()
+    mode = (mode or "MOCK").strip().upper()
+
+    if mode == "MOCK":
+        appkey = os.getenv("KIS_MOCK_APP_KEY", "")
+        appsecret = os.getenv("KIS_MOCK_APP_SECRET", "")
+        if appkey and appsecret:
+            key_type_used = "MOCK_APP_KEY"
+        else:
+            # KIS_MOCK_APP_KEY 미설정 시에만 fallback 허용
+            fallback_key = os.getenv("KIS_APP_KEY", "")
+            fallback_secret = os.getenv("KIS_APP_SECRET", "")
+            if fallback_key and fallback_secret:
+                logger.warning("MOCK mode using KIS_APP_KEY fallback (KIS_MOCK_APP_KEY missing)")
+                appkey, appsecret = fallback_key, fallback_secret
+                key_type_used = "GENERIC_APP_KEY_FALLBACK"
+            else:
+                key_type_used = "MISSING"
+        account_no = os.getenv("KIS_MOCK_ACCOUNT_NO", "")
+        product_code = os.getenv("KIS_MOCK_ACCOUNT_PRODUCT_CODE", "01")
+        token_url = f"{MOCK_BASE_URL}/oauth2/tokenP"
+        base_url = MOCK_BASE_URL
+        token_cache_file = "data/mock_token_cache.json"
+
+    elif mode == "REAL":
+        appkey = os.getenv("KIS_REAL_APP_KEY", "")
+        appsecret = os.getenv("KIS_REAL_APP_SECRET", "")
+        if appkey and appsecret:
+            key_type_used = "REAL_APP_KEY"
+        else:
+            # KIS_REAL_APP_KEY 미설정 시에만 fallback 허용
+            fallback_key = os.getenv("KIS_APP_KEY", "")
+            fallback_secret = os.getenv("KIS_APP_SECRET", "")
+            if fallback_key and fallback_secret:
+                logger.warning("REAL mode using KIS_APP_KEY fallback (KIS_REAL_APP_KEY missing)")
+                appkey, appsecret = fallback_key, fallback_secret
+                key_type_used = "GENERIC_APP_KEY_FALLBACK"
+            else:
+                key_type_used = "MISSING"
+        account_no = os.getenv("KIS_ACCOUNT_NO", "")
+        product_code = os.getenv("KIS_ACCOUNT_PRODUCT_CODE", "01")
+        token_url = f"{REAL_BASE_URL}/oauth2/tokenP"
+        base_url = REAL_BASE_URL
+        token_cache_file = "data/real_token_cache.json"
+
+    else:  # PAPER
+        appkey = ""
+        appsecret = ""
+        key_type_used = "NONE"
+        account_no = ""
+        product_code = "01"
+        token_url = None
+        base_url = None
+        token_cache_file = None
+
+    return {
+        "mode": mode,
+        "appkey": appkey,
+        "appsecret": appsecret,
+        "key_type_used": key_type_used,
+        "account_no": account_no,
+        "product_code": product_code,
+        "token_url": token_url,
+        "base_url": base_url,
+        "token_cache_file": token_cache_file,
+        "appkey_fingerprint": fingerprint_key(appkey),
+    }
+
+
+def validate_final_order_headers(
+    mode: str,
+    headers: Dict[str, str],
+) -> Optional[str]:
+    """주문 직전 최종 헤더 appkey가 mode에 맞는 키인지 검증.
+
+    Returns:
+        None — 검증 통과
+        str  — 차단 사유 (API 호출 금지)
+    """
+    mode = (mode or "").strip().upper()
+    header_key = headers.get("appkey", "")
+
+    if mode == "MOCK":
+        expected_key = os.getenv("KIS_MOCK_APP_KEY", "")
+        if not expected_key:
+            # KIS_MOCK_APP_KEY 미설정: fallback 키가 사용됐을 수 있어 경고만
+            logger.warning("validate_final_order_headers: KIS_MOCK_APP_KEY not set, cannot verify")
+            return None
+        if header_key != expected_key:
+            return (
+                f"MODE_KEY_MISMATCH: MOCK 주문인데 최종 헤더 appkey가 KIS_MOCK_APP_KEY와 일치하지 않습니다. "
+                f"expected={fingerprint_key(expected_key)} actual={fingerprint_key(header_key)}"
+            )
+
+    elif mode == "REAL":
+        expected_key = os.getenv("KIS_REAL_APP_KEY", "")
+        if not expected_key:
+            logger.warning("validate_final_order_headers: KIS_REAL_APP_KEY not set, cannot verify")
+            return None
+        if header_key != expected_key:
+            return (
+                f"MODE_KEY_MISMATCH: REAL 주문인데 최종 헤더 appkey가 KIS_REAL_APP_KEY와 일치하지 않습니다. "
+                f"expected={fingerprint_key(expected_key)} actual={fingerprint_key(header_key)}"
+            )
+
+    return None
+
+
 class KISAuth:
     """Issue and cache KIS tokens for exactly one selected mode."""
 
@@ -62,6 +186,15 @@ class KISAuth:
         ) or (
             self.mode == "REAL" and self.key_type_used in {"REAL_APP_KEY", "GENERIC_APP_KEY_FALLBACK"}
         )
+        # fingerprint: 실제 사용된 키 앞 6 / 뒤 4 (로그 전용)
+        self.appkey_fingerprint: str = fingerprint_key(self._app_key)
+        # expected fingerprint: 환경변수에서 직접 읽은 기대값
+        if self.mode == "MOCK":
+            self.expected_appkey_fingerprint: str = fingerprint_key(os.getenv("KIS_MOCK_APP_KEY", ""))
+        elif self.mode == "REAL":
+            self.expected_appkey_fingerprint = fingerprint_key(os.getenv("KIS_REAL_APP_KEY", ""))
+        else:
+            self.expected_appkey_fingerprint = "N/A"
         self.validate_mode_url_consistency()
 
     def _load_credentials_for_mode(self, mode: str) -> Tuple[str, str, str]:
@@ -263,4 +396,6 @@ class KISAuth:
             "token_cache_file": str(self._token_cache_path),
             "token_source": self.token_source,
             "app_key_mode_valid": self.app_key_mode_valid,
+            "appkey_fingerprint": getattr(self, "appkey_fingerprint", fingerprint_key(self._app_key)),
+            "expected_appkey_fingerprint": getattr(self, "expected_appkey_fingerprint", ""),
         }

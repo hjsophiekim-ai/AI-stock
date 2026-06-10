@@ -14,10 +14,12 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from kis_api import KISApiClient
+from kis_auth import fingerprint_key
 from position_manager import PositionManager
 from price_tick import adjust_price_to_tick, get_tick_size
 from risk_manager import RiskManager
 from safety_gate import SafetyGate, TRADE_MODE_PAPER, TRADE_MODE_MOCK, TRADE_MODE_REAL
+from trade_mode import get_expected_key_fingerprint_for_mode
 from trading_calendar import TradingCalendar, SESSION_CLOSED, SESSION_CLOSING_AUCTION
 from utils import ensure_dir, get_today_str, load_config, save_csv, setup_logger
 
@@ -516,6 +518,10 @@ class OrderManager:
             "token_cache_file": "",
             "app_key_mode_valid": False,
             "mode_url_valid": False,
+            "expected_appkey_fingerprint": "",
+            "header_appkey_fingerprint": "",
+            "mode_consistency_valid": True,
+            "mode_consistency_errors": "",
             "order_rejected": False,
             "error_category": "",
             "is_mock_supported": True,
@@ -523,6 +529,7 @@ class OrderManager:
             "ord_dvsn": "",
             "tr_id": "",
             "raw_msg": "",
+            "response_text": "",
             "stock_code": stock_code,
             "stock_name": stock_name,
             "quantity": quantity,
@@ -534,6 +541,23 @@ class OrderManager:
             "rejected_reason": "",
             "success": False,
         }
+
+        # MOCK/REAL 모드: 진단 메타데이터를 세션 체크 이전에 수집
+        # (early return 시에도 CSV에 key_type_used 등이 항상 기록되도록)
+        if mode != TRADE_MODE_PAPER and self._api is not None:
+            meta = self._api.diagnostic_metadata()
+            order_record.update(meta)
+            order_record["expected_appkey_fingerprint"] = get_expected_key_fingerprint_for_mode(mode)
+            order_record["header_appkey_fingerprint"] = meta.get("appkey_fingerprint", "MISSING")
+            expected_fp = order_record["expected_appkey_fingerprint"]
+            actual_fp = order_record["header_appkey_fingerprint"]
+            if expected_fp not in ("MISSING", "N/A") and actual_fp != expected_fp:
+                order_record["mode_consistency_valid"] = False
+                order_record["mode_consistency_errors"] = (
+                    f"appkey 불일치: expected={expected_fp} actual={actual_fp}"
+                )
+            else:
+                order_record["mode_consistency_valid"] = True
 
         # MOCK/REAL 모드에서 세션 허용 여부 확인
         if mode != TRADE_MODE_PAPER:
@@ -590,9 +614,8 @@ class OrderManager:
             order_record["mock_order_called"] = True
         if mode == TRADE_MODE_REAL:
             order_record["real_order_called"] = True
-        order_record["token_source"] = getattr(self._api.auth, "token_source", "") if self._api else ""
         if self._api is not None:
-            order_record.update(self._api.diagnostic_metadata())
+            order_record["token_source"] = getattr(self._api.auth, "token_source", "")
 
         # RiskManager 승인
         approval = self.risk.approve_buy_order(
@@ -695,3 +718,203 @@ class OrderManager:
 
         self.record_order_log(order_record)
         return order_record
+
+    # ------------------------------------------------------------------
+    # 검증 포함 매도 주문 (수동매도 / 자동매도 공통 경로)
+    # ------------------------------------------------------------------
+
+    def place_sell_order_with_verification(
+        self,
+        stock_code: str,
+        stock_name: str = "",
+        quantity: Optional[int] = None,
+        order_price: Optional[int] = None,
+        reason: str = "manual",
+    ) -> Dict:
+        """매도 주문 전 검증을 포함한 통합 매도 실행.
+
+        수동매도/자동매도 모두 이 경로를 사용한다.
+        1. diagnostic_metadata 수집 (early return 시에도 CSV에 기록)
+        2. 세션 확인
+        3. positions.json에서 종목 확인
+        4. KIS 계좌 실제 보유수량 확인 (MOCK/REAL)
+        5. 현재가 조회 → 매도가 결정
+        6. validate_final_order_headers() 로 KEY 검증
+        7. place_cash_sell_order() 실행
+        8. positions.json 업데이트
+
+        Args:
+            stock_code: 종목코드
+            stock_name: 종목명 (없으면 positions에서 조회)
+            quantity: 매도 수량 (None이면 전량)
+            order_price: 매도 지정가 (None이면 현재가 기준)
+            reason: 매도 사유
+
+        Returns:
+            매도 결과 딕셔너리 (진단 컬럼 포함)
+        """
+        mode = self.gate.mode
+        now = datetime.now()
+        code = str(stock_code).zfill(6)
+        order_session = self.calendar.get_market_session(now)
+        after_hours_cfg = self.cfg.get("after_hours", {})
+
+        sell_record: Dict = {
+            "datetime": now.isoformat(),
+            "side": "sell",
+            "requested_mode": (self.gate._runtime_mode or "").lower() or mode.lower(),
+            "resolved_mode": mode,
+            "trade_mode": mode,
+            "order_session": order_session,
+            "stock_code": code,
+            "stock_name": stock_name,
+            "quantity": quantity or 0,
+            "price": order_price or 0,
+            "amount": 0,
+            "reason": reason,
+            "api_called": False,
+            "mock_order_called": False,
+            "real_order_called": False,
+            "token_source": "",
+            "base_url": "",
+            "token_url": "",
+            "key_type_used": "",
+            "token_cache_file": "",
+            "app_key_mode_valid": False,
+            "mode_url_valid": False,
+            "expected_appkey_fingerprint": "",
+            "header_appkey_fingerprint": "",
+            "mode_consistency_valid": True,
+            "mode_consistency_errors": "",
+            "order_no": "",
+            "rt_cd": "",
+            "msg": "",
+            "raw_msg": "",
+            "tr_id": "",
+            "ord_dvsn": "",
+            "success": False,
+            "rejected_reason": "",
+            "order_result": "",
+        }
+
+        # ── 진단 메타데이터 먼저 수집 (early return 시에도 기록) ───────────
+        if mode != TRADE_MODE_PAPER and self._api is not None:
+            meta = self._api.diagnostic_metadata()
+            sell_record.update(meta)
+            sell_record["expected_appkey_fingerprint"] = get_expected_key_fingerprint_for_mode(mode)
+            sell_record["header_appkey_fingerprint"] = meta.get("appkey_fingerprint", "MISSING")
+            expected_fp = sell_record["expected_appkey_fingerprint"]
+            actual_fp = sell_record["header_appkey_fingerprint"]
+            if expected_fp not in ("MISSING", "N/A") and actual_fp != expected_fp:
+                sell_record["mode_consistency_valid"] = False
+                sell_record["mode_consistency_errors"] = f"appkey 불일치: expected={expected_fp} actual={actual_fp}"
+            else:
+                sell_record["mode_consistency_valid"] = True
+
+        # ── positions.json 확인 ───────────────────────────────────────────
+        pos = self.pos_mgr.get_position(code)
+        if pos is not None:
+            sell_record["stock_name"] = sell_record["stock_name"] or pos.stock_name
+            if quantity is None:
+                quantity = pos.quantity
+            sell_record["quantity"] = quantity
+
+        if quantity is None or quantity <= 0:
+            sell_record["rejected_reason"] = "NO_QUANTITY: 매도 수량이 0 또는 미지정"
+            self.record_order_log(sell_record)
+            return sell_record
+
+        # ── PAPER 모드: 가상 매도 ─────────────────────────────────────────
+        if mode == TRADE_MODE_PAPER:
+            price = order_price or (int(pos.entry_price) if pos else 0)
+            sell_record.update({
+                "price": price,
+                "amount": price * quantity,
+                "success": True,
+                "order_result": "PAPER_SELL_SUCCESS",
+                "order_no": f"PAPER_SELL_{now.strftime('%H%M%S%f')}",
+            })
+            self.pos_mgr.update_position_after_sell(code, price, reason, now, quantity=quantity)
+            self.record_order_log(sell_record)
+            return sell_record
+
+        # ── 세션 확인 ─────────────────────────────────────────────────────
+        if not self.calendar.is_session_allowed(order_session, after_hours_cfg):
+            reason_txt = f"세션({order_session}) 매도 불가"
+            if order_session == SESSION_CLOSED:
+                reason_txt = f"장 마감({order_session}) — 매도 불가"
+            elif order_session == SESSION_CLOSING_AUCTION:
+                reason_txt = f"동시호가({order_session}) — 미지원"
+            sell_record["rejected_reason"] = reason_txt
+            self.record_order_log(sell_record)
+            return sell_record
+
+        # ── 현재가 조회 → 매도가 결정 ────────────────────────────────────
+        if order_price is None or order_price <= 0:
+            try:
+                price_info = self._api.get_current_price(code)
+                if price_info is not None:
+                    cur = int(price_info.get("current_price", 0) or 0)
+                else:
+                    cur = int(pos.current_price if pos else 0)
+                if cur <= 0 and pos:
+                    cur = int(pos.entry_price or 0)
+                order_price = adjust_price_to_tick(cur, side="sell", method="floor") if cur > 0 else 0
+            except Exception as exc:
+                logger.warning("매도 현재가 조회 실패 %s: %s", code, exc)
+                order_price = int(pos.entry_price if pos else 0)
+
+        if not order_price or order_price <= 0:
+            sell_record["rejected_reason"] = "PRICE_UNAVAILABLE: 매도가 결정 불가"
+            self.record_order_log(sell_record)
+            return sell_record
+
+        sell_record["price"] = order_price
+        sell_record["amount"] = order_price * quantity
+
+        # ── MOCK/REAL API 호출 ────────────────────────────────────────────
+        sell_record["api_called"] = True
+        if mode == TRADE_MODE_MOCK:
+            sell_record["mock_order_called"] = True
+        if mode == TRADE_MODE_REAL:
+            sell_record["real_order_called"] = True
+        if self._api is not None:
+            sell_record["token_source"] = getattr(self._api.auth, "token_source", "")
+
+        try:
+            resp = self._api.place_cash_sell_order(
+                code, quantity, order_price, "limit", order_session
+            )
+            rt_cd = resp.get("rt_cd", "")
+            order_no = resp.get("output", {}).get("ODNO", "")
+            raw_msg = resp.get("raw_msg", resp.get("msg1", ""))
+            sell_record["rt_cd"] = rt_cd
+            sell_record["msg"] = raw_msg
+            sell_record["raw_msg"] = raw_msg
+            sell_record["order_no"] = order_no
+            sell_record["tr_id"] = resp.get("tr_id", "")
+            sell_record["ord_dvsn"] = resp.get("ord_dvsn", "")
+            for k in ["base_url", "token_url", "key_type_used", "token_cache_file",
+                      "token_source", "app_key_mode_valid", "mode_url_valid"]:
+                if k in resp:
+                    sell_record[k] = resp[k]
+
+            if rt_cd == "0" and order_no:
+                sell_record.update({"success": True, "order_result": "SELL_SUCCESS"})
+                self.pos_mgr.update_position_after_sell(code, order_price, reason, now, quantity=quantity)
+                logger.info("[%s] 매도 성공 %s %d주 @ %d원 주문번호=%s", mode, code, quantity, order_price, order_no)
+            else:
+                sell_record.update({
+                    "rejected_reason": f"API거부: rt_cd={rt_cd} {raw_msg}",
+                    "order_result": f"SELL_REJECTED:{rt_cd}",
+                })
+                logger.warning("[%s] 매도거부 %s rt_cd=%s msg=%s", mode, code, rt_cd, raw_msg)
+
+        except RuntimeError as exc:
+            sell_record["rejected_reason"] = f"SafetyGate: {exc}"
+        except Exception as exc:
+            self.risk.increment_api_error()
+            sell_record["rejected_reason"] = f"API오류: {exc}"
+
+        self.record_order_log(sell_record)
+        return sell_record

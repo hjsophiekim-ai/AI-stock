@@ -171,6 +171,31 @@ st.subheader("전략 매수 실행")
 st.caption("수동 실행 모드: 현재 시간이 전략 매수시간이 아니어도 MOCK/PAPER 주문은 실행됩니다. REAL 전체 리스트 매수는 기본 차단됩니다.")
 
 order_mode = st.radio("주문 모드", ["MOCK", "PAPER", "REAL"], index=0, horizontal=True, key="strategy_order_mode")
+
+# 모드 진단 표시 (필수 6)
+if order_mode in ("MOCK", "REAL"):
+    from app.services.env_service import inject_to_os_env
+    inject_to_os_env()
+    import sys as _sys
+    _sys.path.insert(0, str(PROJECT_ROOT / "src"))
+    try:
+        from trade_mode import get_expected_key_fingerprint_for_mode, get_base_url_for_mode
+        _expected_fp = get_expected_key_fingerprint_for_mode(order_mode)
+        _base_url = get_base_url_for_mode(order_mode)
+        _key_env = "KIS_MOCK_APP_KEY" if order_mode == "MOCK" else "KIS_REAL_APP_KEY"
+        _diag_col1, _diag_col2 = st.columns(2)
+        with _diag_col1:
+            st.caption(f"예상 API URL: `{_base_url}`")
+            st.caption(f"사용 환경변수: `{_key_env}`")
+        with _diag_col2:
+            st.caption(f"예상 appkey fingerprint: `{_expected_fp}`")
+        if _expected_fp == "MISSING":
+            st.error(f"⛔ {_key_env} 환경변수 미설정 — {order_mode} 주문 불가! .env 파일에 키를 등록하세요.")
+        else:
+            st.success(f"{order_mode} appkey 설정 확인됨: `{_expected_fp}`")
+    except Exception as _e:
+        st.warning(f"모드 진단 로드 실패: {_e}")
+
 if order_mode == "REAL":
     real_order_warning()
     real_bulk_ok = (

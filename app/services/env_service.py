@@ -13,9 +13,9 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 ENV_PATH = PROJECT_ROOT / ".env"
 
 # 지원 키 목록
-MOCK_KEYS = ["KIS_APP_KEY", "KIS_APP_SECRET", "KIS_MOCK_ACCOUNT_NO", "KIS_MOCK_ACCOUNT_PRODUCT_CODE"]
+MOCK_KEYS = ["KIS_MOCK_APP_KEY", "KIS_MOCK_APP_SECRET", "KIS_MOCK_ACCOUNT_NO", "KIS_MOCK_ACCOUNT_PRODUCT_CODE"]
 REAL_KEYS = ["KIS_REAL_APP_KEY", "KIS_REAL_APP_SECRET", "KIS_ACCOUNT_NO", "KIS_ACCOUNT_PRODUCT_CODE"]
-LEGACY_KEYS = ["KIS_APP_KEY", "KIS_APP_SECRET"]  # 하위호환
+LEGACY_KEYS = ["KIS_APP_KEY", "KIS_APP_SECRET"]  # 하위호환 (직접 사용 금지)
 
 
 def load_env() -> Dict[str, str]:
@@ -44,10 +44,10 @@ def save_env(env_dict: Dict[str, str]) -> None:
 
 
 def save_mock_keys(app_key: str, app_secret: str, account_no: str, product_code: str = "01") -> None:
-    """모의투자 키 저장."""
+    """모의투자 키 저장. 반드시 KIS_MOCK_APP_KEY / KIS_MOCK_APP_SECRET 으로 저장."""
     save_env({
-        "KIS_APP_KEY": app_key,
-        "KIS_APP_SECRET": app_secret,
+        "KIS_MOCK_APP_KEY": app_key,
+        "KIS_MOCK_APP_SECRET": app_secret,
         "KIS_MOCK_ACCOUNT_NO": account_no,
         "KIS_MOCK_ACCOUNT_PRODUCT_CODE": product_code,
     })
@@ -91,8 +91,8 @@ def check_mock_keys() -> Dict[str, bool]:
     """모의투자 필수 키 존재 여부 확인."""
     env = load_env()
     return {
-        "KIS_APP_KEY": bool(env.get("KIS_APP_KEY")),
-        "KIS_APP_SECRET": bool(env.get("KIS_APP_SECRET")),
+        "KIS_MOCK_APP_KEY": bool(env.get("KIS_MOCK_APP_KEY")),
+        "KIS_MOCK_APP_SECRET": bool(env.get("KIS_MOCK_APP_SECRET")),
         "KIS_MOCK_ACCOUNT_NO": bool(env.get("KIS_MOCK_ACCOUNT_NO")),
     }
 
@@ -108,15 +108,12 @@ def check_real_keys() -> Dict[str, bool]:
 
 
 def inject_to_os_env() -> None:
-    """현재 .env 값을 os.environ에 주입 (src 모듈이 읽을 수 있도록)."""
+    """현재 .env 값을 os.environ에 주입 (src 모듈이 읽을 수 있도록).
+
+    중요: KIS_MOCK_APP_KEY / KIS_MOCK_APP_SECRET / KIS_REAL_APP_KEY / KIS_REAL_APP_SECRET은
+    절대 오버라이드하지 않는다. 각 모드별 전용 키가 항상 올바른 값을 유지해야 한다.
+    KIS_USE_MOCK 기반 KIS_APP_KEY 오버라이드는 모드 혼재 버그를 유발하므로 제거됨.
+    """
     env = load_env()
     for k, v in env.items():
         os.environ.setdefault(k, v)
-    # 실전 키가 있으면 KIS_APP_KEY/KIS_APP_SECRET 오버라이드 지원
-    # (use_mock=false 일 때 실전 키 사용)
-    real_key = env.get("KIS_REAL_APP_KEY")
-    real_secret = env.get("KIS_REAL_APP_SECRET")
-    use_mock_val = os.environ.get("KIS_USE_MOCK", "true").lower()
-    if use_mock_val in ("false", "0") and real_key and real_secret:
-        os.environ["KIS_APP_KEY"] = real_key
-        os.environ["KIS_APP_SECRET"] = real_secret

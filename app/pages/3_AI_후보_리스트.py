@@ -189,10 +189,13 @@ if df_top100 is not None and not df_top100.empty:
         show_n = st.selectbox("표시 개수", [20, 50, 100], index=2)
         df_display = df_top100.head(show_n)
     with col_c:
+        refresh_mode = st.selectbox("갱신 모드", ["MOCK", "PAPER"], key="refresh_mode_select",
+                                    help="MOCK: KIS 모의투자 API 사용 / PAPER: API 호출 없음")
         if st.button("현재가 갱신", use_container_width=True):
-            with st.spinner("현재가 갱신 중..."):
+            with st.spinner(f"현재가 갱신 중 (mode={refresh_mode})..."):
                 r = run_script("refresh_candidate_prices.py",
-                               args=["--date", today_str, "--top", "100"], timeout=300)
+                               args=["--date", today_str, "--top", "100",
+                                     "--mode", refresh_mode.lower()], timeout=300)
             if r and r.get("success"):
                 st.success("현재가 갱신 완료")
                 st.rerun()

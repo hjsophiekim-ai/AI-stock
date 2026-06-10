@@ -114,6 +114,63 @@ def run_sell_all(stock_code: str, reason: str = "manual", mode: str = "mock") ->
         return {"success": False, "reason": str(e)}
 
 
+def run_sell_order(
+    stock_code: str,
+    mode: str = "mock",
+    reason: str = "manual",
+    quantity: int = None,
+    order_price: int = None,
+    stock_name: str = "",
+) -> Dict:
+    """검증 포함 매도 주문 — 수동매도/자동매도 공통 경로.
+
+    UI에서 선택한 mode 를 끝까지 전달한다. config.yaml 기반 덮어쓰기 금지.
+    """
+    inject_to_os_env()
+    try:
+        from order_manager import OrderManager
+        from safety_gate import SafetyGate
+        CONFIG_PATH = str(PROJECT_ROOT / "config.yaml")
+        gate = SafetyGate(CONFIG_PATH, runtime_mode=(mode or "mock").lower())
+        mgr = OrderManager(CONFIG_PATH, gate=gate)
+        return mgr.place_sell_order_with_verification(
+            stock_code=stock_code,
+            stock_name=stock_name,
+            quantity=quantity,
+            order_price=order_price,
+            reason=reason,
+        )
+    except Exception as e:
+        return {
+            "success": False,
+            "reason": str(e),
+            "requested_mode": (mode or "mock").upper(),
+            "resolved_mode": "",
+            "stock_code": str(stock_code).zfill(6),
+        }
+
+
+def refresh_candidate_prices_service(
+    date_str: str,
+    top_n: int = 100,
+    mode: str = "mock",
+    limit: int = None,
+) -> Dict:
+    """앱에서 현재가 갱신 버튼 클릭 시 호출."""
+    inject_to_os_env()
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from refresh_candidate_prices import refresh_prices
+        return refresh_prices(
+            date_str=date_str,
+            top_n=top_n,
+            mode=(mode or "mock").lower(),
+            limit=limit,
+        )
+    except Exception as e:
+        return {"success": False, "message": str(e), "updated": 0, "price_mode": (mode or "mock").upper()}
+
+
 def run_budget_allocation(budget: int, date_str: Optional[str] = None) -> Dict:
     inject_to_os_env()
     try:

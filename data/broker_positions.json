@@ -1,20 +1,164 @@
 [
   {
-    "stock_code": "035420",
-    "stock_name": "NAVER",
+    "stock_code": "000270",
+    "stock_name": "기아",
+    "quantity": 2,
+    "avg_price": 155200.0,
+    "current_price": 155700,
+    "eval_amount": 311400,
+    "pnl_rate": 0.32
+  },
+  {
+    "stock_code": "003550",
+    "stock_name": "LG",
+    "quantity": 2,
+    "avg_price": 106100.0,
+    "current_price": 105900,
+    "eval_amount": 211800,
+    "pnl_rate": -0.19
+  },
+  {
+    "stock_code": "003670",
+    "stock_name": "포스코퓨처엠",
     "quantity": 1,
-    "avg_price": 252500.0,
-    "current_price": 252500,
-    "eval_amount": 252500,
+    "avg_price": 184000.0,
+    "current_price": 184400,
+    "eval_amount": 184400,
+    "pnl_rate": 0.22
+  },
+  {
+    "stock_code": "005380",
+    "stock_name": "현대차",
+    "quantity": 1,
+    "avg_price": 590000.0,
+    "current_price": 586000,
+    "eval_amount": 586000,
+    "pnl_rate": -0.68
+  },
+  {
+    "stock_code": "010130",
+    "stock_name": "고려아연",
+    "quantity": 1,
+    "avg_price": 1143000.0,
+    "current_price": 1152000,
+    "eval_amount": 1152000,
+    "pnl_rate": 0.79
+  },
+  {
+    "stock_code": "010950",
+    "stock_name": "S-Oil",
+    "quantity": 1,
+    "avg_price": 108100.0,
+    "current_price": 108800,
+    "eval_amount": 108800,
+    "pnl_rate": 0.65
+  },
+  {
+    "stock_code": "011200",
+    "stock_name": "HMM",
+    "quantity": 1,
+    "avg_price": 18080.0,
+    "current_price": 18230,
+    "eval_amount": 18230,
+    "pnl_rate": 0.83
+  },
+  {
+    "stock_code": "015760",
+    "stock_name": "한국전력",
+    "quantity": 13,
+    "avg_price": 36326.923,
+    "current_price": 35800,
+    "eval_amount": 465400,
+    "pnl_rate": -1.45
+  },
+  {
+    "stock_code": "018260",
+    "stock_name": "삼성에스디에스",
+    "quantity": 2,
+    "avg_price": 220500.0,
+    "current_price": 219000,
+    "eval_amount": 438000,
+    "pnl_rate": -0.68
+  },
+  {
+    "stock_code": "028260",
+    "stock_name": "삼성물산",
+    "quantity": 1,
+    "avg_price": 391500.0,
+    "current_price": 392000,
+    "eval_amount": 392000,
+    "pnl_rate": 0.13
+  },
+  {
+    "stock_code": "032830",
+    "stock_name": "삼성생명",
+    "quantity": 1,
+    "avg_price": 358500.0,
+    "current_price": 358000,
+    "eval_amount": 358000,
+    "pnl_rate": -0.14
+  },
+  {
+    "stock_code": "034730",
+    "stock_name": "SK",
+    "quantity": 1,
+    "avg_price": 561000.0,
+    "current_price": 561000,
+    "eval_amount": 561000,
     "pnl_rate": 0.0
+  },
+  {
+    "stock_code": "035720",
+    "stock_name": "카카오",
+    "quantity": 1,
+    "avg_price": 37500.0,
+    "current_price": 37600,
+    "eval_amount": 37600,
+    "pnl_rate": 0.27
+  },
+  {
+    "stock_code": "047050",
+    "stock_name": "포스코인터내셔널",
+    "quantity": 2,
+    "avg_price": 56300.0,
+    "current_price": 56800,
+    "eval_amount": 113600,
+    "pnl_rate": 0.89
+  },
+  {
+    "stock_code": "068270",
+    "stock_name": "셀트리온",
+    "quantity": 1,
+    "avg_price": 163500.0,
+    "current_price": 164800,
+    "eval_amount": 164800,
+    "pnl_rate": 0.8
+  },
+  {
+    "stock_code": "086790",
+    "stock_name": "하나금융지주",
+    "quantity": 2,
+    "avg_price": 115000.0,
+    "current_price": 115800,
+    "eval_amount": 231600,
+    "pnl_rate": 0.7
+  },
+  {
+    "stock_code": "096770",
+    "stock_name": "SK이노베이션",
+    "quantity": 1,
+    "avg_price": 101500.0,
+    "current_price": 101800,
+    "eval_amount": 101800,
+    "pnl_rate": 0.3
   },
   {
     "stock_code": "105560",
     "stock_name": "KB금융",
-    "quantity": 1,
-    "avg_price": 151600.0,
-    "current_price": 154300,
-    "eval_amount": 154300,
-    "pnl_rate": 1.78
+    "quantity": 2,
+    "avg_price": 149800.0,
+    "current_price": 151000,
+    "eval_amount": 302000,
+    "pnl_rate": 0.8
   }
 ]

@@ -225,7 +225,69 @@ reports/after_hours_diagnosis_YYYYMMDD_HHMMSS.txt
 reports/after_hours_diagnosis_YYYYMMDD_HHMMSS.json
 ```
 
-### 10. 호가단위 오류 해결
+### 10. MOCK/REAL 키 모드 진단 및 주문 전 헤더 검증
+
+#### 모드별 키 일관성 사전 진단
+
+```powershell
+cd "C:\Users\FURSYS\Desktop\AI stock"
+
+# 토큰 캐시 초기화 (진단 전 권장)
+Remove-Item data\mock_token_cache.json -ErrorAction SilentlyContinue
+Remove-Item data\real_token_cache.json -ErrorAction SilentlyContinue
+
+# 모드 진단
+python src\mode_diagnosis.py --mode mock
+python src\mode_diagnosis.py --mode real
+python src\mode_diagnosis.py --mode paper
+```
+
+**MOCK 진단 정상 출력 기준:**
+- `key_type_used = MOCK_APP_KEY`
+- `base_url` 및 `token_url`에 `openapivts` 포함
+- `expected_appkey_fingerprint == actual_appkey_fingerprint`
+- `mode_consistency_valid = True`
+
+#### MOCK 주문 1주 진단 (order_no 확인)
+
+```powershell
+python src\mock_order_diagnosis.py --stock-code 015760 --quantity 1
+```
+
+**성공 기준:**
+- `app_key_mode_valid = True`
+- `header_appkey_fingerprint == expected_appkey_fingerprint`
+- `order_no` 있음
+- `success = True`
+- "해당 앱키는 모의투자용 앱키가 아닙니다" 오류 없음
+
+#### 주문 직전 자동 차단 (MODE_KEY_MISMATCH)
+
+MOCK 주문인데 헤더 appkey가 `KIS_MOCK_APP_KEY`와 다르면:
+```
+rt_cd = MODE_KEY_MISMATCH
+msg1  = MODE_KEY_MISMATCH: MOCK 주문인데 최종 헤더 appkey가 KIS_MOCK_APP_KEY와 일치하지 않습니다.
+        expected=XXXXXX****XXXX actual=YYYYYY****YYYY
+api_called = False  ← API 호출 없이 차단
+```
+
+이 에러가 발생하면 `.env`의 `KIS_MOCK_APP_KEY` 값을 확인하세요.
+
+#### 전체 시스템 검증
+
+```powershell
+python src\full_system_verification.py
+```
+
+신규 검증 항목:
+- `MOCK_APP_KEY_존재` — KIS_MOCK_APP_KEY 환경변수 존재 확인
+- `REAL_APP_KEY_존재` — KIS_REAL_APP_KEY 환경변수 존재 확인
+- `MOCK_REAL_키_구분` — MOCK키와 REAL키가 서로 다른지 확인
+- `MOCK_credentials_key_type` — MOCK mode에서 MOCK_APP_KEY 반환 확인
+- `REAL_credentials_key_type` — REAL mode에서 REAL_APP_KEY 반환 확인
+- `MOCK_KISApiClient_appkey_fingerprint` — KISApiClient 헤더 fingerprint 일치 확인
+
+### 11. 호가단위 오류 해결
 
 국내주식은 가격대별 호가단위(KRX 기준)가 정해져 있으므로 유효하지 않은 가격으로는 주문할 수 없습니다.
 

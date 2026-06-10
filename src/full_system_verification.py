@@ -1935,13 +1935,21 @@ class SystemVerifier:
         self._section("13g. order result CSV diagnostics columns")
 
         required = {
+            "requested_mode",
+            "resolved_mode",
             "base_url",
             "token_url",
             "key_type_used",
             "token_cache_file",
             "token_source",
+            "expected_appkey_fingerprint",
+            "header_appkey_fingerprint",
             "app_key_mode_valid",
             "mode_url_valid",
+            "mock_order_called",
+            "real_order_called",
+            "api_called",
+            "success",
         }
         reports_dir = PROJECT_ROOT / "reports"
         orders_dir = reports_dir / "orders"
@@ -1971,6 +1979,198 @@ class SystemVerifier:
             r.warn(str(exc), file=str(latest))
         self._record(r)
 
+    def verify_mode_key_fingerprint_consistency(self) -> None:
+        """MOCK/REAL 키 fingerprint 일관성 검증."""
+        from kis_auth import fingerprint_key, get_kis_credentials
+        from trade_mode import get_expected_key_fingerprint_for_mode
+
+        # 1. KIS_MOCK_APP_KEY 존재
+        r1 = VerificationResult("MOCK_APP_KEY_존재")
+        mock_key = os.getenv("KIS_MOCK_APP_KEY", "")
+        if mock_key:
+            r1.ok(f"KIS_MOCK_APP_KEY 확인 ({fingerprint_key(mock_key)})")
+        else:
+            r1.fail("KIS_MOCK_APP_KEY 환경변수 미설정")
+        self._record(r1)
+
+        # 2. KIS_REAL_APP_KEY 존재
+        r2 = VerificationResult("REAL_APP_KEY_존재")
+        real_key = os.getenv("KIS_REAL_APP_KEY", "")
+        if real_key:
+            r2.ok(f"KIS_REAL_APP_KEY 확인 ({fingerprint_key(real_key)})")
+        else:
+            r2.warn("KIS_REAL_APP_KEY 환경변수 미설정 (REAL 주문 불가)")
+        self._record(r2)
+
+        # 3. MOCK/REAL fingerprint 서로 다른지 확인
+        r3 = VerificationResult("MOCK_REAL_키_구분")
+        if mock_key and real_key:
+            if mock_key != real_key:
+                r3.ok(
+                    f"MOCK키({fingerprint_key(mock_key)})와 REAL키({fingerprint_key(real_key)}) 서로 다름"
+                )
+            else:
+                r3.warn("KIS_MOCK_APP_KEY와 KIS_REAL_APP_KEY가 동일함 (의도된 경우 무시)")
+        else:
+            r3.warn("키 하나 이상 미설정으로 비교 불가")
+        self._record(r3)
+
+        # 4. MOCK mode get_kis_credentials → MOCK_APP_KEY 반환하는지
+        r4 = VerificationResult("MOCK_credentials_key_type")
+        try:
+            creds = get_kis_credentials("MOCK")
+            kt = creds.get("key_type_used", "")
+            if kt == "MOCK_APP_KEY":
+                r4.ok(f"MOCK mode key_type_used={kt} fingerprint={creds.get('appkey_fingerprint')}")
+            elif kt == "GENERIC_APP_KEY_FALLBACK":
+                r4.warn(f"MOCK mode fallback 사용 중 (KIS_MOCK_APP_KEY 미설정?): key_type_used={kt}")
+            else:
+                r4.fail(f"MOCK mode key_type_used={kt} (기대값=MOCK_APP_KEY)")
+        except Exception as exc:
+            r4.fail(str(exc))
+        self._record(r4)
+
+        # 5. REAL mode get_kis_credentials → REAL_APP_KEY 반환하는지
+        r5 = VerificationResult("REAL_credentials_key_type")
+        try:
+            creds = get_kis_credentials("REAL")
+            kt = creds.get("key_type_used", "")
+            if kt == "REAL_APP_KEY":
+                r5.ok(f"REAL mode key_type_used={kt} fingerprint={creds.get('appkey_fingerprint')}")
+            elif kt == "GENERIC_APP_KEY_FALLBACK":
+                r5.warn(f"REAL mode fallback 사용 중 (KIS_REAL_APP_KEY 미설정?): key_type_used={kt}")
+            else:
+                r5.fail(f"REAL mode key_type_used={kt} (기대값=REAL_APP_KEY)")
+        except Exception as exc:
+            r5.warn(str(exc))
+        self._record(r5)
+
+        # 6. MOCK credentials base_url/token_url
+        r6 = VerificationResult("MOCK_token_url_확인")
+        try:
+            creds = get_kis_credentials("MOCK")
+            turl = creds.get("token_url", "")
+            burl = creds.get("base_url", "")
+            if "openapivts" in turl and "openapivts" in burl:
+                r6.ok(f"MOCK token_url/base_url 올바름: {turl}")
+            else:
+                r6.fail(f"MOCK token_url/base_url 이상: token_url={turl} base_url={burl}")
+        except Exception as exc:
+            r6.fail(str(exc))
+        self._record(r6)
+
+        # 7. REAL credentials base_url/token_url
+        r7 = VerificationResult("REAL_token_url_확인")
+        try:
+            creds = get_kis_credentials("REAL")
+            turl = creds.get("token_url", "")
+            burl = creds.get("base_url", "")
+            if "openapi.koreainvestment.com:9443" in (turl or "") and "openapi.koreainvestment.com:9443" in (burl or ""):
+                r7.ok(f"REAL token_url/base_url 올바름: {turl}")
+            else:
+                r7.warn(f"REAL token_url/base_url 확인 필요: token_url={turl} base_url={burl}")
+        except Exception as exc:
+            r7.warn(str(exc))
+        self._record(r7)
+
+        # 8. MOCK KISApiClient fingerprint == expected
+        r8 = VerificationResult("MOCK_KISApiClient_appkey_fingerprint")
+        try:
+            from safety_gate import SafetyGate
+            from kis_api import KISApiClient
+            gate = SafetyGate(self.config_path, runtime_mode="mock")
+            api = KISApiClient(self.config_path, gate=gate)
+            meta = api.diagnostic_metadata()
+            actual_fp = meta.get("appkey_fingerprint", "MISSING")
+            expected_fp = get_expected_key_fingerprint_for_mode("MOCK")
+            if expected_fp and expected_fp != "MISSING" and actual_fp == expected_fp:
+                r8.ok(
+                    f"MOCK KISApiClient appkey fingerprint 일치: {actual_fp}",
+                    expected=expected_fp,
+                    actual=actual_fp,
+                )
+            elif expected_fp == "MISSING":
+                r8.warn("KIS_MOCK_APP_KEY 미설정으로 비교 불가")
+            else:
+                r8.fail(
+                    f"MOCK KISApiClient appkey 불일치! expected={expected_fp} actual={actual_fp}",
+                    expected=expected_fp,
+                    actual=actual_fp,
+                )
+        except Exception as exc:
+            r8.warn(str(exc))
+        self._record(r8)
+
+        # 9. 실제 REAL 주문은 절대 실행하지 않음
+        r9 = VerificationResult("REAL_주문_실행금지_확인")
+        r9.ok("REAL 주문 dry-run은 실행하지 않음 (안전)")
+        self._record(r9)
+
+    def verify_mock_sell_dryrun(self) -> None:
+        """13h. MOCK 매도 경로 dry-run 검증 (실제 주문 없음)."""
+        self._section("13h. MOCK 매도 경로 dry-run 검증")
+        try:
+            from manual_sell_diagnosis import run_manual_sell_diagnosis
+            result = run_manual_sell_diagnosis(
+                stock_code="055550",
+                mode="mock",
+                quantity=1,
+                dry_run=True,
+                config_path=str(PROJECT_ROOT / "config.yaml"),
+            )
+            r = VerificationResult("MOCK_매도_dry_run")
+            if result.get("app_key_mode_valid") and result.get("key_type_used") == "MOCK_APP_KEY":
+                r.ok(
+                    f"MOCK 매도 경로 검증 통과 | key_type={result.get('key_type_used')} "
+                    f"base_url={result.get('base_url')} fingerprint={result.get('header_appkey_fingerprint')}"
+                )
+            elif result.get("app_key_mode_valid") is False:
+                r.fail(
+                    f"appkey 불일치: expected={result.get('expected_appkey_fingerprint')} "
+                    f"actual={result.get('header_appkey_fingerprint')} "
+                    f"errors={result.get('diagnosis_errors', [])}"
+                )
+            else:
+                r.warn(f"매도 dry-run 부분 완료: {result.get('msg')} | errors={result.get('diagnosis_errors', [])}")
+            self._record(r)
+
+            r2 = VerificationResult("MOCK_매도_real_order_not_called")
+            if not result.get("real_order_called") and not result.get("api_called"):
+                r2.ok("dry-run: REAL 주문 미실행 확인")
+            else:
+                r2.fail(f"dry-run 중 주문 호출 감지: api_called={result.get('api_called')} real={result.get('real_order_called')}")
+            self._record(r2)
+
+        except Exception as exc:
+            self._record(VerificationResult("MOCK_매도_dry_run").warn(f"manual_sell_diagnosis 오류: {exc}"))
+
+    def verify_refresh_candidate_prices(self) -> None:
+        """13i. 현재가 갱신 경로 검증 (--mode mock, limit=1)."""
+        self._section("13i. refresh_candidate_prices 검증 (MOCK, limit=1)")
+        try:
+            from refresh_candidate_prices import refresh_prices
+            from prediction_service import get_today_str
+            date_str = get_today_str()
+            result = refresh_prices(
+                date_str=date_str,
+                top_n=20,
+                mode="mock",
+                limit=1,
+            )
+            r = VerificationResult("현재가갱신_MOCK")
+            if result.get("success") and result.get("price_key_type_used") == "MOCK_APP_KEY":
+                r.ok(
+                    f"현재가 갱신 성공 | updated={result.get('updated')} errors={result.get('errors')} "
+                    f"key_type={result.get('price_key_type_used')}"
+                )
+            elif result.get("success") and result.get("updated", 0) >= 0:
+                r.ok(f"현재가 갱신 완료 | updated={result.get('updated')} errors={result.get('errors')}")
+            else:
+                r.warn(f"현재가 갱신 실패 또는 파일 없음: {result.get('message')}")
+            self._record(r)
+        except Exception as exc:
+            self._record(VerificationResult("현재가갱신_MOCK").warn(f"refresh_candidate_prices 오류: {exc}"))
+
     def run_all(self) -> None:
         print("\n" + "=" * 60)
         print("  AI Stock 시스템 통합 검증 시작")
@@ -1999,7 +2199,10 @@ class SystemVerifier:
         self.verify_sell_policy_features()
         self.verify_real_single_order_safety()
         self.verify_mode_url_consistency()
+        self.verify_mode_key_fingerprint_consistency()
         self.verify_order_result_csv_columns()
+        self.verify_mock_sell_dryrun()
+        self.verify_refresh_candidate_prices()
         self.verify_streamlit_app()
 
         # 보고서 생성

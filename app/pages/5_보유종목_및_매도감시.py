@@ -20,6 +20,7 @@ from trading_service import (
     run_force_sell_once,
     run_market_strength,
     run_sell_all,
+    run_sell_order,
     sync_broker_to_local,
 )
 from mode_badge import render_mode_badge, render_mode_warning
@@ -66,9 +67,9 @@ st.title("보유종목 및 매도감시")
 st.caption("+2% 익절 목표 전략입니다. 수익을 보장하지 않습니다.")
 
 cfg = load_config()
-mode = get_trade_mode(cfg)
-render_mode_badge(mode)
-render_mode_warning(mode)
+config_mode = get_trade_mode(cfg)
+render_mode_badge(config_mode)
+render_mode_warning(config_mode)
 
 st.warning("자동매도는 감시 프로세스가 실행 중일 때만 작동합니다. 앱을 닫거나 감시 루프가 꺼져 있으면 +2%에 도달해도 자동매도되지 않습니다.")
 
@@ -147,29 +148,149 @@ with policy_cols[3]:
         result = run_force_sell_once(mode="mock", sell_policy_id=selected_policy_id, policy_override=True)
         st.json({k: v for k, v in result.items() if k != "rows"})
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 수동매도 — 매도 주문 모드 선택
+# ══════════════════════════════════════════════════════════════════════════════
 st.divider()
 st.subheader("수동매도")
+
+# 매도 모드 선택 (기본값: MOCK)
+st.markdown("#### 매도 주문 모드 선택")
+sell_mode = st.radio(
+    "매도 모드",
+    ["MOCK", "PAPER", "REAL"],
+    index=0,
+    horizontal=True,
+    key="sell_order_mode",
+    captions=[
+        "모의투자 계좌 매도 — openapivts + KIS_MOCK_APP_KEY",
+        "가상 매도 기록만 — API 호출 없음",
+        "실전 계좌 매도 — 실제 자산 변동!",
+    ],
+)
+
+# 모드별 진단 표시
+if sell_mode in ("MOCK", "REAL"):
+    from app.services.env_service import inject_to_os_env as _inj
+    _inj()
+    try:
+        from trade_mode import get_expected_key_fingerprint_for_mode, get_base_url_for_mode
+        _fp = get_expected_key_fingerprint_for_mode(sell_mode)
+        _url = get_base_url_for_mode(sell_mode)
+        _key_env = "KIS_MOCK_APP_KEY" if sell_mode == "MOCK" else "KIS_REAL_APP_KEY"
+        _c1, _c2 = st.columns(2)
+        with _c1:
+            st.caption(f"API URL: `{_url}`")
+            st.caption(f"환경변수: `{_key_env}`")
+        with _c2:
+            st.caption(f"appkey fingerprint: `{_fp}`")
+        if _fp == "MISSING":
+            st.error(f"⛔ {_key_env} 미설정 — {sell_mode} 매도 불가! .env 파일에 키를 등록하세요.")
+        else:
+            st.success(f"{sell_mode} appkey 설정 확인: `{_fp}`")
+    except Exception as _e:
+        st.warning(f"모드 진단 로드 실패: {_e}")
+
+# REAL 선택 시 경고 + 확인 체크박스
+real_sell_confirmed = False
+if sell_mode == "REAL":
+    real_order_warning()
+    real_sell_confirmed = st.checkbox(
+        "실제 계좌에서 실제 매도 주문이 실행됨을 이해했습니다.",
+        key="real_sell_confirm",
+    )
+    if not real_sell_confirmed:
+        st.error("REAL 매도를 진행하려면 위 체크박스를 먼저 선택하세요.")
+
+st.divider()
 
 sell_positions = local_pos if local_pos else broker_pos
 codes = [str(p.get("stock_code", "")).zfill(6) for p in sell_positions if p.get("stock_code")]
 names = {str(p.get("stock_code", "")).zfill(6): p.get("stock_name", "") for p in sell_positions}
+quantities = {str(p.get("stock_code", "")).zfill(6): int(p.get("quantity", 0) or 0) for p in sell_positions}
 
 if codes:
-    sel_code = st.selectbox("종목 선택", codes, format_func=lambda c: f"{c} ({names.get(c, '')})")
-    reason = st.selectbox("매도 사유", ["manual", "take_profit", "stop_loss", "force_exit"])
+    sel_code = st.selectbox(
+        "종목 선택",
+        codes,
+        format_func=lambda c: f"{c} ({names.get(c, '')}) — {quantities.get(c, 0)}주 보유",
+    )
+    reason = st.selectbox("매도 사유", ["manual", "take_profit", "stop_loss", "force_exit", "manual_all"])
+
+    # 선택 종목 단일 매도
+    sell_btn_disabled = (sell_mode == "REAL" and not real_sell_confirmed)
     sell_cols = st.columns(2)
+
     with sell_cols[0]:
-        if st.button("선택 종목 수동매도", use_container_width=True):
-            if mode == "REAL":
-                real_order_warning()
-            result = run_sell_all(sel_code, reason=reason, mode=mode.lower())
-            st.success("매도 주문 완료") if result.get("success") else st.error(result.get("reason", result.get("message", "매도 실패")))
+        if st.button(
+            f"{sell_mode} — 선택 종목 수동매도 (전량)",
+            use_container_width=True,
+            type="primary" if sell_mode == "MOCK" else "secondary",
+            disabled=sell_btn_disabled,
+            key="btn_sell_selected",
+        ):
+            with st.spinner(f"{sell_mode} 매도 주문 실행 중..."):
+                result = run_sell_order(
+                    stock_code=sel_code,
+                    mode=sell_mode.lower(),
+                    reason=reason,
+                    stock_name=names.get(sel_code, ""),
+                )
+
+            _success = result.get("success")
+            if _success:
+                st.success(f"매도 성공: 주문번호 {result.get('order_no', '')}")
+            else:
+                st.error(f"매도 실패: {result.get('rejected_reason') or result.get('reason', '알 수 없음')}")
+
+            # 진단 컬럼 표시
+            _diag_cols = [
+                "requested_mode", "resolved_mode", "base_url", "token_url",
+                "key_type_used", "app_key_mode_valid",
+                "mock_order_called", "real_order_called",
+                "order_no", "rt_cd", "msg", "tr_id",
+                "success", "rejected_reason",
+            ]
+            _diag = {k: result.get(k, "") for k in _diag_cols}
+            st.json(_diag)
             st.json(result)
+
     with sell_cols[1]:
-        if st.button("전량 수동매도", use_container_width=True):
-            if mode == "REAL":
-                real_order_warning()
-            results = [run_sell_all(code, reason="manual_all", mode=mode.lower()) for code in codes]
+        if st.button(
+            f"{sell_mode} — 전량 수동매도 (전체 {len(codes)}종목)",
+            use_container_width=True,
+            disabled=sell_btn_disabled,
+            key="btn_sell_all",
+        ):
+            if sell_mode == "REAL":
+                st.warning("REAL 전체 종목 일괄 매도 — 주의하세요.")
+            with st.spinner(f"{sell_mode} 전체 종목 매도 실행 중 ({len(codes)}종목)..."):
+                results = []
+                for code in codes:
+                    r = run_sell_order(
+                        stock_code=code,
+                        mode=sell_mode.lower(),
+                        reason="manual_all",
+                        stock_name=names.get(code, ""),
+                    )
+                    results.append(r)
+
+            success_n = sum(1 for r in results if r.get("success"))
+            fail_n = len(results) - success_n
+            if success_n > 0:
+                st.success(f"매도 완료: {success_n}개 성공, {fail_n}개 실패")
+            else:
+                st.error(f"모두 실패: {fail_n}개")
+
+            # 결과 표시
+            _diag_cols = [
+                "stock_code", "stock_name", "requested_mode", "resolved_mode",
+                "base_url", "key_type_used", "app_key_mode_valid",
+                "mock_order_called", "real_order_called",
+                "order_no", "rt_cd", "success", "rejected_reason",
+            ]
+            _diag_df = pd.DataFrame([{k: r.get(k, "") for k in _diag_cols} for r in results])
+            st.dataframe(_diag_df, use_container_width=True)
             st.json(results)
 else:
     st.info("수동매도할 보유종목이 없습니다.")

@@ -7,6 +7,7 @@
 주문 함수는 SafetyGate를 통과해야만 실행됩니다.
 """
 
+import os
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -15,7 +16,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-from kis_auth import KISAuth
+from kis_auth import KISAuth, fingerprint_key, validate_final_order_headers
 from price_tick import adjust_price_to_tick, get_tick_size, is_valid_tick_price
 from real_order_utils import (
     ERROR_HASHKEY,
@@ -79,6 +80,7 @@ class KISApiClient:
             "base_url": self._base_url,
             "mode_url_valid": True,
             "resolved_mode": self.gate.mode,
+            "header_appkey_fingerprint": meta.get("appkey_fingerprint", ""),
         })
         return meta
 
@@ -151,7 +153,31 @@ class KISApiClient:
         self.validate_mode_url_consistency()
         headers = self.auth.build_auth_headers(tr_id)
         token_refreshed = False
-        is_real_order_post = self.gate.mode == TRADE_MODE_REAL and path.startswith("/uapi/domestic-stock/v1/trading/order")
+        is_order_post = path.startswith("/uapi/domestic-stock/v1/trading/order")
+        is_real_order_post = self.gate.mode == TRADE_MODE_REAL and is_order_post
+
+        # ── 주문 직전 appkey fingerprint 검증 (MOCK/REAL 모두 차단) ─────────
+        if is_order_post and self.gate.mode in (TRADE_MODE_MOCK, TRADE_MODE_REAL):
+            block_reason = validate_final_order_headers(self.gate.mode, headers)
+            if block_reason:
+                logger.error("ORDER BLOCKED by appkey mismatch: %s", block_reason)
+                return {
+                    "rt_cd": "MODE_KEY_MISMATCH",
+                    "msg1": block_reason,
+                    "rejected_reason": block_reason,
+                    "api_called": False,
+                    "mock_order_called": self.gate.mode == TRADE_MODE_MOCK,
+                    "real_order_called": self.gate.mode == TRADE_MODE_REAL,
+                    "header_appkey_fingerprint": fingerprint_key(headers.get("appkey", "")),
+                    "expected_appkey_fingerprint": (
+                        fingerprint_key(os.getenv("KIS_MOCK_APP_KEY", ""))
+                        if self.gate.mode == TRADE_MODE_MOCK
+                        else fingerprint_key(os.getenv("KIS_REAL_APP_KEY", ""))
+                    ),
+                    "app_key_mode_valid": False,
+                    **self.diagnostic_metadata(),
+                }
+        # ── /주문 직전 검증 끝 ───────────────────────────────────────────────
 
         if is_real_order_post:
             valid, errors = validate_real_order_payload(body)
