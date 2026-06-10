@@ -76,6 +76,11 @@ def main() -> None:
                         help="예산 배분도 실행 (원)")
     parser.add_argument("--force-refresh", action="store_true",
                         help="기존 데이터 파일 무시하고 재수집")
+    parser.add_argument("--no-refresh-prices", action="store_true",
+                        help="Top100 생성 후 현재가 갱신 건너뜀")
+    parser.add_argument("--refresh-mode", default="mock",
+                        choices=["paper", "mock", "real"],
+                        help="현재가 갱신 모드 (기본: mock)")
     args = parser.parse_args()
 
     today = get_today_str("%Y%m%d")
@@ -157,6 +162,26 @@ def main() -> None:
         timeout=120,
     )
 
+    # 6b. 현재가 갱신 (Top100 생성 직후 자동 실행)
+    if not args.no_refresh_prices:
+        top100_path = os.path.join(
+            cfg["paths"]["predictions_dir"], f"top100_{today}.csv"
+        )
+        if os.path.exists(top100_path):
+            print(f"\n[6b/7] 현재가 갱신 — mode={args.refresh_mode.upper()}")
+            results["refresh_prices"] = run_step(
+                "현재가갱신",
+                [python, "src/refresh_candidate_prices.py",
+                 "--mode", args.refresh_mode,
+                 "--top", "100",
+                 "--date", today],
+                timeout=300,
+            )
+        else:
+            print(f"\n[6b/7] 현재가 갱신 건너뜀 — top100 파일 없음: {top100_path}")
+    else:
+        print("\n[6b/7] 현재가 갱신 건너뜀 (--no-refresh-prices)")
+
     # 7. (선택) 예산 배분
     if args.budget:
         print(f"\n[7/7] 예산 배분 ({args.budget:,}원)")
@@ -226,7 +251,8 @@ def run_pipeline(
     all_stocks: bool = False,
     budget=None,
     top_n: int = 100,
-    refresh_prices: bool = False,
+    refresh_prices: bool = True,
+    refresh_prices_mode: str = "mock",
     skip_collect: bool = False,
     skip_train: bool = False,
 ) -> dict:
@@ -330,6 +356,24 @@ def run_pipeline(
         ok, err = _run("Top100생성", [python, "src/select_top_candidates.py", "--top-n", "100", "--all"], timeout=120)
         if os.path.exists(top100_file):
             created_files.append(top100_file)
+
+        # Step 6b: 현재가 갱신 (top100 생성 직후 자동 실행)
+        if refresh_prices and os.path.exists(top100_file):
+            refresh_mode = (refresh_prices_mode or "mock").lower()
+            print(f"\n[6b] 현재가 갱신 — mode={refresh_mode.upper()} top={top_n}")
+            ok_r, err_r = _run(
+                "현재가갱신",
+                [python, "src/refresh_candidate_prices.py",
+                 "--mode", refresh_mode,
+                 "--top", str(top_n),
+                 "--date", today],
+                timeout=300,
+            )
+            if not ok_r:
+                errors.append(f"현재가 갱신 실패 (파이프라인은 계속): {err_r}")
+                print(f"  [WARN] 현재가 갱신 실패 (무시하고 계속): {err_r}")
+            else:
+                print("  [OK] 현재가 갱신 완료")
 
         # (선택) 예산 배분
         if budget:

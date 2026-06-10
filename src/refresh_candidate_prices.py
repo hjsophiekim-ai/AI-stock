@@ -91,7 +91,19 @@ def _make_backup(path: Path) -> Optional[Path]:
 
 def find_candidate_file(date_str: str, top_n: int) -> Optional[Path]:
     path = PREDICTIONS_DIR / f"top{top_n}_{date_str}.csv"
-    return path if path.exists() else None
+    if path.exists():
+        return path
+    # 정확한 파일이 없으면 더 큰 top-N 파일로 fallback (--limit 으로 행 수 제한)
+    for n in (100, 50, 20, 10):
+        if n != top_n:
+            fb = PREDICTIONS_DIR / f"top{n}_{date_str}.csv"
+            if fb.exists():
+                logger.info(
+                    "top%d_%s.csv 없음 → %s fallback (--limit %d 적용됨)",
+                    top_n, date_str, fb.name, top_n,
+                )
+                return fb
+    return None
 
 
 # ── 리포트 저장 ───────────────────────────────────────────────────────────────
