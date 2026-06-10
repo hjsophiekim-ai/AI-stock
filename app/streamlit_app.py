@@ -10,10 +10,15 @@ from datetime import datetime
 from pathlib import Path
 
 # 프로젝트 경로 설정
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
-sys.path.insert(0, str(PROJECT_ROOT / "app" / "services"))
-sys.path.insert(0, str(PROJECT_ROOT / "app" / "components"))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+for _p in (
+    str(PROJECT_ROOT),
+    str(PROJECT_ROOT / "src"),
+    str(PROJECT_ROOT / "app" / "services"),
+    str(PROJECT_ROOT / "app" / "components"),
+):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import streamlit as st
 

@@ -6,10 +6,15 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
-sys.path.insert(0, str(PROJECT_ROOT / "app" / "services"))
-sys.path.insert(0, str(PROJECT_ROOT / "app" / "components"))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+for _p in (
+    str(PROJECT_ROOT),
+    str(PROJECT_ROOT / "src"),
+    str(PROJECT_ROOT / "app" / "services"),
+    str(PROJECT_ROOT / "app" / "components"),
+):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from config_service import load_config, get_trade_mode, get_safety_status
 from trading_service import (
@@ -174,10 +179,11 @@ order_mode = st.radio("주문 모드", ["MOCK", "PAPER", "REAL"], index=0, horiz
 
 # 모드 진단 표시 (필수 6)
 if order_mode in ("MOCK", "REAL"):
-    from app.services.env_service import inject_to_os_env
-    inject_to_os_env()
-    import sys as _sys
-    _sys.path.insert(0, str(PROJECT_ROOT / "src"))
+    try:
+        from app.services.env_service import inject_to_os_env as _inj4
+        _inj4()
+    except Exception as _e4:
+        st.warning(f"env_service import 실패: {_e4}")
     try:
         from trade_mode import get_expected_key_fingerprint_for_mode, get_base_url_for_mode
         _expected_fp = get_expected_key_fingerprint_for_mode(order_mode)

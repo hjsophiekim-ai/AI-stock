@@ -107,13 +107,34 @@ def check_real_keys() -> Dict[str, bool]:
     }
 
 
-def inject_to_os_env() -> None:
-    """현재 .env 값을 os.environ에 주입 (src 모듈이 읽을 수 있도록).
+def inject_to_os_env(env_path: Optional[str] = None) -> Dict[str, object]:
+    """현재 .env 값을 os.environ에 주입하고 키 존재 여부를 반환.
 
     중요: KIS_MOCK_APP_KEY / KIS_MOCK_APP_SECRET / KIS_REAL_APP_KEY / KIS_REAL_APP_SECRET은
     절대 오버라이드하지 않는다. 각 모드별 전용 키가 항상 올바른 값을 유지해야 한다.
-    KIS_USE_MOCK 기반 KIS_APP_KEY 오버라이드는 모드 혼재 버그를 유발하므로 제거됨.
+    전체 키 값은 절대 출력하지 않는다.
     """
+    try:
+        from dotenv import load_dotenv as _load_dotenv
+        target = Path(env_path) if env_path else ENV_PATH
+        _load_dotenv(target, override=False)
+    except Exception:
+        pass
+
     env = load_env()
     for k, v in env.items():
         os.environ.setdefault(k, v)
+
+    check_keys = [
+        "KIS_MOCK_APP_KEY", "KIS_MOCK_APP_SECRET",
+        "KIS_REAL_APP_KEY", "KIS_REAL_APP_SECRET",
+        "KIS_ACCOUNT_NO", "KIS_MOCK_ACCOUNT_NO", "DART_API_KEY",
+    ]
+    return {
+        "loaded": ENV_PATH.exists(),
+        "env_path": str(ENV_PATH),
+        "mock_key": bool(os.environ.get("KIS_MOCK_APP_KEY")),
+        "real_key": bool(os.environ.get("KIS_REAL_APP_KEY")),
+        "dart_key": bool(os.environ.get("DART_API_KEY")),
+        "keys_present": {k: bool(os.environ.get(k)) for k in check_keys},
+    }

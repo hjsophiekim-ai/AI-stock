@@ -6,10 +6,15 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
-sys.path.insert(0, str(PROJECT_ROOT / "app" / "services"))
-sys.path.insert(0, str(PROJECT_ROOT / "app" / "components"))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+for _p in (
+    str(PROJECT_ROOT),
+    str(PROJECT_ROOT / "src"),
+    str(PROJECT_ROOT / "app" / "services"),
+    str(PROJECT_ROOT / "app" / "components"),
+):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from config_service import load_config, get_trade_mode
 from trading_service import (
@@ -171,8 +176,11 @@ sell_mode = st.radio(
 
 # 모드별 진단 표시
 if sell_mode in ("MOCK", "REAL"):
-    from app.services.env_service import inject_to_os_env as _inj
-    _inj()
+    try:
+        from app.services.env_service import inject_to_os_env as _inj5
+        _inj5()
+    except Exception as _e5:
+        st.warning(f"env_service import 실패: {_e5}")
     try:
         from trade_mode import get_expected_key_fingerprint_for_mode, get_base_url_for_mode
         _fp = get_expected_key_fingerprint_for_mode(sell_mode)
