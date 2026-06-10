@@ -104,3 +104,562 @@
 | P1 | 리스크 매니저 | 안전한 주문 관리 |
 | P2 | 스케줄러 | 자동 실행 |
 | P2 | 실전 주문 | live_trade=true 이후 |
+
+---
+
+## 현재가 갱신 및 매도 기능 요구사항 (2026-06-11 추가)
+
+### 배경 및 현재 문제
+
+- AI 후보 파이프라인 실행 시 후보 리스트가 전날 종가(close) 기준으로 생성된다.
+- 파이프라인 실행 직전 KIS 현재가를 조회하여 후보 리스트와 주문 가격에 반영해야 한다.
+- 현재가 갱신 버튼이 앱에서 정상 작동하지 않았고, `refresh_candidate_prices.py`와 앱 경로 연결이 불완전하다.
+- 보유종목 화면의 전량 일괄매도 기능이 정확히 작동하지 않았고, 매도 모드(MOCK/REAL/PAPER)가 명확히 분리되지 않았다.
+
+---
+
+### A. 현재가 갱신 전용 모듈 (`src/refresh_candidate_prices.py`)
+
+#### CLI 인터페이스
+
+```
+python src\refresh_candidate_prices.py --mode mock --date 20260610 --top 100
+python src\refresh_candidate_prices.py --mode real --date 20260610 --top 100
+python src\refresh_candidate_prices.py --mode paper --date 20260610 --top 100
+python src\refresh_candidate_prices.py --mode mock --input reports\predictions\top100_20260610.csv --limit 30
+```
+
+#### 지원 인자
+
+| 인자 | 기본값 | 설명 |
+|------|--------|------|
+| `--mode` | mock | paper / mock / real |
+| `--date` | 오늘 | YYYYMMDD |
+| `--top` | 100 | 처리 종목 수 |
+| `--input` | 자동 탐색 | 후보 CSV 경로 (`reports/predictions/top100_YYYYMMDD.csv`) |
+| `--output` | 원본 업데이트 | 저장 경로 |
+| `--limit` | — | 갱신 개수 |
+| `--sleep` | 0.2 | 요청 간격(초) |
+| `--strict` | False | 일부 실패 시 전체 중단 여부 |
+
+#### mode별 동작
+
+- **mode=mock**
+  - `SafetyGate(runtime_mode="mock")`, `KISApiClient(runtime_mode="mock")`
+  - `base_url` = `https://openapivts.koreainvestment.com:29443`
+  - `token_url` = `https://openapivts.koreainvestment.com:29443/oauth2/tokenP`
+  - `key_type_used` = `MOCK_APP_KEY`
+  - `KIS_MOCK_APP_KEY` / `KIS_MOCK_APP_SECRET` 사용
+
+- **mode=real**
+  - `SafetyGate(runtime_mode="real")`, `KISApiClient(runtime_mode="real")`
+  - **현재가 조회만 수행 — 주문 API 절대 호출 금지**
+  - `base_url` = `https://openapi.koreainvestment.com:9443`
+  - `key_type_used` = `REAL_APP_KEY`
+
+- **mode=paper**
+  - KIS API 호출 금지
+  - `current_price` = 기존값 유지, 없으면 `close` 사용
+  - `price_source` = `PAPER_CLOSE`
+
+#### 컬럼 자동 인식 우선순위
+
+- 종목코드: `stock_code` → `종목코드` → `code` → `ticker`
+- 종목명: `stock_name` → `종목명` → `name`
+- 가격: `current_price` → `close` → `현재가`
+- 종목코드는 반드시 문자열 6자리로 `zfill(6)` 처리
+
+#### 현재가 조회 결과 처리
+
+- `kis_api.get_current_price(code)`가 `None`을 반환해도 전체 중단 금지
+- `None`이면 `price_error="QUOTE_NONE"` 저장, `current_price`는 기존값 또는 `close` fallback
+- `result is not None` 확인 후 필드 접근
+- 일부 종목 실패해도 전체 CSV 저장 계속 진행
+
+#### CSV 추가/갱신 컬럼
+
+| 컬럼 | 설명 |
+|------|------|
+| `current_price` | 갱신된 현재가 |
+| `price_updated_at` | 갱신 시각 |
+| `price_mode` | mock / real / paper |
+| `price_source` | MOCK_API / REAL_API / PAPER_CLOSE / CLOSE_FALLBACK |
+| `price_base_url` | 사용된 base URL |
+| `price_token_url` | 사용된 token URL |
+| `price_key_type_used` | MOCK_APP_KEY / REAL_APP_KEY |
+| `price_error` | 오류 사유 (없으면 빈 문자열) |
+
+#### 백업 파일 처리
+
+```python
+# path.rename() 방식 금지 — .bak 파일 중복 시 실패
+from shutil import copy2
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+backup = path.with_name(f"{path.stem}.bak_{timestamp}{path.suffix}")
+copy2(path, backup)
+# 백업 실패는 warning만 남기고 갱신 계속 진행
+```
+
+#### 리포트 저장
+
+- `reports/refresh_candidate_prices_YYYYMMDD_HHMMSS.json`
+- `reports/refresh_candidate_prices_YYYYMMDD_HHMMSS.txt`
+- 포함 항목: mode, input_path, output_path, updated_count, failed_count, price_error 목록, base_url, token_url, key_type_used, exception, stdout/stderr
+
+---
+
+### B. AI 후보 파이프라인에 현재가 갱신 단계 통합
+
+#### 수정 대상 파일
+
+- `app/pages/3_AI_후보_리스트.py`
+- `src/select_top20.py`
+- `src/select_top_candidates.py`
+- `src/force_trade_selector.py`
+- `app/services/trading_service.py`
+- `src/full_system_verification.py`
+
+#### 수정 후 파이프라인 순서
+
+```
+데이터수집 → 피처생성 → 라벨생성 → 모델학습 → 예측생성 → Top100 생성
+→ 현재가 갱신 (refresh_candidate_prices.py) → 최종 Top100 저장
+```
+
+#### 앱 동작 요구사항
+
+- [ ] "전체 파이프라인 실행" 버튼 클릭 시 Top100 생성 후 즉시 `refresh_candidate_prices.py` 실행
+- [ ] 갱신 모드는 앱의 "갱신 모드" 선택값 사용 (기본값: MOCK)
+- [ ] `current_price`가 채워진 Top100 CSV를 최종 후보 파일로 사용
+- [ ] 화면에 `current_price` 우선 표시, 없거나 0이면 `close` fallback 표시
+
+#### 앱 AI 후보 리스트 화면 UI 추가
+
+- [ ] 갱신 모드 선택 라디오/selectbox (PAPER / MOCK / REAL), 기본값 MOCK
+- [ ] "현재가 갱신" 버튼: `python src\refresh_candidate_prices.py --mode 선택값 --date 오늘 --top 100` 실행
+- [ ] 실패 시 단순 "오류" 표시 금지 — 실행 명령어 / stdout 마지막 2000자 / stderr 마지막 2000자 / exception / 리포트 파일 경로 표시
+
+#### 후보 테이블 표시 우선순위
+
+- 가격: `current_price` 우선 → 없으면 `close`
+- `price_updated_at`, `price_source`, `price_error` 함께 표시
+
+---
+
+### C. 예산배분/주문 미리보기 — `current_price` 기준
+
+#### 수정 대상 파일
+
+- `src/budget_allocator.py`
+- `src/buy_candidate_list.py`
+- `src/strategy_executor.py`
+- `app/pages/4_예산배분_및_주문.py`
+
+#### 규칙
+
+- [ ] 주문 미리보기 / 예산배분 / 주문수량 계산은 `current_price` 최우선 사용
+- [ ] `current_price`가 없거나 0이면 `close` fallback 사용
+- [ ] `order_price`는 `current_price` 기준으로 호가단위 보정
+- [ ] 주문 결과에 `used_price_source` 컬럼 저장:
+  - `CURRENT_PRICE_REFRESHED`
+  - `CURRENT_PRICE_EXISTING`
+  - `CLOSE_FALLBACK`
+
+#### 주문 직전 옵션 추가
+
+- [ ] "주문 전 현재가 재갱신" 체크박스 (기본값: True)
+- [ ] MOCK 주문 시 현재가 재조회 후 `order_price` 재계산
+- [ ] REAL 주문 시 현재가 조회만 하고, 주문은 기존 REAL 안전조건 충족 시에만 실행
+
+---
+
+### D. 매수 체결 후 목표가 재계산 — 실제 체결가/평균단가 기준
+
+#### 수정 대상 파일
+
+- `src/order_manager.py`
+- `src/position_manager.py`
+- `src/sync_broker_positions.py`
+
+#### 매수 주문 성공 후 처리
+
+1. KIS 응답에 체결가가 있으면 `filled_price` 사용
+2. 체결가 없으면 `order_price` 임시 사용
+3. 이후 `sync_broker_positions.py`에서 KIS 계좌 평균단가(`avg_price`)로 재동기화
+4. `target_price = avg_price * 1.02` (호가단위 보정)
+5. `stop_loss_price = avg_price * 0.97` (호가단위 보정)
+
+#### positions.json 저장 필드
+
+| 필드 | 설명 |
+|------|------|
+| `avg_price` | KIS 계좌 평균단가 |
+| `entry_price` | 최초 주문가 |
+| `filled_price` | 실제 체결가 |
+| `current_price` | 현재가 |
+| `target_price` | 목표가 (avg_price × 1.02, 호가단위 보정) |
+| `stop_loss_price` | 손절가 (avg_price × 0.97, 호가단위 보정) |
+| `target_basis` | `BROKER_AVG_PRICE` / `FILLED_PRICE` / `ORDER_PRICE_TEMP` |
+| `target_recalculated_at` | 목표가 재계산 시각 |
+| `take_profit_rate` | 0.02 |
+| `stop_loss_rate` | -0.03 |
+| `status` | `OPEN` |
+| `is_closed` | false |
+
+#### sync_broker_positions.py 실행 시
+
+- [ ] KIS 계좌 실제 평균단가 기준으로 `target_price` 재계산
+- [ ] 기존 `target_price`가 후보 close 기준이면 수정
+- [ ] `broker_synced_at` 저장
+- [ ] `target_basis="BROKER_AVG_PRICE"` 저장
+
+> **중요**: 목표가는 후보 리스트 가격이 아니라 실제 매수 평균단가 기준이어야 한다.
+
+---
+
+### E. 전량 일괄매도 기능
+
+#### 수정 대상 파일
+
+- `app/pages/5_보유종목_및_매도감시.py`
+- `app/services/trading_service.py`
+- `src/order_manager.py`
+- `src/position_manager.py`
+- `src/sync_broker_positions.py`
+- `src/manual_sell_diagnosis.py`
+- `src/force_sell_monitor.py`
+
+#### 앱 UI 추가 요구사항
+
+- [ ] "매도 주문 모드" 선택 UI (PAPER / MOCK / REAL), 기본값 MOCK
+- [ ] REAL 선택 시: 빨간 경고 + "실제 계좌에서 실제 매도 주문이 실행됨을 이해했습니다." 체크박스 필수
+- [ ] 체크 없으면 REAL 매도 버튼 비활성화
+
+#### 앱 버튼 추가
+
+| 버튼 | 기능 |
+|------|------|
+| KIS 계좌 동기화 | 브로커 잔고 새로고침 |
+| 현재가 갱신 | 보유종목 현재가 갱신 |
+| 자동매도 조건 검사 | 목표가/손절가 조건 확인 |
+| 현재가 갱신 후 자동매도 실행 | 갱신 + 자동매도 일괄 |
+| 선택 종목 매도 | 선택 종목만 매도 |
+| 전량 일괄매도 | 전체 보유종목 일괄 매도 |
+
+#### 전량 일괄매도 동작 규칙
+
+- [ ] 선택한 mode 사용
+- [ ] mode=mock: KIS MOCK 계좌 보유종목 조회
+- [ ] mode=real: KIS REAL 계좌 보유종목 조회 + REAL 안전조건 + 체크박스 확인
+- [ ] mode=paper: 로컬 positions.json 기준 가상 매도
+- [ ] KIS 계좌 기준 보유수량 우선 사용
+- [ ] 로컬 수량과 KIS 수량 다를 경우 KIS 계좌 수량 기준 매도
+- [ ] 보유수량 0인 종목: 매도 안 하고 `rejected_reason="NO_BROKER_POSITION_TO_SELL"` 기록
+- [ ] 각 종목별 현재가 조회 후 매도 주문가 산정
+- [ ] 매도 주문은 `OrderManager.sell_order` 공통 함수로만 실행
+- [ ] 일부 실패해도 다음 종목 매도 계속 진행
+
+#### 매도 주문 공통 함수 시그니처
+
+```python
+OrderManager.sell_order(
+    stock_code,
+    quantity,
+    mode,
+    price=None,
+    order_type="limit",
+    reason="MANUAL_SELL_ALL"
+)
+```
+
+#### 매도 공통 실행 경로
+
+```
+selected_mode
+→ SafetyGate(runtime_mode=selected_mode)
+→ OrderManager(runtime_mode=selected_mode)
+→ KISApiClient(runtime_mode=selected_mode)
+→ get_kis_credentials(mode=selected_mode)
+→ get_access_token(mode=selected_mode)
+→ validate_final_order_headers()
+→ place_sell_order()
+```
+
+#### 금지 사항
+
+- `requests.post` 직접 호출 금지
+- `SafetyGate()` runtime_mode 없이 생성 금지
+- `KISApiClient()` runtime_mode 없이 생성 금지
+- `config.yaml`의 `live_trade`로 사용자 선택 mode 덮어쓰기 금지
+- `KIS_APP_KEY` 직접 사용 금지 (`get_kis_credentials` 내부에서만 허용)
+
+---
+
+### F. MOCK/REAL 매도 키 및 URL 검증
+
+#### MOCK 매도 검증 조건
+
+| 항목 | 기대값 |
+|------|--------|
+| `base_url` | `openapivts` 포함 |
+| `token_url` | `openapivts` 포함 |
+| `key_type_used` | `MOCK_APP_KEY` |
+| `headers["appkey"]` | `os.getenv("KIS_MOCK_APP_KEY")` |
+| `tr_id` | `VTTC0801U` |
+| `mock_order_called` | True |
+| `real_order_called` | False |
+
+#### REAL 매도 검증 조건
+
+| 항목 | 기대값 |
+|------|--------|
+| `base_url` | `openapi.koreainvestment.com:9443` 포함 |
+| `token_url` | `openapi.koreainvestment.com:9443` 포함 |
+| `key_type_used` | `REAL_APP_KEY` |
+| `headers["appkey"]` | `os.getenv("KIS_REAL_APP_KEY")` |
+| `tr_id` | `TTTC0801U` |
+| `real_order_called` | True |
+| `mock_order_called` | False |
+
+#### 검증 실패 시 동작
+
+- API 호출 안 함
+- `success=False`, `order_no=""`
+- `rejected_reason`: `MODE_KEY_MISMATCH` 또는 `MODE_URL_MISMATCH`
+- `expected_appkey_fingerprint`, `header_appkey_fingerprint` 기록
+- `app_key_mode_valid=False`, `mode_consistency_valid=False`
+
+---
+
+### G. 매도 결과 저장
+
+#### 저장 파일
+
+- `reports/sell_orders_YYYYMMDD.csv`
+- (필요 시) `reports/orders_YYYYMMDD.csv` append
+
+#### 필수 컬럼
+
+| 컬럼 | 설명 |
+|------|------|
+| `timestamp` | 주문 시각 |
+| `side` | SELL |
+| `stock_code` | 종목코드 |
+| `stock_name` | 종목명 |
+| `quantity` | 매도수량 |
+| `sell_price` | 매도 주문가 |
+| `current_price` | 현재가 |
+| `avg_price` | 평균단가 |
+| `target_price` | 목표가 |
+| `requested_mode` | 요청 모드 |
+| `resolved_mode` | 실제 적용 모드 |
+| `base_url` | 사용된 base URL |
+| `token_url` | 사용된 token URL |
+| `key_type_used` | 키 타입 |
+| `token_cache_file` | 캐시 파일 경로 |
+| `token_source` | 토큰 출처 |
+| `expected_appkey_fingerprint` | 기대 appkey 지문 |
+| `header_appkey_fingerprint` | 실제 header appkey 지문 |
+| `app_key_mode_valid` | 키 모드 일치 여부 |
+| `mode_url_valid` | URL 모드 일치 여부 |
+| `mode_consistency_valid` | 전체 모드 일관성 |
+| `mode_consistency_errors` | 불일치 오류 목록 |
+| `api_called` | API 호출 여부 |
+| `mock_order_called` | MOCK 주문 호출 여부 |
+| `real_order_called` | REAL 주문 호출 여부 |
+| `tr_id` | KIS TR_ID |
+| `ord_dvsn` | 주문구분 코드 |
+| `order_no` | 주문번호 |
+| `rt_cd` | KIS 응답 코드 |
+| `msg` | KIS 응답 메시지 |
+| `raw_msg` | KIS 원본 응답 |
+| `response_text` | 응답 전문 |
+| `success` | 주문 성공 여부 |
+| `rejected_reason` | 거부 사유 |
+| `reason` | 매도 이유 |
+
+#### 앱 화면 표시 항목
+
+- 전체 매도 대상 수 / 성공 매도 수 / 실패 매도 수
+- 실패 사유 요약 / 주문번호 / mode / key_type_used / app_key_mode_valid
+
+---
+
+### H. 매도 성공 시 positions.json 업데이트
+
+#### 매도 성공 조건
+
+- `order_no`가 있고 `success=True`이며 `rt_cd=0` 또는 KIS 성공 응답
+
+#### 전량 매도 성공 시 필드 업데이트
+
+| 필드 | 값 |
+|------|-----|
+| `quantity` | 0 |
+| `is_closed` | true |
+| `status` | `CLOSED` |
+| `exit_price` | sell_price |
+| `exit_time` | now |
+| `exit_reason` | `MANUAL_SELL_ALL` 또는 `TAKE_PROFIT` |
+| `sell_order_no` | order_no |
+
+#### 일부 매도 성공 시
+
+- `quantity` 감소
+- `last_sell_order_no`, `last_sell_time` 저장
+- `status=OPEN` 유지
+
+#### 실패 시
+
+- `status=OPEN` 유지
+- `last_sell_attempt_at`, `last_sell_error` 저장
+
+---
+
+### I. 자동매도 — 동일 OrderManager 공통 경로 사용
+
+#### 수정 대상: `src/force_sell_monitor.py`
+
+#### CLI
+
+```
+python src\force_sell_monitor.py --mode mock --once --refresh-prices
+python src\force_sell_monitor.py --mode mock --watch --interval 10
+python src\force_sell_monitor.py --mode paper --once
+python src\force_sell_monitor.py --mode real --once
+```
+
+#### 자동매도 실행 조건 (모두 충족 시)
+
+- [ ] 매도 판단 직전 현재가 갱신
+- [ ] `current_price >= target_price`
+- [ ] `auto_take_profit_enabled == true`
+- [ ] `manual_only != true`
+- [ ] `status == OPEN`
+- [ ] `quantity > 0`
+
+#### 자동매도 결과 처리
+
+- 성공 시: positions.json CLOSED 처리 + `sell_orders_YYYYMMDD.csv` 기록
+- `OrderManager.sell_order` 공통 함수 사용
+
+---
+
+### J. 수동매도 진단 CLI (`src/manual_sell_diagnosis.py`)
+
+#### CLI
+
+```
+python src\manual_sell_diagnosis.py --mode mock --stock-code 055550 --quantity 1 --dry-run
+python src\manual_sell_diagnosis.py --mode mock --stock-code 055550 --quantity 1 --execute
+python src\manual_sell_diagnosis.py --mode mock --all --dry-run
+python src\manual_sell_diagnosis.py --mode mock --all --execute
+```
+
+#### 기능 요구사항
+
+- [ ] mode 강제 적용
+- [ ] 보유수량 확인
+- [ ] 현재가 조회
+- [ ] 최종 매도 헤더 검증 (`validate_final_order_headers`)
+- [ ] `--dry-run`: 주문 전까지만 검증, 실제 주문 금지
+- [ ] `--execute`: 선택 mode 주문 실행
+- [ ] `--all`: KIS 계좌 또는 positions.json 기준 전체 보유종목 매도
+- [ ] 결과 저장: `reports/manual_sell_diagnosis_YYYYMMDD_HHMMSS.json/txt`
+
+#### MOCK 성공 기준
+
+| 항목 | 기대값 |
+|------|--------|
+| `base_url` | `openapivts` 포함 |
+| `token_url` | `openapivts` 포함 |
+| `key_type_used` | `MOCK_APP_KEY` |
+| `tr_id` | `VTTC0801U` |
+| `app_key_mode_valid` | True |
+| `mock_order_called` | True |
+| `real_order_called` | False |
+| `--execute` 시 | `order_no` 있음, `success=True` |
+
+---
+
+### K. `full_system_verification.py` 보강
+
+#### 추가 검증 항목
+
+- [ ] `refresh_candidate_prices.py` 파일 존재 확인
+- [ ] `refresh_candidate_prices.py --mode paper --top 3` 성공
+- [ ] `refresh_candidate_prices.py --mode mock --top 3` 성공
+- [ ] Top100 CSV에 `current_price` 컬럼 존재 확인
+- [ ] `budget_allocator`가 `current_price` 우선 사용하는지 확인
+- [ ] `sync_broker_positions.py` 실행 시 `target_basis=BROKER_AVG_PRICE` 저장 확인
+- [ ] `manual_sell_diagnosis.py --mode mock --all --dry-run` 성공
+- [ ] `force_sell_monitor.py --mode mock --once --refresh-prices` dry-run 또는 안전 검증 성공
+- [ ] REAL 주문은 절대 실행하지 않음 확인
+
+---
+
+### L. 수정 완료 후 검증 명령어
+
+```powershell
+cd "C:\Users\FURSYS\Desktop\AI stock"
+
+Remove-Item data\mock_token_cache.json -ErrorAction SilentlyContinue
+Remove-Item data\token_cache.json -ErrorAction SilentlyContinue
+Remove-Item data\real_token_cache.json -ErrorAction SilentlyContinue
+
+python src\mode_diagnosis.py --mode mock
+python src\mock_order_diagnosis.py --stock-code 015760 --quantity 1
+
+python src\refresh_candidate_prices.py --mode paper --date 20260610 --top 3
+python src\refresh_candidate_prices.py --mode mock --date 20260610 --top 3
+
+python src\sync_broker_positions.py --mode mock --strategy morning_0930
+
+python src\manual_sell_diagnosis.py --mode mock --all --dry-run
+
+python src\force_sell_monitor.py --mode mock --once --refresh-prices
+
+python src\full_system_verification.py
+```
+
+#### 성공 기준
+
+| 항목 | 기대 결과 |
+|------|-----------|
+| `refresh_candidate_prices.py` | `current_price` 갱신 성공 |
+| AI 후보 CSV | `current_price`, `price_updated_at`, `price_source` 저장 |
+| 후보 리스트 화면 | `current_price` 표시 |
+| 예산배분 | `current_price` 기준 계산 |
+| 매수 후 `target_price` | `avg_price` 기준 계산 |
+| `manual_sell_diagnosis --all --dry-run` | 매도 대상 목록 + 예상 주문 표시 |
+| MOCK 매도 dry-run | `base_url=openapivts`, `key_type_used=MOCK_APP_KEY` |
+| `force_sell_monitor` | 현재가 갱신 후 자동매도 조건 검사 |
+| `full_system_verification.py` | 전체 통과 |
+
+---
+
+### M. Git 반영
+
+```bash
+git status -sb
+git add src app README.md config.yaml
+git commit -m "Implement current-price pipeline refresh and bulk sell execution"
+git push origin HEAD
+```
+
+---
+
+## 요구사항 우선순위 업데이트 (2026-06-11)
+
+| 순위 | 기능 | 설명 |
+|------|------|------|
+| P0 | 현재가 갱신 모듈 | `refresh_candidate_prices.py` MOCK/REAL/PAPER 완전 지원 |
+| P0 | 파이프라인 현재가 통합 | Top100 생성 후 자동 갱신 |
+| P0 | 전량 일괄매도 | MOCK/REAL/PAPER 모드 분리 |
+| P0 | 매도 키/URL 검증 | 모드 불일치 시 주문 차단 |
+| P1 | 예산배분 `current_price` | 주문가 계산 기준 변경 |
+| P1 | 목표가 재계산 | avg_price 기준 target_price |
+| P1 | 매도 결과 저장 | sell_orders CSV 완전 기록 |
+| P1 | 수동매도 진단 CLI | `manual_sell_diagnosis.py` |
+| P2 | 자동매도 공통 경로 | `force_sell_monitor` 통합 |
+| P2 | 검증 시스템 보강 | `full_system_verification.py` |
