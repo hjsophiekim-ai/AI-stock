@@ -373,3 +373,58 @@ def run_market_strength() -> Dict:
         return {"success": True, **get_market_strength()}
     except Exception as e:
         return {"success": False, "message": str(e)}
+
+
+def get_open_sell_orders(mode: str = "mock") -> Dict:
+    """KIS 미체결 매도 주문 조회."""
+    inject_to_os_env()
+    try:
+        from kis_api import KISApiClient
+        from safety_gate import SafetyGate
+        CONFIG_PATH = str(PROJECT_ROOT / "config.yaml")
+        gate = SafetyGate(CONFIG_PATH, runtime_mode=(mode or "mock").lower())
+        api = KISApiClient(CONFIG_PATH, gate=gate)
+        orders = api.get_open_orders(side="SELL")
+        return {
+            "success": True,
+            "count": len(orders),
+            "orders": orders,
+            "mode": gate.mode,
+            "base_url": api._base_url,
+        }
+    except Exception as e:
+        return {"success": False, "message": str(e), "count": 0, "orders": []}
+
+
+def run_bulk_sell_with_amend(
+    mode: str = "mock",
+    check_open_orders: bool = True,
+    amend_unfilled: bool = True,
+    cancel_replace_if_amend_fails: bool = True,
+    max_sell_slippage_pct: float = 1.0,
+    dry_run: bool = False,
+) -> Dict:
+    """미체결 주문 정정 포함 전량 일괄매도."""
+    inject_to_os_env()
+    try:
+        from order_manager import OrderManager
+        from safety_gate import SafetyGate
+        CONFIG_PATH = str(PROJECT_ROOT / "config.yaml")
+        gate = SafetyGate(CONFIG_PATH, runtime_mode=(mode or "mock").lower())
+        mgr = OrderManager(CONFIG_PATH, gate=gate)
+        result = mgr.bulk_sell_with_open_order_check(
+            check_open_orders=check_open_orders,
+            amend_unfilled=amend_unfilled,
+            cancel_replace_if_amend_fails=cancel_replace_if_amend_fails,
+            max_sell_slippage_pct=max_sell_slippage_pct,
+            dry_run=dry_run,
+        )
+        return result
+    except Exception as e:
+        return {
+            "success": False,
+            "message": str(e),
+            "total": 0,
+            "results": [],
+            "requested_mode": (mode or "mock").upper(),
+        }

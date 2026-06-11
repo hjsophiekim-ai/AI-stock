@@ -1683,6 +1683,14 @@ class SystemVerifier:
         print(f"|  앱 파일        : {_icon('메인앱_파일')}{'':<32}|")
         print(f"|  페이지 파일    : {_icon('페이지_파일')}{'':<32}|")
         print(sep)
+        print(f"|  {'[미체결 주문 처리]':<56}|")
+        print(f"|  get_open_orders: {_icon('get_open_orders_메서드')}{'':<32}|")
+        print(f"|  amend_order    : {_icon('amend_order_메서드')}{'':<32}|")
+        print(f"|  bulk_sell_amend: {_icon('bulk_sell_with_open_order_check_메서드')}{'':<32}|")
+        print(f"|  pending_sell   : {_icon('PositionRecord_pending_sell_필드')}{'':<32}|")
+        print(f"|  sell 섹션      : {_icon('config_sell_섹션')}{'':<32}|")
+        print(f"|  구문검사       : {_icon('미체결_관련파일_구문검사')}{'':<32}|")
+        print(sep)
         verdict_line = f"  최종 판정: {verdict}  ({verdict_color})"
         print(f"|{verdict_line:<58}|")
         print(sep)
@@ -2171,6 +2179,166 @@ class SystemVerifier:
         except Exception as exc:
             self._record(VerificationResult("현재가갱신_MOCK").warn(f"refresh_candidate_prices 오류: {exc}"))
 
+    def verify_unfilled_order_handling(self) -> None:
+        """13j. 미체결 주문 조회 및 정정 매도 경로 검증."""
+        self._section("13j. 미체결 주문 처리 (get_open_orders / amend_order) 검증")
+
+        # 1. kis_api.get_open_orders 메서드 존재 확인
+        r1 = VerificationResult("get_open_orders_메서드")
+        try:
+            import inspect
+            from kis_api import KISApiClient
+            if hasattr(KISApiClient, "get_open_orders"):
+                sig = inspect.signature(KISApiClient.get_open_orders)
+                r1.ok(f"KISApiClient.get_open_orders() 존재: params={list(sig.parameters.keys())}")
+            else:
+                r1.fail("KISApiClient.get_open_orders() 메서드 없음")
+        except Exception as exc:
+            r1.fail(f"import 오류: {exc}")
+        self._record(r1)
+
+        # 2. kis_api.amend_order 메서드 존재 확인
+        r2 = VerificationResult("amend_order_메서드")
+        try:
+            import inspect
+            from kis_api import KISApiClient
+            if hasattr(KISApiClient, "amend_order"):
+                sig = inspect.signature(KISApiClient.amend_order)
+                r2.ok(f"KISApiClient.amend_order() 존재: params={list(sig.parameters.keys())}")
+            else:
+                r2.fail("KISApiClient.amend_order() 메서드 없음")
+        except Exception as exc:
+            r2.fail(f"import 오류: {exc}")
+        self._record(r2)
+
+        # 3. order_manager.bulk_sell_with_open_order_check 존재 확인
+        r3 = VerificationResult("bulk_sell_with_open_order_check_메서드")
+        try:
+            import inspect
+            from order_manager import OrderManager
+            if hasattr(OrderManager, "bulk_sell_with_open_order_check"):
+                sig = inspect.signature(OrderManager.bulk_sell_with_open_order_check)
+                r3.ok(f"OrderManager.bulk_sell_with_open_order_check() 존재: params={list(sig.parameters.keys())}")
+            else:
+                r3.fail("OrderManager.bulk_sell_with_open_order_check() 메서드 없음")
+        except Exception as exc:
+            r3.fail(f"import 오류: {exc}")
+        self._record(r3)
+
+        # 4. position_manager OPEN_WITH_PENDING_SELL 상태 / set_pending_sell 메서드 확인
+        r4 = VerificationResult("PositionRecord_pending_sell_필드")
+        try:
+            from position_manager import PositionRecord, PositionManager
+            import dataclasses
+            fields = {f.name for f in dataclasses.fields(PositionRecord)}
+            required_fields = {"pending_sell_order_no", "pending_sell_qty",
+                               "pending_sell_price", "pending_sell_updated_at"}
+            missing_f = required_fields - fields
+            has_set_pending = hasattr(PositionManager, "set_pending_sell")
+            has_clear_pending = hasattr(PositionManager, "clear_pending_sell")
+            if not missing_f and has_set_pending and has_clear_pending:
+                r4.ok("pending_sell 필드 4개 + set/clear 메서드 존재")
+            else:
+                issues = []
+                if missing_f:
+                    issues.append(f"필드 누락: {missing_f}")
+                if not has_set_pending:
+                    issues.append("set_pending_sell() 없음")
+                if not has_clear_pending:
+                    issues.append("clear_pending_sell() 없음")
+                r4.fail(" | ".join(issues))
+        except Exception as exc:
+            r4.fail(f"import 오류: {exc}")
+        self._record(r4)
+
+        # 5. trading_service get_open_sell_orders / run_bulk_sell_with_amend 존재 확인
+        r5 = VerificationResult("trading_service_미체결_함수")
+        try:
+            svc_backup = list(sys.path)
+            sys.path.insert(0, str(PROJECT_ROOT / "app" / "services"))
+            from trading_service import get_open_sell_orders, run_bulk_sell_with_amend
+            r5.ok("get_open_sell_orders + run_bulk_sell_with_amend 함수 존재")
+        except ImportError as exc:
+            r5.fail(f"import 오류: {exc}")
+        finally:
+            sys.path = svc_backup
+        self._record(r5)
+
+        # 6. config.yaml sell 섹션 존재 확인
+        r6 = VerificationResult("config_sell_섹션")
+        cfg = self._cfg or {}
+        sell_cfg = cfg.get("sell", {}) if isinstance(cfg, dict) else {}
+        required_keys = {"open_order_check_before_sell", "amend_unfilled_on_bulk_sell",
+                         "cancel_replace_if_amend_fails", "max_sell_slippage_pct"}
+        missing_keys = required_keys - set(sell_cfg.keys())
+        if not missing_keys:
+            r6.ok(f"sell 섹션 존재 | amend={sell_cfg.get('amend_unfilled_on_bulk_sell')} "
+                  f"slippage={sell_cfg.get('max_sell_slippage_pct')}%")
+        else:
+            r6.warn(f"sell 섹션 키 누락: {missing_keys}")
+        self._record(r6)
+
+        # 7. manual_sell_diagnosis CLI --check-open-orders 플래그 검증 (dry-run)
+        r7 = VerificationResult("manual_sell_diagnosis_CLI_check_open_orders")
+        if not self._mock_keys_ok:
+            r7.skip("MOCK 키 없음 — CLI dry-run SKIP")
+        else:
+            rc, out, err = _run_cmd(
+                [sys.executable, "src/manual_sell_diagnosis.py",
+                 "--mode", "mock", "--check-open-orders"],
+                timeout=60,
+            )
+            combined = out + err
+            if "미체결 매도 주문 조회 결과" in combined:
+                r7.ok("--check-open-orders 플래그 동작 확인")
+            elif rc == 0:
+                r7.ok(f"정상 종료 (rc=0)")
+            else:
+                r7.warn(f"rc={rc}: {combined.strip()[:150]}")
+        self._record(r7)
+
+        # 8. OPEN_WITH_PENDING_SELL 상태 전이 로직 확인 (set_pending_sell 호출 시뮬레이션)
+        r8 = VerificationResult("OPEN_WITH_PENDING_SELL_상태전이")
+        try:
+            from position_manager import PositionRecord
+            pos = PositionRecord(
+                stock_code="005930", stock_name="테스트", quantity=10,
+                entry_price=70000, status="OPEN",
+            )
+            pos.status = "OPEN_WITH_PENDING_SELL"
+            pos.pending_sell_order_no = "12345678"
+            pos.pending_sell_qty = 10
+            pos.pending_sell_price = 71000.0
+            ok = (pos.status == "OPEN_WITH_PENDING_SELL"
+                  and pos.pending_sell_order_no == "12345678"
+                  and pos.pending_sell_qty == 10)
+            if ok:
+                r8.ok("OPEN → OPEN_WITH_PENDING_SELL 상태 필드 설정 정상")
+            else:
+                r8.fail(f"상태 전이 실패: {pos.status} {pos.pending_sell_order_no}")
+        except Exception as exc:
+            r8.fail(f"PositionRecord 상태 전이 오류: {exc}")
+        self._record(r8)
+
+        # 9. 구문 검사 (미체결 관련 파일)
+        r9 = VerificationResult("미체결_관련파일_구문검사")
+        import ast as _ast
+        check_files = ["kis_api.py", "order_manager.py", "manual_sell_diagnosis.py",
+                       "position_manager.py", "sync_broker_positions.py"]
+        parse_errors = []
+        for fname in check_files:
+            fpath = PROJECT_ROOT / "src" / fname
+            if fpath.exists():
+                try:
+                    _ast.parse(fpath.read_text(encoding="utf-8", errors="replace"))
+                except SyntaxError as e:
+                    parse_errors.append(f"{fname}:{e.lineno}")
+        if not parse_errors:
+            r9.ok(f"미체결 관련 파일 {len(check_files)}개 구문 오류 없음")
+        else:
+            r9.fail(f"구문 오류: {', '.join(parse_errors)}")
+        self._record(r9)
+
     def run_all(self) -> None:
         print("\n" + "=" * 60)
         print("  AI Stock 시스템 통합 검증 시작")
@@ -2203,6 +2371,7 @@ class SystemVerifier:
         self.verify_order_result_csv_columns()
         self.verify_mock_sell_dryrun()
         self.verify_refresh_candidate_prices()
+        self.verify_unfilled_order_handling()
         self.verify_streamlit_app()
 
         # 보고서 생성

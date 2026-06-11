@@ -699,6 +699,176 @@ class KISApiClient:
             "session": order_session,
         }
 
+    def get_open_orders(
+        self,
+        side: Optional[str] = None,
+        stock_code: Optional[str] = None,
+    ) -> List[Dict]:
+        """미체결(정정취소가능) 주문 조회.
+
+        KIS 공식 문서 기준 재확인 필요:
+          GET /uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl
+          TR_ID: VTTC8036R (모의) / TTTC8036R (실전)
+
+        Args:
+            side: "SELL" 또는 "BUY" 또는 None(전체)
+            stock_code: 종목코드 필터 (None이면 전체)
+
+        Returns:
+            List[Dict] — stock_code, stock_name, order_no, original_order_no,
+            order_qty, unfilled_qty, order_price, side, order_time, order_status,
+            mode, base_url, key_type_used, raw_response
+        """
+        if not self.gate.is_mock_allowed():
+            logger.warning("PAPER 모드에서는 미체결 조회 API를 호출할 수 없습니다.")
+            return []
+
+        # KIS 공식 문서 확인 필요: VTTC8036R (모의) / TTTC8036R (실전)
+        tr_id = "VTTC8036R" if self._use_mock else "TTTC8036R"
+        params = {
+            "CANO": self._account_no,
+            "ACNT_PRDT_CD": self._product_code,
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+            "INQR_DVSN_1": "0",
+            "INQR_DVSN_2": "0",
+        }
+        try:
+            data = self._get(
+                "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl",
+                tr_id,
+                params,
+            )
+        except Exception as exc:
+            logger.warning("미체결 주문 조회 실패 tr_id=%s: %s", tr_id, exc)
+            return []
+
+        records = []
+        for row in data.get("output", []):
+            # KIS 공식 문서 확인 필요 — 필드명이 버전에 따라 다를 수 있음
+            raw_side_cd = str(row.get("sll_buy_dvsn_cd", ""))
+            if raw_side_cd == "01":
+                row_side = "SELL"
+            elif raw_side_cd == "02":
+                row_side = "BUY"
+            else:
+                row_side = raw_side_cd or "UNKNOWN"
+
+            code = str(row.get("pdno", "") or "").zfill(6) if row.get("pdno") else ""
+            # 미체결수량: psbl_qty (정정취소가능수량) → rmn_qty → nccs_qty 순으로 fallback
+            unfilled_qty = int(
+                row.get("psbl_qty") or row.get("rmn_qty") or row.get("nccs_qty") or 0
+            )
+            order_no = str(row.get("odno", "") or "")
+            orig_order_no = str(row.get("orgn_odno", "") or order_no)
+
+            record = {
+                "stock_code": code,
+                "stock_name": row.get("prdt_name", ""),
+                "order_no": order_no,
+                "original_order_no": orig_order_no if orig_order_no else order_no,
+                "order_qty": int(row.get("ord_qty", 0) or 0),
+                "unfilled_qty": unfilled_qty,
+                "order_price": int(row.get("ord_unpr", 0) or 0),
+                "side": row_side,
+                "order_time": row.get("ord_tmd", ""),
+                "order_status": row.get("ord_stts", ""),
+                "mode": self.gate.mode,
+                "base_url": self._base_url,
+                "key_type_used": getattr(self.auth, "key_type_used", ""),
+                "raw_response": dict(row),
+            }
+
+            if side and record["side"] != side.upper():
+                continue
+            if stock_code and record["stock_code"] != str(stock_code).zfill(6):
+                continue
+            if unfilled_qty <= 0:
+                continue
+
+            records.append(record)
+
+        logger.info(
+            "[미체결조회] tr_id=%s 총=%d건 side=%s stock=%s → 필터후=%d건",
+            tr_id, len(data.get("output", [])), side or "ALL", stock_code or "ALL", len(records),
+        )
+        return records
+
+    def amend_order(
+        self,
+        stock_code: str,
+        original_order_no: str,
+        quantity: int,
+        new_price: int,
+        side: str = "SELL",
+        reason: str = "AMEND_SELL_UNFILLED",
+        qty_all_yn: str = "N",
+    ) -> Dict:
+        """주문 정정.
+
+        KIS 공식 문서 기준 재확인 필요:
+          POST /uapi/domestic-stock/v1/trading/order-rvsecncl
+          TR_ID: VTTC0803U (모의) / TTTC0803U (실전)
+          RVSE_CNCL_DVSN_CD: "01"=정정, "02"=취소
+
+        Args:
+            stock_code: 종목코드
+            original_order_no: 원주문번호
+            quantity: 정정 수량
+            new_price: 정정 단가
+            side: "SELL" or "BUY"
+            reason: 정정 사유 (로그용)
+            qty_all_yn: Y=전량정정, N=일부정정
+        """
+        if not self.gate.is_mock_allowed():
+            raise RuntimeError("PAPER 모드에서는 정정 API를 호출할 수 없습니다.")
+        if self.gate.mode == TRADE_MODE_REAL:
+            self.gate.assert_can_place_real_order()
+
+        # 호가단위 보정
+        tick_cfg = self.cfg.get("order_price", {})
+        if tick_cfg.get("tick_adjust_enabled", True):
+            method = (
+                tick_cfg.get("sell_tick_method", "ceil")
+                if side.upper() == "SELL"
+                else tick_cfg.get("buy_tick_method", "floor")
+            )
+            adjusted_price = adjust_price_to_tick(int(new_price), side=side.lower(), method=method)
+        else:
+            adjusted_price = int(new_price)
+
+        # KIS 공식 문서 확인 필요: VTTC0803U (모의) / TTTC0803U (실전)
+        tr_id = "VTTC0803U" if self._use_mock else "TTTC0803U"
+        body = {
+            "CANO": self._account_no,
+            "ACNT_PRDT_CD": self._product_code,
+            "KRX_FWDG_ORD_ORGNO": "",  # KIS 공식 문서 확인 필요 — 보통 ""
+            "ORGN_ODNO": str(original_order_no),
+            "ORD_DVSN": "00",  # 지정가 (KIS 공식 문서 확인 필요)
+            "RVSE_CNCL_DVSN_CD": "01",  # 정정
+            "ORD_QTY": str(int(quantity)),
+            "ORD_UNPR": str(int(adjusted_price)),
+            "QTY_ALL_ORD_YN": qty_all_yn,
+        }
+        logger.info(
+            "[주문] 정정 | 원주문번호=%s | 종목=%s | 수량=%d | 새가격=%d | TR_ID=%s | 모드=%s",
+            original_order_no, stock_code, quantity, adjusted_price, tr_id, self.gate.mode,
+        )
+        resp = self._post(
+            "/uapi/domestic-stock/v1/trading/order-rvsecncl",
+            tr_id,
+            body,
+        )
+        enriched = dict(resp)
+        enriched["original_order_no"] = original_order_no
+        enriched["new_price"] = adjusted_price
+        enriched["original_price"] = int(new_price)
+        enriched["reason"] = reason
+        enriched["operation_type"] = "AMEND_SELL"
+        enriched["tr_id"] = tr_id
+        enriched.update(self.diagnostic_metadata())
+        return enriched
+
     def get_orderable_cash(self) -> float:
         """주문 가능 현금 조회.
 

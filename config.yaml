@@ -293,3 +293,10 @@ logging:
   trade_log_file: logs/trade.log
   api_log_file: logs/api.log
   error_log_file: logs/error.log
+sell:
+  open_order_check_before_sell: true
+  amend_unfilled_on_bulk_sell: true
+  cancel_replace_if_amend_fails: true
+  aggressive_limit_sell: true
+  max_sell_slippage_pct: 1.0
+  sell_orders_csv_dir: reports/orders

@@ -342,10 +342,81 @@ def _print_result(result: dict) -> None:
     print("=" * 60)
 
 
+def run_open_order_check(
+    mode: str = "mock",
+    config_path: str = "config.yaml",
+) -> Dict[str, Any]:
+    """KIS 미체결 매도 주문 조회 및 출력."""
+    try:
+        tmp_path = _make_mode_config(mode, config_path) if mode == "mock" else config_path
+        gate = SafetyGate(tmp_path, runtime_mode=mode)
+        api = KISApiClient(tmp_path, gate=gate)
+        orders = api.get_open_orders(side="SELL")
+        result = {
+            "run_at": datetime.now().isoformat(),
+            "mode": mode.upper(),
+            "open_sell_order_count": len(orders),
+            "orders": orders,
+            "base_url": api._base_url,
+        }
+        if tmp_path != config_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        return result
+    except Exception as exc:
+        return {
+            "run_at": datetime.now().isoformat(),
+            "mode": mode.upper(),
+            "open_sell_order_count": 0,
+            "orders": [],
+            "error": str(exc),
+        }
+
+
+def run_amend_unfilled_sell(
+    mode: str = "mock",
+    dry_run: bool = True,
+    cancel_replace_if_amend_fails: bool = True,
+    config_path: str = "config.yaml",
+    stock_code: str = None,
+) -> Dict[str, Any]:
+    """미체결 매도 주문 정정 (단일 종목 또는 전체)."""
+    try:
+        from order_manager import OrderManager
+        tmp_path = _make_mode_config(mode, config_path) if mode == "mock" else config_path
+        gate = SafetyGate(tmp_path, runtime_mode=mode)
+        mgr = OrderManager(tmp_path, gate=gate)
+        result = mgr.bulk_sell_with_open_order_check(
+            check_open_orders=True,
+            amend_unfilled=True,
+            cancel_replace_if_amend_fails=cancel_replace_if_amend_fails,
+            dry_run=dry_run,
+        )
+        if tmp_path != config_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        return result
+    except Exception as exc:
+        return {
+            "run_at": datetime.now().isoformat(),
+            "mode": mode.upper(),
+            "success": False,
+            "error": str(exc),
+            "results": [],
+        }
+
+
 def run_all_manual_sell_diagnosis(
     mode: str = "mock",
     dry_run: bool = True,
     config_path: str = "config.yaml",
+    check_open_orders: bool = False,
+    amend_unfilled: bool = False,
+    cancel_replace_if_amend_fails: bool = True,
 ) -> Dict[str, Any]:
     """positions.json + KIS 계좌 기준 전체 보유종목 일괄 진단."""
     from position_manager import PositionManager
@@ -455,16 +526,73 @@ def main() -> None:
     parser.add_argument("--quantity", type=int, default=None, help="매도 수량 (없으면 포지션 전량)")
     parser.add_argument("--dry-run", action="store_true", default=True, help="주문 직전까지만 검증 (기본)")
     parser.add_argument("--execute", action="store_true", help="실제 매도 주문 실행")
+    parser.add_argument("--check-open-orders", dest="check_open_orders", action="store_true",
+                        help="미체결 매도 주문 조회 (dry-run에서도 출력)")
+    parser.add_argument("--amend-unfilled", dest="amend_unfilled", action="store_true",
+                        help="미체결 주문 정정 후 신규매도 (--execute 필요)")
+    parser.add_argument("--cancel-replace-if-amend-fails", dest="cancel_replace_if_amend_fails",
+                        action="store_true", default=True,
+                        help="정정 실패 시 취소 후 재매도 (기본 활성)")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--json", action="store_true", help="JSON 출력")
     args = parser.parse_args()
 
-    if not args.stock_code and not args.all:
-        parser.error("--stock-code 또는 --all 중 하나를 지정해야 합니다.")
+    if not args.stock_code and not args.all and not args.check_open_orders:
+        parser.error("--stock-code, --all, 또는 --check-open-orders 중 하나를 지정해야 합니다.")
 
     dry = not args.execute
 
+    # 미체결 주문 조회 전용 실행
+    if args.check_open_orders and not args.all and not args.stock_code:
+        result = run_open_order_check(mode=args.mode, config_path=args.config)
+        orders = result.get("orders", [])
+        print(f"\n미체결 매도 주문 조회 결과: {len(orders)}건  mode={args.mode.upper()}")
+        print("-" * 60)
+        for o in orders:
+            print(f"  [{o.get('stock_code')}] {o.get('stock_name')} 원주문={o.get('original_order_no')} "
+                  f"미체결={o.get('unfilled_qty')}주 @ {o.get('order_price')}원 시각={o.get('order_time')}")
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return
+
+    # 미체결 정정 포함 전량 매도 (--all --amend-unfilled)
+    if args.all and args.amend_unfilled:
+        print(f"\n미체결 정정 포함 전량 일괄{'DRY-RUN' if dry else '매도'}: mode={args.mode.upper()}")
+        print("-" * 60)
+
+        if args.check_open_orders:
+            oo = run_open_order_check(mode=args.mode, config_path=args.config)
+            print(f"  미체결 매도 주문: {oo.get('open_sell_order_count', 0)}건")
+            for o in oo.get("orders", []):
+                print(f"    [{o.get('stock_code')}] {o.get('stock_name')} 미체결={o.get('unfilled_qty')}주")
+
+        result = run_amend_unfilled_sell(
+            mode=args.mode,
+            dry_run=dry,
+            cancel_replace_if_amend_fails=args.cancel_replace_if_amend_fails,
+            config_path=args.config,
+        )
+        print(f"  완료: 총 {result.get('total', 0)}건 | "
+              f"성공 {result.get('success_count', 0)} | 실패 {result.get('fail_count', 0)} | "
+              f"정정 {result.get('amend_count', 0)} | 신규매도 {result.get('new_sell_count', 0)}")
+        for r in result.get("results", []):
+            op = r.get("operation_type", "")
+            ok = "OK" if r.get("success") else "FAIL"
+            print(f"    [{r.get('stock_code')}] {r.get('stock_name')} {op} → {ok} "
+                  f"new_price={r.get('new_price', '')} order_no={r.get('new_order_no', r.get('order_no', ''))}")
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        if result.get("fail_count", 0) > 0 and not dry:
+            sys.exit(1)
+        return
+
     if args.all:
+        if args.check_open_orders:
+            print("\n[미체결 주문 사전 조회]")
+            oo = run_open_order_check(mode=args.mode, config_path=args.config)
+            print(f"  미체결 매도 주문: {oo.get('open_sell_order_count', 0)}건")
+            for o in oo.get("orders", []):
+                print(f"    [{o.get('stock_code')}] {o.get('stock_name')} 미체결={o.get('unfilled_qty')}주 @ {o.get('order_price')}원")
         result = run_all_manual_sell_diagnosis(
             mode=args.mode,
             dry_run=dry,
@@ -484,6 +612,20 @@ def main() -> None:
         dry_run=dry,
         config_path=args.config,
     )
+
+    if args.amend_unfilled and args.stock_code and not dry:
+        # 단일 종목 정정
+        oo = run_open_order_check(mode=args.mode, config_path=args.config)
+        code = str(args.stock_code).zfill(6)
+        for o in oo.get("orders", []):
+            if o.get("stock_code") == code:
+                print(f"  미체결 주문 발견: 원주문={o.get('original_order_no')} 미체결={o.get('unfilled_qty')}주")
+                amend_r = run_amend_unfilled_sell(
+                    mode=args.mode, dry_run=False, config_path=args.config,
+                    cancel_replace_if_amend_fails=args.cancel_replace_if_amend_fails,
+                )
+                if args.json:
+                    print(json.dumps(amend_r, ensure_ascii=False, indent=2, default=str))
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))

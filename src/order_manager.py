@@ -460,6 +460,364 @@ class OrderManager:
         self._failed_tickers.clear()
 
     # ------------------------------------------------------------------
+    # 미체결 정정 포함 전량 일괄매도
+    # ------------------------------------------------------------------
+
+    def _get_amend_sell_price(
+        self,
+        stock_code: str,
+        fallback_price: int = 0,
+        max_slippage_pct: float = 1.0,
+    ) -> int:
+        """매도 정정가 산정.
+
+        우선순위: 최우선매수호가(bid_price) → 현재가 → fallback_price
+        max_slippage_pct 초과 하락이면 fallback_price로 안전처리.
+        """
+        if self._api is None:
+            return fallback_price
+        try:
+            price_info = self._api.get_current_price(stock_code)
+            cur = int(price_info.get("current_price", 0) or 0)
+            # 최우선매수호가는 현재가 조회 응답에 없으면 cur 사용
+            bid = int(price_info.get("bid_price", 0) or cur)
+            base = bid if bid > 0 else cur
+            if base <= 0:
+                return fallback_price
+            # 최대 허용 하락률 체크
+            if fallback_price > 0:
+                min_allowed = int(fallback_price * (1 - max_slippage_pct / 100))
+                if base < min_allowed:
+                    logger.warning(
+                        "[정정가 안전처리] %s 산정가=%d < 허용최저=%d → fallback=%d",
+                        stock_code, base, min_allowed, fallback_price,
+                    )
+                    base = fallback_price
+            tick_cfg = self.cfg.get("order_price", {})
+            if tick_cfg.get("tick_adjust_enabled", True):
+                method = tick_cfg.get("sell_tick_method", "ceil")
+                base = adjust_price_to_tick(base, side="sell", method=method)
+            return base
+        except Exception as exc:
+            logger.warning("정정가 조회 실패 %s: %s → fallback=%d", stock_code, exc, fallback_price)
+            return fallback_price
+
+    def _save_sell_order_csv(self, results: List[Dict]) -> str:
+        """sell_orders_YYYYMMDD.csv에 매도/정정/취소 결과 저장."""
+        if not results:
+            return ""
+        today = get_today_str("%Y%m%d")
+        sell_dir = self.cfg.get("paths", {}).get("orders_dir", "reports/orders")
+        ensure_dir(sell_dir)
+        output_path = os.path.join(sell_dir, f"sell_orders_{today}.csv")
+        cols = [
+            "timestamp", "operation_type", "stock_code", "stock_name",
+            "quantity", "unfilled_qty", "original_order_no", "new_order_no", "order_no",
+            "old_price", "new_price", "current_price", "bid_price",
+            "requested_mode", "resolved_mode", "base_url", "token_url",
+            "key_type_used", "app_key_mode_valid", "mock_order_called", "real_order_called",
+            "tr_id", "ord_dvsn", "rt_cd", "msg", "success", "rejected_reason", "reason",
+        ]
+        rows = []
+        now_str = datetime.now().isoformat()
+        for r in results:
+            row = {col: r.get(col, "") for col in cols}
+            if not row.get("timestamp"):
+                row["timestamp"] = now_str
+            rows.append(row)
+        df = pd.DataFrame(rows, columns=cols)
+        if os.path.exists(output_path):
+            existing = pd.read_csv(output_path)
+            df = pd.concat([existing, df], ignore_index=True)
+        save_csv(df, output_path)
+        return output_path
+
+    def _cancel_and_replace_sell(
+        self,
+        stock_code: str,
+        stock_name: str,
+        original_order_no: str,
+        quantity: int,
+        new_price: int,
+        base_result: Dict,
+    ) -> Dict:
+        """정정 실패 시 취소 후 재매도 (cancel + new sell)."""
+        r = dict(base_result)
+        r["operation_type"] = "CANCEL_REPLACE_SELL"
+        try:
+            cancel_resp = self._api.cancel_order(original_order_no, stock_code, quantity)
+            cancel_ok = cancel_resp.get("rt_cd", "") == "0"
+            r["cancel_rt_cd"] = cancel_resp.get("rt_cd", "")
+            r["cancel_msg"] = cancel_resp.get("msg1", "")
+            if cancel_ok:
+                # Place new sell order after cancel
+                order_session = self.calendar.get_market_session()
+                resp2 = self._api.place_cash_sell_order(stock_code, quantity, new_price, "limit", order_session)
+                new_order_no = resp2.get("output", {}).get("ODNO", "")
+                rt_cd2 = resp2.get("rt_cd", "")
+                r["rt_cd"] = rt_cd2
+                r["msg"] = resp2.get("msg1", resp2.get("raw_msg", ""))
+                r["new_order_no"] = new_order_no
+                r["success"] = rt_cd2 == "0" and bool(new_order_no)
+                if r["success"]:
+                    self.pos_mgr.set_pending_sell(stock_code, new_order_no, quantity, new_price, "CANCEL_REPLACE_SELL")
+                    logger.info("[CANCEL_REPLACE_SELL] %s 취소 후 재주문 성공 주문번호=%s", stock_code, new_order_no)
+            else:
+                r["success"] = False
+                r["reason"] = f"취소 실패: {cancel_resp.get('msg1', '')}"
+        except Exception as exc:
+            r["success"] = False
+            r["reason"] = f"취소+재주문 오류: {exc}"
+        return r
+
+    def bulk_sell_with_open_order_check(
+        self,
+        check_open_orders: bool = True,
+        amend_unfilled: bool = True,
+        cancel_replace_if_amend_fails: bool = True,
+        max_sell_slippage_pct: float = 1.0,
+        dry_run: bool = False,
+    ) -> Dict:
+        """전량 일괄매도 (미체결 주문 정정/취소 후 재주문 포함).
+
+        흐름:
+          1. KIS 계좌 보유종목 조회
+          2. KIS 미체결 매도 주문 조회 (check_open_orders=True)
+          3. 종목별:
+             A. 미체결 매도 주문 있음 + amend_unfilled=True → 정정주문
+             B. 미체결 없거나 수량 차이 있는 경우 → 신규 매도
+             C. 보유수량 0 → skip
+          4. sell_orders CSV 저장
+
+        중복 매도 방지:
+          신규 매도수량 = broker 보유수량 - 기존 미체결 매도수량
+          0 이하이면 신규 매도 주문하지 않음.
+
+        IMPORTANT:
+          주문 접수 성공만으로 CLOSED 처리하지 않음 → OPEN_WITH_PENDING_SELL
+          KIS 계좌 동기화(sync_broker_positions --apply --close-missing) 결과로 CLOSED.
+        """
+        mode = self.gate.mode
+        now = datetime.now()
+        results = []
+
+        # PAPER 모드: 가상 매도
+        if mode == TRADE_MODE_PAPER:
+            open_positions = self.pos_mgr.get_open_positions()
+            for code, pos in open_positions.items():
+                r = self._execute_sell(code, pos.stock_name, pos.quantity, int(pos.entry_price), "manual_all")
+                r["operation_type"] = "NEW_SELL"
+                r["timestamp"] = now.isoformat()
+                results.append(r)
+                self.record_order_log(r)
+            self._save_sell_order_csv(results)
+            return {
+                "success": True, "total": len(results), "success_count": len(results),
+                "fail_count": 0, "amend_count": 0, "new_sell_count": len(results),
+                "cancel_replace_count": 0, "skip_count": 0,
+                "results": results, "mode": mode, "dry_run": dry_run,
+            }
+
+        if self._api is None:
+            return {"success": False, "reason": "API 클라이언트 없음", "results": [], "mode": mode}
+
+        # Step 1: KIS 계좌 보유종목 조회
+        try:
+            broker_df = self._api.get_positions()
+        except Exception as exc:
+            return {"success": False, "reason": f"계좌 조회 실패: {exc}", "results": [], "mode": mode}
+
+        if broker_df is None or broker_df.empty:
+            return {
+                "success": True, "total": 0, "success_count": 0, "fail_count": 0,
+                "amend_count": 0, "new_sell_count": 0, "cancel_replace_count": 0, "skip_count": 0,
+                "message": "KIS 계좌 보유종목 없음", "results": [], "mode": mode, "dry_run": dry_run,
+            }
+
+        # Step 2: KIS 미체결 매도 주문 조회
+        open_sell_map: Dict[str, List[Dict]] = {}  # code → list of pending orders
+        if check_open_orders:
+            try:
+                pending_list = self._api.get_open_orders(side="SELL")
+                for order in pending_list:
+                    code = order["stock_code"]
+                    if code not in open_sell_map:
+                        open_sell_map[code] = []
+                    open_sell_map[code].append(order)
+            except Exception as exc:
+                logger.warning("미체결 주문 조회 실패 (무시): %s", exc)
+
+        order_session = self.calendar.get_market_session()
+        diag_meta = self._api.diagnostic_metadata()
+
+        # Step 3: 종목별 처리
+        for _, row in broker_df.iterrows():
+            code = str(row.get("stock_code", "")).zfill(6)
+            broker_qty = int(row.get("quantity", 0) or 0)
+            stock_name = str(row.get("stock_name", code))
+            avg_price = int(row.get("avg_price", 0) or 0)
+
+            base_record = {
+                "timestamp": now.isoformat(),
+                "stock_code": code,
+                "stock_name": stock_name,
+                "quantity": broker_qty,
+                "requested_mode": (self.gate._runtime_mode or "").lower() or mode.lower(),
+                "resolved_mode": mode,
+                "mock_order_called": mode == TRADE_MODE_MOCK,
+                "real_order_called": mode == TRADE_MODE_REAL,
+                **diag_meta,
+            }
+
+            if broker_qty <= 0:
+                r = {**base_record, "operation_type": "SKIP", "reason": "NO_POSITION_AND_NO_OPEN_ORDER",
+                     "unfilled_qty": 0, "success": True}
+                results.append(r)
+                continue
+
+            pending_orders = open_sell_map.get(code, [])
+            total_pending_qty = sum(o.get("unfilled_qty", 0) for o in pending_orders)
+
+            if pending_orders and amend_unfilled:
+                # Case A: 미체결 매도 주문 있음 → 정정
+                for order in pending_orders:
+                    orig_no = order.get("original_order_no") or order.get("order_no", "")
+                    unfilled_qty = int(order.get("unfilled_qty", 0) or 0)
+                    old_price = int(order.get("order_price", 0) or 0)
+                    if unfilled_qty <= 0:
+                        continue
+                    new_price = self._get_amend_sell_price(code, old_price, max_sell_slippage_pct)
+
+                    r = {
+                        **base_record,
+                        "operation_type": "AMEND_SELL",
+                        "original_order_no": orig_no,
+                        "order_no": order.get("order_no", ""),
+                        "new_order_no": "",
+                        "quantity": unfilled_qty,
+                        "unfilled_qty": unfilled_qty,
+                        "old_price": old_price,
+                        "new_price": new_price,
+                        "success": False,
+                    }
+
+                    if dry_run:
+                        r["success"] = True
+                        r["dry_run"] = True
+                        r["reason"] = "DRY_RUN_AMEND"
+                    else:
+                        try:
+                            resp = self._api.amend_order(
+                                stock_code=code,
+                                original_order_no=orig_no,
+                                quantity=unfilled_qty,
+                                new_price=new_price,
+                                side="SELL",
+                                reason="AMEND_SELL_UNFILLED",
+                            )
+                            rt_cd = resp.get("rt_cd", "")
+                            new_order_no = resp.get("output", {}).get("ODNO", resp.get("ODNO", ""))
+                            r["rt_cd"] = rt_cd
+                            r["msg"] = resp.get("msg1", resp.get("raw_msg", ""))
+                            r["tr_id"] = resp.get("tr_id", "")
+                            r["new_order_no"] = new_order_no
+                            r["success"] = rt_cd == "0"
+                            if r["success"]:
+                                self.pos_mgr.set_pending_sell(code, new_order_no or orig_no, unfilled_qty, new_price, "AMEND_SELL")
+                                logger.info("[AMEND_SELL] %s(%s) 원주문=%s → 정정가=%d 정정번호=%s", code, stock_name, orig_no, new_price, new_order_no)
+                            elif cancel_replace_if_amend_fails:
+                                r = self._cancel_and_replace_sell(code, stock_name, orig_no, unfilled_qty, new_price, r)
+                        except Exception as exc:
+                            r["success"] = False
+                            r["reason"] = f"정정 오류: {exc}"
+                            if cancel_replace_if_amend_fails:
+                                r = self._cancel_and_replace_sell(code, stock_name, orig_no, unfilled_qty, new_price, r)
+
+                    results.append(r)
+
+                # 미체결 수량 초과분(broker 보유 > 미체결 주문) → 신규 매도
+                net_remaining = broker_qty - total_pending_qty
+                if net_remaining > 0:
+                    new_price = self._get_amend_sell_price(code, avg_price, max_sell_slippage_pct)
+                    r2 = {**base_record, "operation_type": "NEW_SELL", "quantity": net_remaining,
+                          "unfilled_qty": 0, "new_price": new_price, "old_price": 0, "success": False}
+                    if dry_run:
+                        r2["success"] = True
+                        r2["reason"] = "DRY_RUN_REMAINDER"
+                    else:
+                        try:
+                            resp2 = self._api.place_cash_sell_order(code, net_remaining, new_price, "limit", order_session)
+                            new_order_no2 = resp2.get("output", {}).get("ODNO", "")
+                            rt_cd2 = resp2.get("rt_cd", "")
+                            r2["rt_cd"] = rt_cd2
+                            r2["msg"] = resp2.get("msg1", resp2.get("raw_msg", ""))
+                            r2["tr_id"] = resp2.get("tr_id", "")
+                            r2["new_order_no"] = new_order_no2
+                            r2["order_no"] = new_order_no2
+                            r2["success"] = rt_cd2 == "0" and bool(new_order_no2)
+                            if r2["success"]:
+                                self.pos_mgr.set_pending_sell(code, new_order_no2, net_remaining, new_price, "NEW_SELL")
+                        except Exception as exc:
+                            r2["reason"] = f"신규매도 오류: {exc}"
+                    results.append(r2)
+
+            else:
+                # Case B: 미체결 없거나 amend_unfilled=False → 신규 매도
+                net_qty = broker_qty - total_pending_qty
+                if net_qty <= 0:
+                    r = {**base_record, "operation_type": "SKIP",
+                         "reason": "ALL_QTY_IN_PENDING_ORDERS",
+                         "unfilled_qty": total_pending_qty, "success": True}
+                    results.append(r)
+                    continue
+
+                new_price = self._get_amend_sell_price(code, avg_price, max_sell_slippage_pct)
+                r = {**base_record, "operation_type": "NEW_SELL", "quantity": net_qty,
+                     "unfilled_qty": 0, "new_price": new_price, "old_price": 0, "success": False}
+
+                if dry_run:
+                    r["success"] = True
+                    r["reason"] = "DRY_RUN_NEW_SELL"
+                else:
+                    try:
+                        resp = self._api.place_cash_sell_order(code, net_qty, new_price, "limit", order_session)
+                        new_order_no = resp.get("output", {}).get("ODNO", "")
+                        rt_cd = resp.get("rt_cd", "")
+                        r["rt_cd"] = rt_cd
+                        r["msg"] = resp.get("msg1", resp.get("raw_msg", ""))
+                        r["tr_id"] = resp.get("tr_id", "")
+                        r["new_order_no"] = new_order_no
+                        r["order_no"] = new_order_no
+                        r["success"] = rt_cd == "0" and bool(new_order_no)
+                        if r["success"]:
+                            self.pos_mgr.set_pending_sell(code, new_order_no, net_qty, new_price, "NEW_SELL")
+                            logger.info("[NEW_SELL] %s(%s) %d주 @ %d원 주문번호=%s", code, stock_name, net_qty, new_price, new_order_no)
+                    except Exception as exc:
+                        r["reason"] = f"신규매도 오류: {exc}"
+
+                results.append(r)
+                self.record_order_log(r)
+
+        self._save_sell_order_csv(results)
+
+        success_n = sum(1 for r in results if r.get("success"))
+        fail_n = len(results) - success_n
+        return {
+            "success": fail_n == 0,
+            "total": len(results),
+            "success_count": success_n,
+            "fail_count": fail_n,
+            "amend_count": sum(1 for r in results if r.get("operation_type") == "AMEND_SELL"),
+            "new_sell_count": sum(1 for r in results if r.get("operation_type") == "NEW_SELL"),
+            "cancel_replace_count": sum(1 for r in results if r.get("operation_type") == "CANCEL_REPLACE_SELL"),
+            "skip_count": sum(1 for r in results if r.get("operation_type") == "SKIP"),
+            "results": results,
+            "mode": mode,
+            "dry_run": dry_run,
+            "open_orders_checked": check_open_orders,
+        }
+
+    # ------------------------------------------------------------------
     # 검증 포함 주문 실행 (force_trade 등에서 사용)
     # ------------------------------------------------------------------
 

@@ -34,6 +34,10 @@ class PositionRecord:
     exit_reason: Optional[str] = None
     order_no: str = ""
     filled_quantity: int = 0
+    pending_sell_order_no: str = ""
+    pending_sell_qty: int = 0
+    pending_sell_price: float = 0.0
+    pending_sell_updated_at: str = ""
     filled_price: float = 0.0
     force_trade_mode: bool = False
     forced_exit_time_str: str = "09:30"
@@ -322,3 +326,44 @@ class PositionManager:
             del self._positions[code]
             return True
         return False
+
+    def set_pending_sell(
+        self,
+        stock_code: str,
+        order_no: str,
+        quantity: int,
+        price: float,
+        operation_type: str = "NEW_SELL",
+    ) -> Optional["PositionRecord"]:
+        """매도 주문 접수 후 OPEN_WITH_PENDING_SELL 상태로 전환.
+
+        KIS에서 체결 확인 전까지 CLOSED 처리하지 않는다.
+        sync_broker_positions 실행 후 보유수량=0이면 CLOSED 처리.
+        """
+        code = str(stock_code).zfill(6)
+        pos = self._positions.get(code)
+        if pos is None:
+            return None
+        pos.pending_sell_order_no = order_no
+        pos.pending_sell_qty = int(quantity)
+        pos.pending_sell_price = float(price)
+        pos.pending_sell_updated_at = datetime.now().isoformat()
+        if pos.status in ("OPEN", "OPEN_WITH_PENDING_SELL"):
+            pos.status = "OPEN_WITH_PENDING_SELL"
+        self.save_local_positions()
+        return pos
+
+    def clear_pending_sell(self, stock_code: str) -> Optional["PositionRecord"]:
+        """미체결 매도 주문 정보 초기화 (취소되거나 체결 완료 후 호출)."""
+        code = str(stock_code).zfill(6)
+        pos = self._positions.get(code)
+        if pos is None:
+            return None
+        pos.pending_sell_order_no = ""
+        pos.pending_sell_qty = 0
+        pos.pending_sell_price = 0.0
+        pos.pending_sell_updated_at = ""
+        if pos.status == "OPEN_WITH_PENDING_SELL":
+            pos.status = "OPEN"
+        self.save_local_positions()
+        return pos

@@ -19,8 +19,10 @@ for _p in (
 from config_service import load_config, get_trade_mode
 from trading_service import (
     get_broker_positions,
+    get_open_sell_orders,
     get_positions_with_current_price,
     list_sell_policies,
+    run_bulk_sell_with_amend,
     run_force_exit,
     run_force_sell_once,
     run_market_strength,
@@ -30,6 +32,41 @@ from trading_service import (
 )
 from mode_badge import render_mode_badge, render_mode_warning
 from warning_box import no_profit_guarantee_notice, real_order_warning
+
+
+def _show_bulk_result(result: dict, is_dry_run: bool = False) -> None:
+    """전량 일괄매도 결과 표시 헬퍼."""
+    prefix = "[DRY-RUN] " if is_dry_run else ""
+    success_n = result.get("success_count", 0)
+    fail_n = result.get("fail_count", 0)
+    amend_n = result.get("amend_count", 0)
+    new_n = result.get("new_sell_count", 0)
+    cancel_n = result.get("cancel_replace_count", 0)
+    skip_n = result.get("skip_count", 0)
+
+    if result.get("success") or is_dry_run:
+        st.success(
+            f"{prefix}완료: 성공 {success_n}건 | "
+            f"정정(AMEND) {amend_n}건 | 신규매도 {new_n}건 | "
+            f"취소후재주문 {cancel_n}건 | 스킵 {skip_n}건 | 실패 {fail_n}건"
+        )
+    else:
+        st.error(f"{prefix}실패 {fail_n}건 / 전체 {result.get('total', 0)}건")
+
+    rows = result.get("results", [])
+    if rows:
+        _cols = [
+            "stock_code", "stock_name", "operation_type",
+            "quantity", "unfilled_qty", "old_price", "new_price",
+            "original_order_no", "new_order_no",
+            "mock_order_called", "real_order_called",
+            "rt_cd", "msg", "success", "reason",
+        ]
+        _df = pd.DataFrame([{k: r.get(k, "") for k in _cols} for r in rows])
+        st.dataframe(_df, use_container_width=True)
+
+        if st.checkbox("원본 JSON 보기", key=f"bulk_json_{is_dry_run}"):
+            st.json(rows)
 
 
 def _position_rows(positions: list[dict]) -> list[dict]:
@@ -280,43 +317,95 @@ if codes:
             st.json(result)
 
     with sell_cols[1]:
-        if st.button(
-            f"{sell_mode} — 전량 수동매도 (전체 {len(codes)}종목)",
-            use_container_width=True,
-            disabled=sell_btn_disabled,
-            key="btn_sell_all",
-        ):
-            if sell_mode == "REAL":
-                st.warning("REAL 전체 종목 일괄 매도 — 주의하세요.")
-            with st.spinner(f"{sell_mode} 전체 종목 매도 실행 중 ({len(codes)}종목)..."):
-                results = []
-                for code in codes:
-                    r = run_sell_order(
-                        stock_code=code,
-                        mode=sell_mode.lower(),
-                        reason="manual_all",
-                        stock_name=names.get(code, ""),
-                    )
-                    results.append(r)
-
-            success_n = sum(1 for r in results if r.get("success"))
-            fail_n = len(results) - success_n
-            if success_n > 0:
-                st.success(f"매도 완료: {success_n}개 성공, {fail_n}개 실패")
-            else:
-                st.error(f"모두 실패: {fail_n}개")
-
-            # 결과 표시
-            _diag_cols = [
-                "stock_code", "stock_name", "requested_mode", "resolved_mode",
-                "base_url", "key_type_used", "app_key_mode_valid",
-                "mock_order_called", "real_order_called",
-                "order_no", "rt_cd", "success", "rejected_reason",
-            ]
-            _diag_df = pd.DataFrame([{k: r.get(k, "") for k in _diag_cols} for r in results])
-            st.dataframe(_diag_df, use_container_width=True)
-            st.json(results)
+        # 전량 일괄매도는 아래 전용 섹션에서 처리
+        st.caption("↓ 아래 '전량 일괄매도' 버튼 사용")
 else:
     st.info("수동매도할 보유종목이 없습니다.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 전량 일괄매도 — 미체결 주문 정정 포함
+# ══════════════════════════════════════════════════════════════════════════════
+st.divider()
+st.subheader("전량 일괄매도 (미체결 정정 포함)")
+
+_bulk_sell_disabled = (sell_mode == "REAL" and not real_sell_confirmed)
+
+# 옵션 체크박스
+_opt_cols = st.columns(3)
+with _opt_cols[0]:
+    opt_check_open = st.checkbox("미체결 매도 주문 먼저 조회", value=True, key="opt_check_open_orders")
+with _opt_cols[1]:
+    opt_amend = st.checkbox("미체결 주문은 현재가 기준 정정", value=True, key="opt_amend_unfilled")
+with _opt_cols[2]:
+    opt_cancel_replace = st.checkbox("정정 실패 시 취소 후 재매도", value=True, key="opt_cancel_replace")
+
+# 미체결 주문 조회 버튼
+_bulk_btn_cols = st.columns(3)
+with _bulk_btn_cols[0]:
+    if st.button("🔍 미체결 주문 조회", use_container_width=True, key="btn_check_open_orders"):
+        with st.spinner("KIS 미체결 매도 주문 조회 중..."):
+            oo_result = get_open_sell_orders(mode=sell_mode.lower())
+        if oo_result.get("success"):
+            oo_list = oo_result.get("orders", [])
+            if oo_list:
+                _oo_cols = ["stock_code", "stock_name", "order_no", "original_order_no",
+                            "order_qty", "unfilled_qty", "order_price", "order_time"]
+                st.success(f"미체결 매도 주문 {len(oo_list)}건 조회됨")
+                st.dataframe(
+                    pd.DataFrame([{k: o.get(k, "") for k in _oo_cols} for o in oo_list]),
+                    use_container_width=True,
+                )
+                st.session_state["open_sell_orders"] = oo_list
+            else:
+                st.info("미체결 매도 주문 없음")
+                st.session_state["open_sell_orders"] = []
+        else:
+            st.error(f"조회 실패: {oo_result.get('message', '')}")
+
+# 이전 조회 결과 표시
+if st.session_state.get("open_sell_orders"):
+    _oo_list = st.session_state["open_sell_orders"]
+    st.caption(f"최근 조회: 미체결 매도 주문 {len(_oo_list)}건")
+    _oo_cols2 = ["stock_code", "stock_name", "unfilled_qty", "order_price", "order_time"]
+    _oo_preview = [{k: o.get(k, "") for k in _oo_cols2} for o in _oo_list]
+    if _oo_preview:
+        st.dataframe(pd.DataFrame(_oo_preview), use_container_width=True)
+
+with _bulk_btn_cols[1]:
+    if st.button(
+        f"⚡ {sell_mode} — 미체결 정정 후 전량 일괄매도",
+        use_container_width=True,
+        type="primary" if sell_mode == "MOCK" else "secondary",
+        disabled=_bulk_sell_disabled,
+        key="btn_bulk_sell_amend",
+    ):
+        if sell_mode == "REAL":
+            st.warning("REAL 전체 종목 일괄 매도 + 정정주문 — 실제 주문 실행됩니다!")
+        with st.spinner(f"{sell_mode} 미체결 정정 후 전량 일괄매도 실행 중..."):
+            bulk_result = run_bulk_sell_with_amend(
+                mode=sell_mode.lower(),
+                check_open_orders=opt_check_open,
+                amend_unfilled=opt_amend,
+                cancel_replace_if_amend_fails=opt_cancel_replace,
+                dry_run=False,
+            )
+        _show_bulk_result(bulk_result)
+
+with _bulk_btn_cols[2]:
+    if st.button(
+        f"🔍 {sell_mode} — DRY-RUN (정정 예정 확인만)",
+        use_container_width=True,
+        disabled=_bulk_sell_disabled,
+        key="btn_bulk_sell_dryrun",
+    ):
+        with st.spinner("DRY-RUN 실행 중 (실제 주문 없음)..."):
+            dry_result = run_bulk_sell_with_amend(
+                mode=sell_mode.lower(),
+                check_open_orders=opt_check_open,
+                amend_unfilled=opt_amend,
+                cancel_replace_if_amend_fails=opt_cancel_replace,
+                dry_run=True,
+            )
+        _show_bulk_result(dry_result, is_dry_run=True)
 
 no_profit_guarantee_notice()
