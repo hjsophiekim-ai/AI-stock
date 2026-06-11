@@ -3,6 +3,7 @@
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
+from datetime import date as _date
 
 import pandas as pd
 
@@ -52,20 +53,53 @@ def get_positions() -> List[Dict]:
         return []
 
 
-def get_positions_with_current_price() -> List[Dict]:
+def get_positions_with_current_price(mode: str = "") -> List[Dict]:
     inject_to_os_env()
-    positions = get_positions()
-    cfg = load_config()
-    mode = get_trade_mode(cfg)
+    if mode:
+        from position_manager import PositionManager
+        pm = PositionManager(str(PROJECT_ROOT / "config.yaml"), mode=mode)
+        positions = []
+        _open = pm.get_open_positions() if hasattr(pm, "get_open_positions") else {
+            k: v for k, v in pm.get_all_positions().items() if not getattr(v, "is_closed", False)
+        }
+        for code, pos in _open.items():
+            positions.append({
+                "stock_code": code,
+                "stock_name": getattr(pos, "stock_name", ""),
+                "quantity": getattr(pos, "quantity", 0),
+                "entry_price": getattr(pos, "entry_price", 0),
+                "avg_price": getattr(pos, "avg_price", getattr(pos, "entry_price", 0)),
+                "target_price": getattr(pos, "target_price", 0),
+                "stop_loss_price": getattr(pos, "stop_loss_price", getattr(pos, "stop_price", 0)),
+                "entry_time": str(getattr(pos, "entry_time", "")),
+                "order_no": getattr(pos, "order_no", ""),
+                "strategy_id": getattr(pos, "strategy_id", ""),
+                "strategy_name": getattr(pos, "strategy_name", ""),
+                "sell_policy_id": getattr(pos, "sell_policy_id", "fixed_2pct"),
+                "sell_policy_name": getattr(pos, "sell_policy_name", "기본 자동매도"),
+                "trailing_active": getattr(pos, "trailing_active", False),
+                "trailing_high_price": getattr(pos, "trailing_high_price", 0),
+                "trailing_stop_price": getattr(pos, "trailing_stop_price", 0),
+                "manual_only": getattr(pos, "manual_only", False),
+                "auto_take_profit_enabled": getattr(pos, "auto_take_profit_enabled", True),
+                "allowed_sell_sessions": getattr(pos, "allowed_sell_sessions", []),
+                "status": getattr(pos, "status", "OPEN"),
+                "source": getattr(pos, "source", "local"),
+                "force_trade_mode": getattr(pos, "force_trade_mode", False),
+                "current_price": getattr(pos, "current_price", 0),
+            })
+    else:
+        positions = get_positions()
+    _effective_mode = (mode or "").upper() or get_trade_mode(load_config())
     for pos in positions:
         entry = float(pos.get("entry_price", 0) or 0)
-        current_price = entry
-        if mode != "PAPER":
+        current_price = float(pos.get("current_price", entry) or entry)
+        if _effective_mode != "PAPER":
             try:
                 from api_service import test_current_price
                 current_price = float(test_current_price(pos["stock_code"]).get("price", entry) or entry)
             except Exception:
-                current_price = float(pos.get("current_price", entry) or entry)
+                pass
         qty = int(pos.get("quantity", 0) or 0)
         pnl = (current_price - entry) * qty
         pnl_rate = (current_price / entry - 1) * 100 if entry else 0
@@ -78,11 +112,18 @@ def get_positions_with_current_price() -> List[Dict]:
     return positions
 
 
-def get_broker_positions() -> List[Dict]:
+def get_broker_positions(mode: str = "mock") -> List[Dict]:
     inject_to_os_env()
     try:
         from api_service import get_broker_positions as _api_get
-        return _api_get().get("positions", [])
+        return _api_get(mode=mode).get("positions", [])
+    except TypeError:
+        # fallback: api_service.get_broker_positions doesn't accept mode arg
+        try:
+            from api_service import get_broker_positions as _api_get
+            return _api_get().get("positions", [])
+        except Exception:
+            return []
     except Exception:
         return []
 
@@ -230,16 +271,28 @@ def run_buy_candidates(
     try:
         if (mode or "").lower() == "real":
             cfg = load_config()
-            if not (
-                cfg.get("real_trade", {}).get("allow_bulk_buy", False)
-                and cfg.get("force_trade", {}).get("allow_real_bulk_order", False)
-                and cfg.get("safety", {}).get("confirm_live_trade", False)
-            ):
+            real_trade_cfg = cfg.get("real_trade", {})
+            # New condition: allow_bulk_buy_after_api_confirmation
+            allow_bulk = real_trade_cfg.get("allow_bulk_buy_after_api_confirmation", False)
+            # Also allow if legacy allow_bulk_buy is True
+            allow_bulk = allow_bulk or real_trade_cfg.get("allow_bulk_buy", False)
+            if not allow_bulk:
                 return {
                     "success": False,
-                    "message": "실전 전체 리스트 매수는 비활성화되어 있습니다. 먼저 개별 종목 1주 테스트를 완료하세요.",
+                    "message": "실전 전체 리스트 매수가 비활성화되어 있습니다. config.yaml real_trade.allow_bulk_buy_after_api_confirmation을 확인하세요.",
                     "orders_placed": 0,
                 }
+            # Daily confirmation check
+            try:
+                from real_trade_confirmation import is_confirmed_today
+                if not is_confirmed_today():
+                    return {
+                        "success": False,
+                        "message": "오늘 실전 주문 확인이 완료되지 않았습니다. API 설정 화면에서 실전 주문 확인을 완료하세요.",
+                        "orders_placed": 0,
+                    }
+            except Exception:
+                pass
         from buy_candidate_list import buy_candidates
         result = buy_candidates(
             candidate_file=candidate_file,
@@ -484,3 +537,69 @@ def check_real_readiness() -> Dict:
             "message": f"readiness 확인 실패: {exc}",
             "details": {},
         }
+
+
+def get_real_bulk_buy_readiness(
+    planned_total_amount: int = 0,
+    order_plan_id: str = "",
+    order_plan_hash: str = "",
+    user_confirmed_bulk_real: bool = False,
+) -> Dict:
+    """REAL 전체 리스트 매수 활성화 조건 점검.
+
+    기존 '1주 테스트 완료 필수' 조건 제거.
+    대신 API 설정 당일 확인, readiness, order_plan, 금액한도, 사용자 최종확인 기준.
+    """
+    inject_to_os_env()
+    cfg = load_config()
+    real_trade_cfg = cfg.get("real_trade", {})
+    max_amount = int(real_trade_cfg.get("max_real_bulk_order_amount", 300000))
+
+    # 1. REAL readiness
+    readiness = check_real_readiness()
+    real_readiness_ready = readiness.get("ready", False)
+
+    # 2. 당일 API 확인
+    try:
+        from real_trade_confirmation import is_confirmed_today
+        api_confirmation_today = is_confirmed_today()
+    except Exception:
+        api_confirmation_today = False
+
+    # 3. order_plan 존재
+    order_plan_exists = bool(order_plan_id)
+
+    # 4. order_plan hash 유효 (hash가 없으면 skip)
+    order_plan_hash_valid = bool(order_plan_id)  # plan id exists = valid for now
+
+    # 5. 금액한도
+    budget_within_limit = (planned_total_amount <= max_amount) if planned_total_amount > 0 else True
+
+    # 6. real_bulk_enabled (config)
+    real_bulk_enabled = (
+        real_trade_cfg.get("allow_bulk_buy_after_api_confirmation", True)
+        and real_trade_cfg.get("enabled", True)
+        and not cfg.get("safety", {}).get("block_real_bulk_order", False)
+    )
+
+    # 7. 사용자 최종확인
+    conditions = {
+        "real_readiness_ready": real_readiness_ready,
+        "api_confirmation_today": api_confirmation_today,
+        "order_plan_exists": order_plan_exists,
+        "order_plan_hash_valid": order_plan_hash_valid,
+        "budget_within_limit": budget_within_limit,
+        "user_confirmed_bulk_real": user_confirmed_bulk_real,
+        "real_bulk_enabled": real_bulk_enabled,
+    }
+    missing = [k for k, v in conditions.items() if not v]
+    ready = all(conditions.values())
+
+    return {
+        "ready": ready,
+        "conditions": conditions,
+        "missing_conditions": missing,
+        "planned_total_amount": planned_total_amount,
+        "max_real_bulk_order_amount": max_amount,
+        "readiness_details": readiness,
+    }

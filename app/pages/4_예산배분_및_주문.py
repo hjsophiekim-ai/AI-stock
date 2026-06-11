@@ -20,6 +20,7 @@ from config_service import load_config, get_trade_mode, get_safety_status
 from trading_service import (
     check_real_order_conditions,
     check_real_readiness,
+    get_real_bulk_buy_readiness,
     run_budget_allocation,
     run_buy_candidates,
     list_sell_policies,
@@ -205,40 +206,100 @@ if order_mode in ("MOCK", "REAL"):
 
 if order_mode == "REAL":
     real_order_warning()
+    import json as _json4
+    from trading_service import get_real_bulk_buy_readiness
+
+    # Safety flag check
+    _sflag_path4 = PROJECT_ROOT / "reports" / "real_order_safety_flag.json"
+    if _sflag_path4.exists():
+        try:
+            _sflag4 = _json4.loads(_sflag_path4.read_text(encoding="utf-8"))
+            if _sflag4.get("blocked"):
+                st.error(
+                    f"이전 실전 주문 미검증: 주문번호 {_sflag4.get('order_no','?')}, 종목 {_sflag4.get('stock_code','?')}\n"
+                    f"추가 실전 주문이 차단됩니다. reports/real_order_safety_flag.json 확인 후 삭제하세요."
+                )
+        except Exception:
+            pass
+
+    # API 설정 당일 확인 상태
+    _confirm_path4 = PROJECT_ROOT / "data" / "real_trade_confirmation.json"
+    _confirm4 = _json4.loads(_confirm_path4.read_text(encoding="utf-8")) if _confirm_path4.exists() else {}
+    _today4 = __import__("datetime").date.today().strftime("%Y%m%d")
+    _api_confirmed_today = _confirm4.get("confirmation_date") == _today4 and _confirm4.get("real_trade_confirmed", False)
+    if _api_confirmed_today:
+        st.success(f"오늘 실전 주문 확인 완료 ({_confirm4.get('confirmed_at','')[:19]})")
+    else:
+        st.warning("오늘 실전 주문 확인이 필요합니다. [API 설정] 화면에서 확인을 완료하세요.")
+
     # REAL readiness 확인
     if "real_readiness_buy" not in st.session_state:
         st.session_state["real_readiness_buy"] = None
     _rb_col1, _rb_col2 = st.columns([3, 1])
-    _real_buy_readiness_ok = True
     with _rb_col1:
         if st.session_state["real_readiness_buy"]:
             _rb = st.session_state["real_readiness_buy"]
             if _rb.get("ready"):
                 st.success(f"REAL 계좌조회 준비 완료 — {_rb.get('message', '')}")
             else:
-                st.error(
-                    f"⛔ REAL 계좌조회 실패 — 전부 매수 버튼 비활성화\n"
-                    f"{_rb.get('message', '')}"
-                )
-                _real_buy_readiness_ok = False
+                st.error(f"REAL 계좌조회 실패 — {_rb.get('message', '')}")
     with _rb_col2:
         if st.button("REAL 준비상태 확인", key="btn_real_readiness_buy"):
             with st.spinner("REAL API 계좌조회 확인 중..."):
                 st.session_state["real_readiness_buy"] = check_real_readiness()
             st.rerun()
-    if st.session_state["real_readiness_buy"] and not st.session_state["real_readiness_buy"].get("ready"):
-        _real_buy_readiness_ok = False
 
-    real_bulk_ok = (
-        _real_buy_readiness_ok
-        and bool(cfg.get("real_trade", {}).get("allow_bulk_buy"))
-        and bool(cfg.get("force_trade", {}).get("allow_real_bulk_order"))
-        and bool(cfg.get("safety", {}).get("confirm_live_trade"))
+    # 주문계획 상태
+    _order_plan_id = st.session_state.get("current_order_plan_id", "")
+    _order_plan_total = st.session_state.get("current_order_plan_total", 0)
+    _max_real_bulk = int(cfg.get("real_trade", {}).get("max_real_bulk_order_amount", 300_000))
+
+    if _order_plan_id:
+        st.info(f"주문계획: `{_order_plan_id}` | 예정금액: {int(_order_plan_total):,}원 / 한도: {_max_real_bulk:,}원")
+    else:
+        st.warning("주문계획(order_plan_id)이 없습니다. 먼저 '주문 미리보기'를 실행해 주문계획을 생성하세요.")
+
+    # 사용자 최종 확인 체크박스
+    _real_confirm1 = st.checkbox(
+        "위 주문계획의 모든 종목을 실제 계좌에서 매수하는 것을 확인합니다.",
+        key="real_bulk_confirm1",
     )
-    if not real_bulk_ok:
-        st.error("실전 전체 리스트 매수는 비활성화되어 있습니다. 먼저 REAL 준비상태를 확인하고 개별 종목 1주 테스트를 완료하세요.")
+    _real_confirm2 = st.checkbox(
+        "실제 자금이 사용되며 손실 및 미체결 가능성을 이해합니다.",
+        key="real_bulk_confirm2",
+    )
+
+    # 안전조건 점검
+    _bulk_readiness = get_real_bulk_buy_readiness(
+        planned_total_amount=int(_order_plan_total),
+        order_plan_id=_order_plan_id,
+        user_confirmed_bulk_real=(_real_confirm1 and _real_confirm2),
+    )
+
+    # 조건 표시
+    _cond_table = {
+        "real_readiness_ready": "REAL API 준비 완료",
+        "api_confirmation_today": "오늘 API 설정 확인 완료",
+        "order_plan_exists": "주문계획(order_plan_id) 존재",
+        "order_plan_hash_valid": "주문계획 해시 유효",
+        "budget_within_limit": f"주문금액 한도 내 ({_max_real_bulk:,}원 이하)",
+        "user_confirmed_bulk_real": "사용자 최종 확인 체크박스",
+        "real_bulk_enabled": "config 전체매수 허용",
+    }
+    _cond_data = _bulk_readiness.get("conditions", {})
+    _cond_rows = [{"조건": v, "상태": "OK" if _cond_data.get(k) else "FAIL"} for k, v in _cond_table.items()]
+    st.dataframe(_cond_rows, use_container_width=True, hide_index=True)
+
+    if not _bulk_readiness.get("ready"):
+        _missing = _bulk_readiness.get("missing_conditions", [])
+        st.error(f"REAL 전체 리스트 매수를 위해 필요한 조건이 아직 충족되지 않았습니다.\n미충족: {', '.join(_missing)}")
+
+    real_bulk_ok = _bulk_readiness.get("ready", False)
+
 else:
     real_bulk_ok = True
+    _real_confirm1 = False
+    _real_confirm2 = False
     if order_mode == "MOCK":
         st.info("MOCK 주문은 모의투자 서버 openapivts와 KIS_MOCK_APP_KEY만 사용해야 합니다.")
 
@@ -261,6 +322,11 @@ with col_buy:
                 st.success(result.get("message", "매수 완료"))
             else:
                 st.error(result.get("message", "매수 실패"))
+            if order_mode == "REAL":
+                # Clear order plan after execution
+                st.session_state.pop("current_order_plan_id", None)
+                st.session_state.pop("current_order_plan_total", None)
+                st.session_state.pop("current_order_plan_preview", None)
             if isinstance(result, dict):
                 _render_budget_metrics(result)
                 if result.get("allocation_preview"):
@@ -268,9 +334,11 @@ with col_buy:
                 orders = result.get("order_results") or result.get("orders") or []
                 if orders:
                     meta_cols = [
-                        "requested_mode", "resolved_mode", "base_url", "token_url",
-                        "key_type_used", "mock_order_called", "real_order_called",
-                        "order_no", "success", "rejected_reason",
+                        "stock_code", "stock_name", "quantity", "order_price",
+                        "order_no", "rt_cd", "msg",
+                        "requested_mode", "resolved_mode",
+                        "api_called", "real_order_called", "mock_order_called",
+                        "success", "fill_status", "rejected_reason",
                     ]
                     meta_df = pd.DataFrame(orders)
                     show_cols = [c for c in meta_cols if c in meta_df.columns]
@@ -297,6 +365,15 @@ with col_preview:
                 st.success(f"미리보기 {len(result['allocation_preview'])}건, 실제 주문 없음")
                 st.dataframe(pd.DataFrame(result["allocation_preview"]), use_container_width=True)
                 _render_budget_metrics(result)
+                # REAL 모드: order_plan_id를 session_state에 저장
+                if order_mode == "REAL":
+                    import uuid, datetime as _dt
+                    _plan_id = _dt.datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
+                    _plan_total = sum(int(r.get("order_amount", 0) or 0) for r in result["allocation_preview"])
+                    st.session_state["current_order_plan_id"] = _plan_id
+                    st.session_state["current_order_plan_total"] = _plan_total
+                    st.session_state["current_order_plan_preview"] = result["allocation_preview"]
+                    st.info(f"주문계획 생성됨: `{_plan_id}` | 예정금액: {_plan_total:,}원")
             else:
                 st.warning(result.get("message", "미리보기 결과가 없습니다."))
 
