@@ -77,20 +77,21 @@ def test_current_price(stock_code: str = "005930") -> Dict:
         return {"success": False, "message": f"현재가 조회 오류: {e}", "price": 0}
 
 
-def get_broker_positions() -> Dict:
-    """KIS 계좌 보유 종목 직접 조회."""
+def get_broker_positions(mode: str = None) -> Dict:
+    """KIS 계좌 보유 종목 직접 조회. mode='mock'/'real' 로 모드별 API key/URL 선택."""
     try:
-        api = _get_api_client()
+        api = _get_api_client(runtime_mode=mode)
         df = api.get_positions()
         if df is None or df.empty:
-            return {"success": True, "message": "보유 종목 없음", "positions": []}
+            return {"success": True, "message": "보유 종목 없음", "positions": [], "mode": mode}
         return {
             "success": True,
             "message": f"{len(df)}개 종목 조회",
             "positions": df.to_dict("records"),
+            "mode": mode,
         }
     except Exception as e:
-        return {"success": False, "message": f"보유종목 조회 오류: {e}", "positions": []}
+        return {"success": False, "message": f"보유종목 조회 오류: {e}", "positions": [], "mode": mode}
 
 
 def run_full_connection_test(stock_code: str = "005930") -> Dict:

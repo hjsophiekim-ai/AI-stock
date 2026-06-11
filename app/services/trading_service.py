@@ -1,4 +1,4 @@
-﻿"""Trading service wrappers used by the Streamlit pages."""
+"""Trading service wrappers used by the Streamlit pages."""
 
 import sys
 from pathlib import Path
@@ -116,16 +116,23 @@ def get_broker_positions(mode: str = "mock") -> List[Dict]:
     inject_to_os_env()
     try:
         from api_service import get_broker_positions as _api_get
-        return _api_get(mode=mode).get("positions", [])
-    except TypeError:
-        # fallback: api_service.get_broker_positions doesn't accept mode arg
-        try:
-            from api_service import get_broker_positions as _api_get
-            return _api_get().get("positions", [])
-        except Exception:
-            return []
+        result = _api_get(mode=mode)
+        if not result.get("success"):
+            raise RuntimeError(result.get("message", "알 수 없는 오류"))
+        return result.get("positions", [])
     except Exception:
         return []
+
+
+def get_broker_positions_result(mode: str = "mock") -> Dict:
+    """get_broker_positions의 에러 정보 포함 버전 — UI에서 오류 표시 시 사용."""
+    inject_to_os_env()
+    try:
+        from api_service import get_broker_positions as _api_get
+        result = _api_get(mode=mode)
+        return result
+    except Exception as e:
+        return {"success": False, "message": str(e), "positions": [], "mode": mode}
 
 
 def sync_broker_to_local(

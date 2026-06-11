@@ -21,6 +21,7 @@ from config_service import load_config, get_trade_mode
 from trading_service import (
     check_real_readiness,
     get_broker_positions,
+    get_broker_positions_result,
     get_open_sell_orders,
     get_positions_with_current_price,
     list_sell_policies,
@@ -104,8 +105,8 @@ def _show_bulk_result(result: dict, is_dry_run: bool = False) -> None:
         st.dataframe(pd.DataFrame([{k: r.get(k, "") for k in _cols} for r in rows]), use_container_width=True)
 
 
-def _render_sell_section(mode_str: str, local_pos: list, broker_pos: list, real_readiness_ok: bool = True) -> None:
-    """공용 매도 섹션 렌더러."""
+def _render_sell_tabs(mode_str: str, local_pos: list, broker_pos: list, real_readiness_ok: bool = True) -> None:
+    """매도 탭 — 2% 자동매도 / 트레일링 매도 / 수동매도 / 일괄매도 탭 구조."""
     real_sell_confirmed = False
     if mode_str == "REAL":
         real_sell_confirmed = st.checkbox(
@@ -118,24 +119,7 @@ def _render_sell_section(mode_str: str, local_pos: list, broker_pos: list, real_
 
     sell_btn_disabled = (mode_str == "REAL" and (not real_sell_confirmed or not real_readiness_ok))
 
-    sell_positions = local_pos if local_pos else broker_pos
-    codes = [str(p.get("stock_code", "")).zfill(6) for p in sell_positions if p.get("stock_code")]
-    names = {str(p.get("stock_code", "")).zfill(6): p.get("stock_name", "") for p in sell_positions}
-    quantities = {str(p.get("stock_code", "")).zfill(6): int(p.get("quantity", 0) or 0) for p in sell_positions}
-
-    if not codes:
-        st.info("매도할 보유종목이 없습니다.")
-        return
-
-    sel_code = st.selectbox(
-        "종목 선택",
-        codes,
-        format_func=lambda c: f"{c} ({names.get(c, '')}) — {quantities.get(c, 0)}주 보유",
-        key=f"sel_code_{mode_str}",
-    )
-    reason = st.selectbox("매도 사유", ["manual", "take_profit", "stop_loss", "force_exit"], key=f"sell_reason_{mode_str}")
-
-    # 옵션
+    # 미체결 조회 옵션 (탭 공통)
     _opt_cols = st.columns(4)
     with _opt_cols[0]:
         opt_check_open = st.checkbox("미체결 매도 주문 먼저 조회", value=True, key=f"opt_check_{mode_str}")
@@ -151,72 +135,153 @@ def _render_sell_section(mode_str: str, local_pos: list, broker_pos: list, real_
             disabled=(mode_str == "REAL"),
         )
 
-    _btn_cols = st.columns(4)
-    with _btn_cols[0]:
+    _stab_2pct, _stab_trail, _stab_manual, _stab_bulk = st.tabs([
+        "2% 자동매도",
+        "트레일링 매도",
+        "수동매도",
+        "일괄매도",
+    ])
+
+    with _stab_2pct:
+        st.caption("현재 보유종목 중 +2% 목표가 도달 종목 자동매도 1회 실행")
         if st.button(
-            f"{mode_str} — 선택 종목 수동매도 (전량)",
+            f"+2% 자동매도 감시 1회 실행 ({mode_str})",
+            key=f"sell2pct_{mode_str}",
             use_container_width=True,
-            type="primary" if mode_str == "MOCK" else "secondary",
-            disabled=sell_btn_disabled,
-            key=f"btn_sell_single_{mode_str}",
+            type="primary",
         ):
-            with st.spinner(f"{mode_str} 매도 주문 실행 중..."):
-                result = run_sell_order(
-                    stock_code=sel_code,
-                    mode=mode_str.lower(),
-                    reason=reason,
-                    stock_name=names.get(sel_code, ""),
-                )
+            with st.spinner("+2% 목표가 도달 감시 실행 중..."):
+                result = run_force_sell_once(mode=mode_str.lower(), sell_policy_id="fixed_2pct", policy_override=True)
             if result.get("success"):
-                st.success(f"매도 성공: 주문번호 {result.get('order_no', '')}")
+                st.success(f"완료: {result.get('message', '')}")
             else:
-                st.error(f"매도 실패: {result.get('rejected_reason') or result.get('reason', '알 수 없음')}")
-            st.json({k: result.get(k, "") for k in [
-                "requested_mode", "resolved_mode", "base_url", "mock_order_called", "real_order_called",
-                "order_no", "rt_cd", "msg", "success", "rejected_reason",
-            ]})
+                st.error(f"실패: {result.get('message', '알 수 없음')}")
+            st.json({k: v for k, v in result.items() if k != "rows"})
 
-    with _btn_cols[1]:
+    with _stab_trail:
+        st.caption("시장강도 기반 트레일링 매도 감시 1회 실행")
         if st.button(
-            f"⚡ {mode_str} — 미체결 정정 후 전량 일괄매도",
+            f"트레일링 매도 감시 1회 실행 ({mode_str})",
+            key=f"sell_trail_{mode_str}",
             use_container_width=True,
-            type="primary" if mode_str == "MOCK" else "secondary",
-            disabled=sell_btn_disabled,
-            key=f"btn_bulk_sell_{mode_str}",
+            type="primary",
         ):
-            if mode_str == "REAL":
-                st.warning("REAL 전체 종목 일괄 매도 — 실제 주문 실행됩니다!")
-            with st.spinner(f"{mode_str} 미체결 정정 후 전량 일괄매도 실행 중..."):
-                bulk_result = run_bulk_sell_with_amend(
-                    mode=mode_str.lower(),
-                    check_open_orders=opt_check_open,
-                    amend_unfilled=opt_amend,
-                    cancel_replace_if_amend_fails=opt_cancel_replace,
-                    dry_run=False,
-                    proceed_without_open_order_check=opt_proceed,
-                )
-            _show_bulk_result(bulk_result)
+            with st.spinner("트레일링 매도 감시 실행 중..."):
+                result = run_force_sell_once(mode=mode_str.lower(), sell_policy_id="market_strength_trailing", policy_override=True)
+            if result.get("success"):
+                st.success(f"완료: {result.get('message', '')}")
+            else:
+                st.error(f"실패: {result.get('message', '알 수 없음')}")
+            st.json({k: v for k, v in result.items() if k != "rows"})
 
-    with _btn_cols[2]:
+    with _stab_manual:
+        st.caption("수동보유(manual_hold) 종목 알림 확인 + 개별 종목 수동매도")
+
         if st.button(
-            f"🔍 {mode_str} — DRY-RUN",
+            f"수동보유 종목 알림 확인 ({mode_str})",
+            key=f"sell_manual_mon_{mode_str}",
             use_container_width=True,
-            disabled=sell_btn_disabled,
-            key=f"btn_dryrun_{mode_str}",
         ):
-            with st.spinner("DRY-RUN 실행 중 (실제 주문 없음)..."):
-                dry_result = run_bulk_sell_with_amend(
-                    mode=mode_str.lower(),
-                    check_open_orders=opt_check_open,
-                    amend_unfilled=opt_amend,
-                    cancel_replace_if_amend_fails=opt_cancel_replace,
-                    dry_run=True,
-                    proceed_without_open_order_check=opt_proceed,
-                )
-            _show_bulk_result(dry_result, is_dry_run=True)
+            with st.spinner("수동보유 종목 확인 중..."):
+                result = run_force_sell_once(mode=mode_str.lower(), sell_policy_id="manual_hold", policy_override=True)
+            if result.get("success"):
+                st.success(f"완료: {result.get('message', '')}")
+            else:
+                st.error(f"실패: {result.get('message', '알 수 없음')}")
+            st.json({k: v for k, v in result.items() if k != "rows"})
 
-    with _btn_cols[3]:
-        if st.button(f"🔍 미체결 주문 조회", use_container_width=True, key=f"btn_open_orders_{mode_str}"):
+        st.divider()
+
+        sell_positions = local_pos if local_pos else broker_pos
+        codes = [str(p.get("stock_code", "")).zfill(6) for p in sell_positions if p.get("stock_code")]
+        names = {str(p.get("stock_code", "")).zfill(6): p.get("stock_name", "") for p in sell_positions}
+        quantities = {str(p.get("stock_code", "")).zfill(6): int(p.get("quantity", 0) or 0) for p in sell_positions}
+
+        if not codes:
+            st.info("수동매도할 보유종목이 없습니다. (로컬 포지션 및 브로커 계좌 모두 없음)")
+        else:
+            sel_code = st.selectbox(
+                "종목 선택",
+                codes,
+                format_func=lambda c: f"{c} ({names.get(c, '')}) — {quantities.get(c, 0)}주 보유",
+                key=f"sel_code_{mode_str}",
+            )
+            reason = st.selectbox(
+                "매도 사유",
+                ["manual", "take_profit", "stop_loss", "force_exit"],
+                key=f"sell_reason_{mode_str}",
+            )
+            if st.button(
+                f"{mode_str} — 선택 종목 수동매도 (전량)",
+                use_container_width=True,
+                type="primary" if mode_str == "MOCK" else "secondary",
+                disabled=sell_btn_disabled,
+                key=f"btn_sell_single_{mode_str}",
+            ):
+                with st.spinner(f"{mode_str} 매도 주문 실행 중..."):
+                    result = run_sell_order(
+                        stock_code=sel_code,
+                        mode=mode_str.lower(),
+                        reason=reason,
+                        stock_name=names.get(sel_code, ""),
+                    )
+                if result.get("success"):
+                    st.success(f"매도 성공: 주문번호 {result.get('order_no', '')}")
+                else:
+                    st.error(f"매도 실패: {result.get('rejected_reason') or result.get('reason', '알 수 없음')}")
+                st.json({k: result.get(k, "") for k in [
+                    "requested_mode", "resolved_mode", "base_url", "mock_order_called", "real_order_called",
+                    "order_no", "rt_cd", "msg", "success", "rejected_reason",
+                ]})
+
+    with _stab_bulk:
+        st.caption(f"전 종목 일괄매도 및 DRY-RUN 테스트. {mode_str} 포지션 파일 기준.")
+
+        _bcols = st.columns(2)
+        with _bcols[0]:
+            if st.button(
+                f"⚡ {mode_str} 계좌 일괄매도",
+                use_container_width=True,
+                type="primary" if mode_str == "MOCK" else "secondary",
+                disabled=sell_btn_disabled,
+                key=f"btn_bulk_sell_{mode_str}",
+            ):
+                if mode_str == "REAL":
+                    st.warning("REAL 전체 종목 일괄 매도 — 실제 주문 실행됩니다!")
+                with st.spinner(f"{mode_str} 미체결 정정 후 전량 일괄매도 실행 중..."):
+                    bulk_result = run_bulk_sell_with_amend(
+                        mode=mode_str.lower(),
+                        check_open_orders=opt_check_open,
+                        amend_unfilled=opt_amend,
+                        cancel_replace_if_amend_fails=opt_cancel_replace,
+                        dry_run=False,
+                        proceed_without_open_order_check=opt_proceed,
+                    )
+                _show_bulk_result(bulk_result)
+
+        with _bcols[1]:
+            if st.button(
+                f"🔍 {mode_str} DRY-RUN (주문없음)",
+                use_container_width=True,
+                key=f"btn_dryrun_{mode_str}",
+            ):
+                with st.spinner("DRY-RUN 실행 중 (실제 주문 없음)..."):
+                    dry_result = run_bulk_sell_with_amend(
+                        mode=mode_str.lower(),
+                        check_open_orders=opt_check_open,
+                        amend_unfilled=opt_amend,
+                        cancel_replace_if_amend_fails=opt_cancel_replace,
+                        dry_run=True,
+                        proceed_without_open_order_check=opt_proceed,
+                    )
+                _show_bulk_result(dry_result, is_dry_run=True)
+
+        st.divider()
+        if st.button(
+            f"🔍 미체결 주문 조회 ({mode_str})",
+            use_container_width=True,
+            key=f"btn_open_orders_{mode_str}",
+        ):
             with st.spinner("KIS 미체결 매도 주문 조회 중..."):
                 oo_result = get_open_sell_orders(mode=mode_str.lower())
             oo_qstatus = oo_result.get("query_status", "OK")
@@ -263,7 +328,14 @@ with tab_mock:
     _mock_top = st.columns(4)
     with _mock_top[0]:
         if st.button("KIS MOCK 계좌 새로고침", use_container_width=True, key="mock_refresh"):
-            st.session_state["mock_broker_pos"] = get_broker_positions(mode="mock")
+            with st.spinner("KIS MOCK 계좌 조회 중..."):
+                _refresh_result = get_broker_positions_result(mode="mock")
+            if _refresh_result.get("success"):
+                st.session_state["mock_broker_pos"] = _refresh_result.get("positions", [])
+                st.session_state["mock_broker_error"] = None
+            else:
+                st.session_state["mock_broker_pos"] = []
+                st.session_state["mock_broker_error"] = _refresh_result.get("message", "알 수 없는 오류")
             st.rerun()
     with _mock_top[1]:
         if st.button("MOCK 계좌 동기화 (누락 CLOSED처리)", use_container_width=True, key="mock_sync"):
@@ -290,12 +362,18 @@ with tab_mock:
     _mock_open = [p for p in _mock_local if p.get("status", "OPEN") == "OPEN"]
     if "mock_broker_pos" not in st.session_state:
         st.session_state["mock_broker_pos"] = []
+    if "mock_broker_error" not in st.session_state:
+        st.session_state["mock_broker_error"] = None
     _mock_broker = st.session_state.get("mock_broker_pos", [])
+    _mock_broker_error = st.session_state.get("mock_broker_error")
 
     _mock_open_count = len(_mock_open)
     _mock_broker_count = len(_mock_broker)
     st.caption(f"로컬 OPEN: {_mock_open_count}개 | KIS MOCK 계좌 (마지막 조회): {_mock_broker_count}개")
-    if _mock_broker_count and _mock_open_count != _mock_broker_count:
+
+    if _mock_broker_error:
+        st.error(f"KIS MOCK 계좌 조회 오류: {_mock_broker_error}")
+    elif _mock_broker_count and _mock_open_count != _mock_broker_count:
         st.warning(f"⚠️ KIS MOCK 계좌 {_mock_broker_count}개 vs 로컬 OPEN {_mock_open_count}개 — 'MOCK 계좌 동기화' 버튼으로 맞추세요.")
 
     _mock_sub1, _mock_sub2, _mock_sub3 = st.tabs([
@@ -327,38 +405,8 @@ with tab_mock:
             st.success("MOCK 로컬과 KIS MOCK 계좌가 일치합니다.")
 
     st.divider()
-    st.subheader("MOCK 매도정책 감시")
-    _policies_mock = list_sell_policies()
-    _policy_label_to_id_mock = {p["name"]: p["id"] for p in _policies_mock}
-    _selected_policy_label_mock = st.radio(
-        "감시할 매도방식",
-        list(_policy_label_to_id_mock.keys()),
-        horizontal=True,
-        index=0,
-        key="mock_tab_policy",
-    )
-    _selected_policy_id_mock = _policy_label_to_id_mock[_selected_policy_label_mock]
-
-    _mock_pcols = st.columns(4)
-    with _mock_pcols[0]:
-        if st.button("+2% 기본 자동매도 감시 실행", use_container_width=True, key="mock_tab_sell1"):
-            result = run_force_sell_once(mode="mock", sell_policy_id="fixed_2pct", policy_override=True)
-            st.json({k: v for k, v in result.items() if k != "rows"})
-    with _mock_pcols[1]:
-        if st.button("강한 장 트레일링 감시 실행", use_container_width=True, key="mock_tab_sell2"):
-            result = run_force_sell_once(mode="mock", sell_policy_id="market_strength_trailing", policy_override=True)
-            st.json({k: v for k, v in result.items() if k != "rows"})
-    with _mock_pcols[2]:
-        if st.button("수동보유 종목 알림만 확인", use_container_width=True, key="mock_tab_sell3"):
-            result = run_force_sell_once(mode="mock", sell_policy_id="manual_hold", policy_override=True)
-            st.json({k: v for k, v in result.items() if k != "rows"})
-    with _mock_pcols[3]:
-        if st.button("선택 매도방식으로 1회 감시", use_container_width=True, key="mock_tab_sell4"):
-            result = run_force_sell_once(mode="mock", sell_policy_id=_selected_policy_id_mock, policy_override=True)
-            st.json({k: v for k, v in result.items() if k != "rows"})
-
-    st.subheader("MOCK 수동매도")
-    _render_sell_section("MOCK", _mock_open, _mock_broker)
+    st.subheader("MOCK 매도 감시")
+    _render_sell_tabs("MOCK", _mock_open, _mock_broker)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -406,7 +454,14 @@ with tab_real:
     _real_top = st.columns(4)
     with _real_top[0]:
         if st.button("KIS REAL 계좌 새로고침", use_container_width=True, key="real_refresh", disabled=not _real_readiness_ok):
-            st.session_state["real_broker_pos"] = get_broker_positions(mode="real")
+            with st.spinner("KIS REAL 계좌 조회 중..."):
+                _real_refresh_result = get_broker_positions_result(mode="real")
+            if _real_refresh_result.get("success"):
+                st.session_state["real_broker_pos"] = _real_refresh_result.get("positions", [])
+                st.session_state["real_broker_error"] = None
+            else:
+                st.session_state["real_broker_pos"] = []
+                st.session_state["real_broker_error"] = _real_refresh_result.get("message", "알 수 없는 오류")
             st.rerun()
     with _real_top[1]:
         if st.button("REAL 계좌 동기화 (조회만)", use_container_width=True, key="real_sync_dry", disabled=not _real_readiness_ok):
@@ -431,12 +486,18 @@ with tab_real:
     _real_open = [p for p in _real_local if p.get("status", "OPEN") == "OPEN"]
     if "real_broker_pos" not in st.session_state:
         st.session_state["real_broker_pos"] = []
+    if "real_broker_error" not in st.session_state:
+        st.session_state["real_broker_error"] = None
     _real_broker = st.session_state.get("real_broker_pos", [])
+    _real_broker_error = st.session_state.get("real_broker_error")
 
     _real_open_count = len(_real_open)
     _real_broker_count = len(_real_broker)
     st.caption(f"로컬 OPEN: {_real_open_count}개 | KIS REAL 계좌 (마지막 조회): {_real_broker_count}개")
-    if _real_broker_count and _real_open_count != _real_broker_count:
+
+    if _real_broker_error:
+        st.error(f"KIS REAL 계좌 조회 오류: {_real_broker_error}")
+    elif _real_broker_count and _real_open_count != _real_broker_count:
         st.warning(f"⚠️ KIS REAL 계좌 {_real_broker_count}개 vs 로컬 OPEN {_real_open_count}개")
 
     _real_sub1, _real_sub2, _real_sub3 = st.tabs([
@@ -468,8 +529,8 @@ with tab_real:
             st.success("REAL 로컬과 KIS REAL 계좌가 일치합니다.")
 
     st.divider()
-    st.subheader("REAL 매도")
-    _render_sell_section("REAL", _real_open, _real_broker, real_readiness_ok=_real_readiness_ok)
+    st.subheader("REAL 매도 감시")
+    _render_sell_tabs("REAL", _real_open, _real_broker, real_readiness_ok=_real_readiness_ok)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -491,7 +552,7 @@ with tab_paper:
 
     st.divider()
     st.subheader("PAPER 매도")
-    _render_sell_section("PAPER", _paper_open, [])
+    _render_sell_tabs("PAPER", _paper_open, [])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -531,30 +592,5 @@ with tab_diag:
                     st.error(f"읽기 실패: {e}")
             else:
                 st.info(f"파일 없음: {path}")
-
-    st.divider()
-    st.subheader("매도정책 감시 (MOCK 전용)")
-    policies = list_sell_policies()
-    policy_label_to_id = {p["name"]: p["id"] for p in policies}
-    selected_policy_label = st.radio("감시할 매도방식", list(policy_label_to_id.keys()), horizontal=True, index=0, key="diag_policy")
-    selected_policy_id = policy_label_to_id[selected_policy_label]
-
-    _pcols = st.columns(4)
-    with _pcols[0]:
-        if st.button("+2% 기본 자동매도 감시 실행 (MOCK)", use_container_width=True, key="diag_sell1"):
-            result = run_force_sell_once(mode="mock", sell_policy_id="fixed_2pct", policy_override=True)
-            st.json({k: v for k, v in result.items() if k != "rows"})
-    with _pcols[1]:
-        if st.button("강한 장 트레일링 감시 실행 (MOCK)", use_container_width=True, key="diag_sell2"):
-            result = run_force_sell_once(mode="mock", sell_policy_id="market_strength_trailing", policy_override=True)
-            st.json({k: v for k, v in result.items() if k != "rows"})
-    with _pcols[2]:
-        if st.button("수동보유 종목 알림만 확인 (MOCK)", use_container_width=True, key="diag_sell3"):
-            result = run_force_sell_once(mode="mock", sell_policy_id="manual_hold", policy_override=True)
-            st.json({k: v for k, v in result.items() if k != "rows"})
-    with _pcols[3]:
-        if st.button("선택 매도방식 1회 감시 (MOCK)", use_container_width=True, key="diag_sell4"):
-            result = run_force_sell_once(mode="mock", sell_policy_id=selected_policy_id, policy_override=True)
-            st.json({k: v for k, v in result.items() if k != "rows"})
 
 no_profit_guarantee_notice()
