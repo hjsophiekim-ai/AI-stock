@@ -668,20 +668,15 @@ class OrderManager:
                 oq_msg = oq_result.get("query_msg", "")
 
                 if oq_status in ("UNSUPPORTED", "ERROR"):
-                    # REAL: 항상 차단 / MOCK: proceed_without_open_order_check=True일 때만 진행
-                    if mode == TRADE_MODE_REAL or not proceed_without_open_order_check:
-                        block_reason = (
-                            "REAL_MODE_OPEN_ORDER_QUERY_FAILED"
-                            if mode == TRADE_MODE_REAL
-                            else "OPEN_ORDER_QUERY_UNSUPPORTED"
-                        )
+                    if mode == TRADE_MODE_REAL:
+                        # REAL: 미체결 조회 실패 시 항상 차단
                         logger.warning(
-                            "미체결 주문 조회 %s → 전량매도 차단 mode=%s msg=%s",
-                            oq_status, mode, oq_msg,
+                            "REAL 미체결 주문 조회 %s → 전량매도 차단 msg=%s",
+                            oq_status, oq_msg,
                         )
                         return {
                             "success": False,
-                            "reason": block_reason,
+                            "reason": "REAL_MODE_OPEN_ORDER_QUERY_FAILED",
                             "open_order_query_status": oq_status,
                             "open_order_query_supported": oq_supported,
                             "open_order_query_msg": oq_msg,
@@ -690,11 +685,35 @@ class OrderManager:
                             "cancel_replace_count": 0, "skip_count": 0,
                             "results": [], "mode": mode, "dry_run": dry_run,
                         }
-                    # MOCK + 사용자 허용 → 경고 후 진행 (정정 검증 불가)
-                    logger.warning(
-                        "미체결 주문 조회 %s (정정 검증 불가) — 사용자 허용으로 신규매도 진행 mode=%s",
-                        oq_status, mode,
-                    )
+                    elif oq_status == "UNSUPPORTED":
+                        # MOCK + UNSUPPORTED: KIS 모의투자 API 미지원 기능 → 자동 진행
+                        logger.warning(
+                            "MOCK 미체결 조회 UNSUPPORTED (KIS 모의투자 API 미지원) → 신규매도 자동 진행 msg=%s",
+                            oq_msg,
+                        )
+                    elif not proceed_without_open_order_check:
+                        # MOCK + ERROR + 사용자 미허용 → 차단
+                        logger.warning(
+                            "MOCK 미체결 주문 조회 ERROR → 전량매도 차단 msg=%s",
+                            oq_msg,
+                        )
+                        return {
+                            "success": False,
+                            "reason": "OPEN_ORDER_QUERY_ERROR",
+                            "open_order_query_status": oq_status,
+                            "open_order_query_supported": oq_supported,
+                            "open_order_query_msg": oq_msg,
+                            "total": 0, "success_count": 0, "fail_count": 0,
+                            "amend_count": 0, "new_sell_count": 0,
+                            "cancel_replace_count": 0, "skip_count": 0,
+                            "results": [], "mode": mode, "dry_run": dry_run,
+                        }
+                    else:
+                        # MOCK + ERROR + 사용자 허용 → 경고 후 진행
+                        logger.warning(
+                            "MOCK 미체결 주문 조회 ERROR — 사용자 허용으로 신규매도 진행 msg=%s",
+                            oq_msg,
+                        )
                 else:
                     for order in oq_result.get("orders", []):
                         code = order["stock_code"]
@@ -1029,7 +1048,7 @@ class OrderManager:
                 stock_name=stock_name,
                 price=float(current_price),
                 quantity=quantity,
-                current_positions={} if allow_additional_buy else self.pos_mgr.get_all_positions(),
+                current_positions={} if allow_additional_buy else self.pos_mgr.get_open_positions(),
             )
             if not approval.approved:
                 order_record["rejected_reason"] = f"RiskManager: {approval.reason}"
@@ -1065,7 +1084,7 @@ class OrderManager:
             stock_name=stock_name,
             price=float(current_price),
             quantity=quantity,
-            current_positions={} if allow_additional_buy else self.pos_mgr.get_all_positions(),
+            current_positions={} if allow_additional_buy else self.pos_mgr.get_open_positions(),
         )
         if not approval.approved:
             order_record["rejected_reason"] = f"RiskManager: {approval.reason}"

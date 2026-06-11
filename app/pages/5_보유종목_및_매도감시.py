@@ -388,9 +388,9 @@ with _opt_cols[2]:
 with _opt_cols[3]:
     opt_proceed_without_check = st.checkbox(
         "미체결 조회 실패해도 KIS 보유수량 기준 신규매도 진행",
-        value=False,
+        value=(sell_mode == "MOCK"),
         key="opt_proceed_without_open_order_check",
-        help="MOCK 전용. REAL은 미체결 조회 실패 시 항상 차단됨.",
+        help="MOCK: KIS 모의투자는 미체결 조회 미지원(UNSUPPORTED) → 자동 진행. REAL은 항상 차단.",
         disabled=(sell_mode == "REAL"),
     )
 
