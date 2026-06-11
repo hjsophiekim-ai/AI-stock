@@ -83,9 +83,18 @@ with top_cols[0]:
     if st.button("KIS 계좌 새로고침", use_container_width=True):
         st.session_state["broker_refresh"] = True
 with top_cols[1]:
-    if st.button("KIS 계좌와 로컬 포지션 동기화", use_container_width=True):
-        result = sync_broker_to_local(mode="mock")
-        st.success(result.get("message", "동기화 완료")) if result.get("success") else st.error(result.get("message", "동기화 실패"))
+    if st.button("KIS 계좌와 로컬 포지션 동기화 (누락 CLOSED처리)", use_container_width=True):
+        result = sync_broker_to_local(mode=config_mode.lower(), apply=True, close_missing=True)
+        if result.get("success"):
+            closed_n = result.get("closed_count", 0)
+            broker_n = result.get("broker_count", 0)
+            open_n = result.get("open_count", broker_n)
+            msg = f"동기화 완료: 브로커 {broker_n}개 → 로컬 OPEN {open_n}개"
+            if closed_n:
+                msg += f" ({closed_n}개 CLOSED 처리됨)"
+            st.success(msg)
+        else:
+            st.error(result.get("message", "동기화 실패"))
         st.rerun()
 with top_cols[2]:
     if st.button("시장강도 계산", use_container_width=True):
@@ -103,6 +112,13 @@ if "market_strength" in st.session_state:
 
 broker_pos = get_broker_positions()
 local_pos = get_positions_with_current_price()
+
+_open_local_count = sum(1 for p in local_pos if p.get("status", "OPEN") == "OPEN")
+if broker_pos and _open_local_count != len(broker_pos):
+    st.warning(
+        f"⚠️ KIS 계좌 보유종목 수({len(broker_pos)})와 로컬 OPEN 종목 수({_open_local_count})가 다릅니다. "
+        "'KIS 계좌와 로컬 포지션 동기화' 버튼으로 맞추세요."
+    )
 
 tab_local, tab_broker = st.tabs([f"로컬 positions.json ({len(local_pos)}개)", f"KIS 계좌 ({len(broker_pos)}개)"])
 

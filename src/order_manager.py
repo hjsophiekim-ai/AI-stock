@@ -151,13 +151,16 @@ class OrderManager:
         else:
             order_price = raw_price
 
-        # RiskManager 승인
+        # RiskManager 승인 — OPEN 포지션만 카운트 (CLOSED 종목으로 인한 오차 방지)
+        _open_pos = (self.pos_mgr.get_open_positions()
+                     if hasattr(self.pos_mgr, "get_open_positions")
+                     else self.pos_mgr.get_all_positions())
         approval = self.risk.approve_buy_order(
             stock_code=stock_code,
             stock_name=stock_name,
             price=current_price,
             quantity=quantity,
-            current_positions=self.pos_mgr.get_all_positions(),
+            current_positions=_open_pos,
             market_drop_rate=market_drop_rate,
         )
         if not approval.approved:

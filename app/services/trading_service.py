@@ -19,7 +19,10 @@ def get_positions() -> List[Dict]:
         from position_manager import PositionManager
         pm = PositionManager(str(PROJECT_ROOT / "config.yaml"))
         rows = []
-        for code, pos in pm.get_all_positions().items():
+        _open = pm.get_open_positions() if hasattr(pm, "get_open_positions") else {
+            k: v for k, v in pm.get_all_positions().items() if not getattr(v, "is_closed", False)
+        }
+        for code, pos in _open.items():
             rows.append({
                 "stock_code": code,
                 "stock_name": getattr(pos, "stock_name", ""),
@@ -84,12 +87,29 @@ def get_broker_positions() -> List[Dict]:
         return []
 
 
-def sync_broker_to_local(mode: str = "mock", strategy_id: str = "morning_0930") -> Dict:
+def sync_broker_to_local(
+    mode: str = "mock",
+    strategy_id: str = "morning_0930",
+    apply: bool = False,
+    close_missing: bool = False,
+) -> Dict:
     inject_to_os_env()
     try:
         from sync_broker_positions import sync_broker_positions
-        result = sync_broker_positions(mode=mode, strategy=strategy_id, config_path=str(PROJECT_ROOT / "config.yaml"))
-        return {"success": True, "message": f"{result.get('broker_count', 0)} positions synced", "synced": result.get("broker_count", 0), **result}
+        result = sync_broker_positions(
+            mode=mode,
+            strategy=strategy_id,
+            config_path=str(PROJECT_ROOT / "config.yaml"),
+            apply=apply,
+            close_missing=close_missing,
+        )
+        broker_n = result.get("broker_count", 0)
+        closed_n = result.get("closed_count", 0)
+        open_n = result.get("open_count", broker_n)
+        msg = f"브로커 {broker_n}개 동기화 → 로컬 OPEN {open_n}개"
+        if closed_n:
+            msg += f", {closed_n}개 CLOSED 처리"
+        return {"success": True, "message": msg, "synced": broker_n, **result}
     except Exception as e:
         return {"success": False, "message": str(e), "synced": 0}
 
