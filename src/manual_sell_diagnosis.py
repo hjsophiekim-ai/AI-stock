@@ -351,12 +351,17 @@ def run_open_order_check(
         tmp_path = _make_mode_config(mode, config_path) if mode == "mock" else config_path
         gate = SafetyGate(tmp_path, runtime_mode=mode)
         api = KISApiClient(tmp_path, gate=gate)
-        orders = api.get_open_orders(side="SELL")
+        oq = api.get_open_orders(side="SELL")
+        orders = oq.get("orders", [])
+        query_status = oq.get("query_status", "OK")
         result = {
             "run_at": datetime.now().isoformat(),
             "mode": mode.upper(),
             "open_sell_order_count": len(orders),
             "orders": orders,
+            "open_order_query_supported": oq.get("open_order_query_supported", True),
+            "query_status": query_status,
+            "query_msg": oq.get("query_msg", ""),
             "base_url": api._base_url,
         }
         if tmp_path != config_path:
@@ -371,6 +376,9 @@ def run_open_order_check(
             "mode": mode.upper(),
             "open_sell_order_count": 0,
             "orders": [],
+            "open_order_query_supported": False,
+            "query_status": "ERROR",
+            "query_msg": str(exc),
             "error": str(exc),
         }
 
@@ -381,6 +389,7 @@ def run_amend_unfilled_sell(
     cancel_replace_if_amend_fails: bool = True,
     config_path: str = "config.yaml",
     stock_code: str = None,
+    proceed_without_open_order_check: bool = False,
 ) -> Dict[str, Any]:
     """미체결 매도 주문 정정 (단일 종목 또는 전체)."""
     try:
@@ -393,6 +402,7 @@ def run_amend_unfilled_sell(
             amend_unfilled=True,
             cancel_replace_if_amend_fails=cancel_replace_if_amend_fails,
             dry_run=dry_run,
+            proceed_without_open_order_check=proceed_without_open_order_check,
         )
         if tmp_path != config_path:
             try:
@@ -533,6 +543,9 @@ def main() -> None:
     parser.add_argument("--cancel-replace-if-amend-fails", dest="cancel_replace_if_amend_fails",
                         action="store_true", default=True,
                         help="정정 실패 시 취소 후 재매도 (기본 활성)")
+    parser.add_argument("--proceed-without-open-order-check", dest="proceed_without_open_order_check",
+                        action="store_true", default=False,
+                        help="미체결 조회 실패/미지원 시에도 KIS 보유수량 기준 신규매도 진행 (MOCK 전용, REAL은 항상 차단)")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--json", action="store_true", help="JSON 출력")
     args = parser.parse_args()
@@ -546,11 +559,19 @@ def main() -> None:
     if args.check_open_orders and not args.all and not args.stock_code:
         result = run_open_order_check(mode=args.mode, config_path=args.config)
         orders = result.get("orders", [])
-        print(f"\n미체결 매도 주문 조회 결과: {len(orders)}건  mode={args.mode.upper()}")
+        query_status = result.get("query_status", "OK")
+        print(f"\n미체결 매도 주문 조회 결과: mode={args.mode.upper()} status={query_status}")
         print("-" * 60)
-        for o in orders:
-            print(f"  [{o.get('stock_code')}] {o.get('stock_name')} 원주문={o.get('original_order_no')} "
-                  f"미체결={o.get('unfilled_qty')}주 @ {o.get('order_price')}원 시각={o.get('order_time')}")
+        if query_status == "UNSUPPORTED":
+            print(f"  [UNSUPPORTED] 미체결 조회 미지원: {result.get('query_msg', '')}")
+            print(f"  → 미체결 0건이 아님. 정정 검증 불가.")
+        elif query_status == "ERROR":
+            print(f"  [ERROR] 미체결 조회 실패: {result.get('query_msg', '')}")
+        else:
+            print(f"  미체결 매도 주문: {len(orders)}건")
+            for o in orders:
+                print(f"  [{o.get('stock_code')}] {o.get('stock_name')} 원주문={o.get('original_order_no')} "
+                      f"미체결={o.get('unfilled_qty')}주 @ {o.get('order_price')}원 시각={o.get('order_time')}")
         if args.json:
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         return
@@ -562,24 +583,41 @@ def main() -> None:
 
         if args.check_open_orders:
             oo = run_open_order_check(mode=args.mode, config_path=args.config)
-            print(f"  미체결 매도 주문: {oo.get('open_sell_order_count', 0)}건")
-            for o in oo.get("orders", []):
-                print(f"    [{o.get('stock_code')}] {o.get('stock_name')} 미체결={o.get('unfilled_qty')}주")
+            oo_status = oo.get("query_status", "OK")
+            if oo_status == "UNSUPPORTED":
+                print(f"  [UNSUPPORTED] 미체결 조회 미지원: {oo.get('query_msg', '')}")
+                print(f"  → 정정 검증 불가. 미체결 0건과 다름.")
+                if args.mode.lower() == "real" or not args.proceed_without_open_order_check:
+                    print(f"  → 전량매도 차단. --proceed-without-open-order-check 플래그로 신규매도 허용 가능 (MOCK 전용).")
+                else:
+                    print(f"  → --proceed-without-open-order-check 허용됨. KIS 보유수량 기준 신규매도 진행.")
+            elif oo_status == "ERROR":
+                print(f"  [ERROR] 미체결 조회 실패: {oo.get('query_msg', '')}")
+            else:
+                print(f"  미체결 매도 주문: {oo.get('open_sell_order_count', 0)}건")
+                for o in oo.get("orders", []):
+                    print(f"    [{o.get('stock_code')}] {o.get('stock_name')} 미체결={o.get('unfilled_qty')}주")
 
         result = run_amend_unfilled_sell(
             mode=args.mode,
             dry_run=dry,
             cancel_replace_if_amend_fails=args.cancel_replace_if_amend_fails,
             config_path=args.config,
+            proceed_without_open_order_check=args.proceed_without_open_order_check,
         )
-        print(f"  완료: 총 {result.get('total', 0)}건 | "
-              f"성공 {result.get('success_count', 0)} | 실패 {result.get('fail_count', 0)} | "
-              f"정정 {result.get('amend_count', 0)} | 신규매도 {result.get('new_sell_count', 0)}")
-        for r in result.get("results", []):
-            op = r.get("operation_type", "")
-            ok = "OK" if r.get("success") else "FAIL"
-            print(f"    [{r.get('stock_code')}] {r.get('stock_name')} {op} → {ok} "
-                  f"new_price={r.get('new_price', '')} order_no={r.get('new_order_no', r.get('order_no', ''))}")
+        oq_st = result.get("open_order_query_status", "")
+        if oq_st in ("UNSUPPORTED", "ERROR") and not result.get("success"):
+            print(f"  [차단] 미체결 조회 {oq_st} → 전량매도 실행 안 됨: {result.get('reason', '')}")
+            print(f"  msg: {result.get('open_order_query_msg', '')}")
+        else:
+            print(f"  완료: 총 {result.get('total', 0)}건 | "
+                  f"성공 {result.get('success_count', 0)} | 실패 {result.get('fail_count', 0)} | "
+                  f"정정 {result.get('amend_count', 0)} | 신규매도 {result.get('new_sell_count', 0)}")
+            for r in result.get("results", []):
+                op = r.get("operation_type", "")
+                ok = "OK" if r.get("success") else "FAIL"
+                print(f"    [{r.get('stock_code')}] {r.get('stock_name')} {op} → {ok} "
+                      f"new_price={r.get('new_price', '')} order_no={r.get('new_order_no', r.get('order_no', ''))}")
         if args.json:
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         if result.get("fail_count", 0) > 0 and not dry:

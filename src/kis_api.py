@@ -703,7 +703,7 @@ class KISApiClient:
         self,
         side: Optional[str] = None,
         stock_code: Optional[str] = None,
-    ) -> List[Dict]:
+    ) -> Dict:
         """미체결(정정취소가능) 주문 조회.
 
         KIS 공식 문서 기준 재확인 필요:
@@ -715,13 +715,37 @@ class KISApiClient:
             stock_code: 종목코드 필터 (None이면 전체)
 
         Returns:
-            List[Dict] — stock_code, stock_name, order_no, original_order_no,
-            order_qty, unfilled_qty, order_price, side, order_time, order_status,
-            mode, base_url, key_type_used, raw_response
+            Dict — {
+              "orders": List[Dict],          # 미체결 주문 목록
+              "open_order_query_supported": bool,  # False=조회 미지원/오류
+              "query_status": str,           # "OK" | "UNSUPPORTED" | "ERROR" | "SKIPPED"
+              "query_msg": str,              # 오류/경고 메시지
+              "count": int,                  # 필터 후 건수
+              "mode": str,                   # MOCK | REAL | PAPER
+            }
+
+        IMPORTANT:
+          rt_cd=1 "모의투자에서는 해당업무가 제공되지 않습니다" → query_status="UNSUPPORTED"
+          이 경우는 미체결 0건과 다름 — 호출자가 반드시 구분해야 함.
         """
+        _unsupported_keywords = ("해당업무가 제공되지 않습니다", "해당 업무가 제공되지 않습니다")
+        _base = {
+            "open_order_query_supported": True,
+            "query_status": "OK",
+            "query_msg": "",
+            "count": 0,
+            "orders": [],
+            "mode": self.gate.mode,
+        }
+
         if not self.gate.is_mock_allowed():
             logger.warning("PAPER 모드에서는 미체결 조회 API를 호출할 수 없습니다.")
-            return []
+            return {
+                **_base,
+                "open_order_query_supported": False,
+                "query_status": "UNSUPPORTED",
+                "query_msg": "PAPER 모드: 미체결 조회 미지원",
+            }
 
         # KIS 공식 문서 확인 필요: VTTC8036R (모의) / TTTC8036R (실전)
         tr_id = "VTTC8036R" if self._use_mock else "TTTC8036R"
@@ -740,8 +764,50 @@ class KISApiClient:
                 params,
             )
         except Exception as exc:
-            logger.warning("미체결 주문 조회 실패 tr_id=%s: %s", tr_id, exc)
-            return []
+            exc_str = str(exc)
+            if any(kw in exc_str for kw in _unsupported_keywords):
+                logger.warning(
+                    "미체결 주문 조회 미지원(UNSUPPORTED) tr_id=%s: %s", tr_id, exc_str
+                )
+                return {
+                    **_base,
+                    "open_order_query_supported": False,
+                    "query_status": "UNSUPPORTED",
+                    "query_msg": exc_str,
+                }
+            logger.warning("미체결 주문 조회 실패 tr_id=%s: %s", tr_id, exc_str)
+            return {
+                **_base,
+                "open_order_query_supported": False,
+                "query_status": "ERROR",
+                "query_msg": exc_str,
+            }
+
+        # rt_cd != "0" 인 경우: 오류/미지원 판별
+        rt_cd = str(data.get("rt_cd", "0"))
+        raw_msg = str(data.get("msg1", "") or data.get("msg", "") or "")
+        if rt_cd != "0":
+            if any(kw in raw_msg for kw in _unsupported_keywords):
+                logger.warning(
+                    "미체결 주문 조회 미지원(UNSUPPORTED) tr_id=%s rt_cd=%s msg=%s",
+                    tr_id, rt_cd, raw_msg,
+                )
+                return {
+                    **_base,
+                    "open_order_query_supported": False,
+                    "query_status": "UNSUPPORTED",
+                    "query_msg": raw_msg,
+                }
+            logger.warning(
+                "미체결 주문 조회 오류(ERROR) tr_id=%s rt_cd=%s msg=%s",
+                tr_id, rt_cd, raw_msg,
+            )
+            return {
+                **_base,
+                "open_order_query_supported": False,
+                "query_status": "ERROR",
+                "query_msg": raw_msg,
+            }
 
         records = []
         for row in data.get("output", []):
@@ -792,7 +858,7 @@ class KISApiClient:
             "[미체결조회] tr_id=%s 총=%d건 side=%s stock=%s → 필터후=%d건",
             tr_id, len(data.get("output", [])), side or "ALL", stock_code or "ALL", len(records),
         )
-        return records
+        return {**_base, "orders": records, "count": len(records)}
 
     def amend_order(
         self,

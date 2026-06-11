@@ -384,16 +384,29 @@ def get_open_sell_orders(mode: str = "mock") -> Dict:
         CONFIG_PATH = str(PROJECT_ROOT / "config.yaml")
         gate = SafetyGate(CONFIG_PATH, runtime_mode=(mode or "mock").lower())
         api = KISApiClient(CONFIG_PATH, gate=gate)
-        orders = api.get_open_orders(side="SELL")
+        oq = api.get_open_orders(side="SELL")
+        orders = oq.get("orders", [])
+        query_status = oq.get("query_status", "OK")
         return {
-            "success": True,
+            "success": query_status == "OK",
             "count": len(orders),
             "orders": orders,
+            "open_order_query_supported": oq.get("open_order_query_supported", True),
+            "query_status": query_status,
+            "query_msg": oq.get("query_msg", ""),
             "mode": gate.mode,
             "base_url": api._base_url,
         }
     except Exception as e:
-        return {"success": False, "message": str(e), "count": 0, "orders": []}
+        return {
+            "success": False,
+            "message": str(e),
+            "count": 0,
+            "orders": [],
+            "open_order_query_supported": False,
+            "query_status": "ERROR",
+            "query_msg": str(e),
+        }
 
 
 def run_bulk_sell_with_amend(
@@ -403,6 +416,7 @@ def run_bulk_sell_with_amend(
     cancel_replace_if_amend_fails: bool = True,
     max_sell_slippage_pct: float = 1.0,
     dry_run: bool = False,
+    proceed_without_open_order_check: bool = False,
 ) -> Dict:
     """미체결 주문 정정 포함 전량 일괄매도."""
     inject_to_os_env()
@@ -418,6 +432,7 @@ def run_bulk_sell_with_amend(
             cancel_replace_if_amend_fails=cancel_replace_if_amend_fails,
             max_sell_slippage_pct=max_sell_slippage_pct,
             dry_run=dry_run,
+            proceed_without_open_order_check=proceed_without_open_order_check,
         )
         return result
     except Exception as e:

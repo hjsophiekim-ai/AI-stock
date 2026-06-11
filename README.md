@@ -1139,6 +1139,9 @@ python src/monitor_take_profit.py --mode mock --loop --sleep 5
 흐름:
   1. KIS 계좌 보유종목 조회
   2. KIS 미체결 매도 주문 조회 (TR: VTTC8036R/TTTC8036R)
+     → UNSUPPORTED: 모의투자 서버 미지원 → 기본 차단 (REAL은 항상 차단)
+     → ERROR: 조회 실패 → 기본 차단
+     → OK: 정상 조회
   3. 종목별 처리:
      A. 미체결 있음 → amend_order() 정정 (TR: VTTC0803U/TTTC0803U)
         정정 실패 → cancel_and_replace_sell_order() 취소 후 재주문
@@ -1148,6 +1151,37 @@ python src/monitor_take_profit.py --mode mock --loop --sleep 5
   5. 1~2초 대기 → KIS 계좌 동기화 (--apply --close-missing)
 ```
 
+### UNSUPPORTED 미체결 조회 처리 (중요)
+
+KIS MOCK 서버는 미체결 조회(VTTC8036R)를 지원하지 않을 수 있습니다.  
+이때 `rt_cd=1`, `msg=모의투자에서는 해당업무가 제공되지 않습니다` 응답이 옵니다.
+
+**이는 미체결 0건과 전혀 다릅니다.**
+
+| 상태 | 의미 | 기본 동작 |
+|---|---|---|
+| `query_status=OK` | 조회 성공 (0건 포함) | 정정/신규매도 정상 진행 |
+| `query_status=UNSUPPORTED` | 서버 미지원 | **전량매도 차단** |
+| `query_status=ERROR` | 조회 오류 | **전량매도 차단** |
+
+**REAL 모드**: 미체결 조회 실패 시 항상 차단됩니다.  
+**MOCK 모드**: `--proceed-without-open-order-check` 플래그로 차단 해제 가능.
+
+```bash
+# MOCK에서 미체결 조회 실패해도 KIS 보유수량 기준 신규매도 진행 (위험)
+python src/manual_sell_diagnosis.py --mode mock --all --dry-run \
+  --check-open-orders --amend-unfilled --proceed-without-open-order-check
+```
+
+### sell_orders CSV open_order_query 컬럼
+
+| 컬럼 | 설명 |
+|---|---|
+| `open_order_query_status` | OK / UNSUPPORTED / ERROR / SKIPPED |
+| `open_order_query_supported` | True/False |
+| `open_order_query_msg` | KIS 응답 메시지 |
+| `proceeded_without_open_order_check` | 조회 실패에도 진행했는지 여부 |
+
 ### CLI 명령
 
 ```bash
@@ -1155,7 +1189,7 @@ python src/monitor_take_profit.py --mode mock --loop --sleep 5
 python src/manual_sell_diagnosis.py --mode mock --check-open-orders
 
 # dry-run: 미체결 조회 + 정정 예정 목록 출력 (실제 주문 없음)
-python src/manual_sell_diagnosis.py --mode mock --all --dry-run --check-open-orders
+python src/manual_sell_diagnosis.py --mode mock --all --dry-run --check-open-orders --amend-unfilled
 
 # 미체결 정정 포함 전량 일괄매도 실행
 python src/manual_sell_diagnosis.py --mode mock --all --execute --amend-unfilled

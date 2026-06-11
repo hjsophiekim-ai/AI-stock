@@ -517,6 +517,8 @@ class OrderManager:
             "requested_mode", "resolved_mode", "base_url", "token_url",
             "key_type_used", "app_key_mode_valid", "mock_order_called", "real_order_called",
             "tr_id", "ord_dvsn", "rt_cd", "msg", "success", "rejected_reason", "reason",
+            "open_order_query_status", "open_order_query_supported",
+            "open_order_query_msg", "proceeded_without_open_order_check",
         ]
         rows = []
         now_str = datetime.now().isoformat()
@@ -577,6 +579,7 @@ class OrderManager:
         cancel_replace_if_amend_fails: bool = True,
         max_sell_slippage_pct: float = 1.0,
         dry_run: bool = False,
+        proceed_without_open_order_check: bool = False,
     ) -> Dict:
         """전량 일괄매도 (미체결 주문 정정/취소 후 재주문 포함).
 
@@ -616,36 +619,105 @@ class OrderManager:
                 "fail_count": 0, "amend_count": 0, "new_sell_count": len(results),
                 "cancel_replace_count": 0, "skip_count": 0,
                 "results": results, "mode": mode, "dry_run": dry_run,
+                "open_order_query_status": "SKIPPED",
+                "open_order_query_supported": False,
+                "open_order_query_msg": "PAPER 모드: 미체결 조회 미지원",
             }
 
         if self._api is None:
-            return {"success": False, "reason": "API 클라이언트 없음", "results": [], "mode": mode}
+            return {
+                "success": False, "reason": "API 클라이언트 없음",
+                "results": [], "mode": mode,
+                "open_order_query_status": "SKIPPED",
+                "open_order_query_supported": False,
+                "open_order_query_msg": "API 클라이언트 없음",
+            }
 
         # Step 1: KIS 계좌 보유종목 조회
         try:
             broker_df = self._api.get_positions()
         except Exception as exc:
-            return {"success": False, "reason": f"계좌 조회 실패: {exc}", "results": [], "mode": mode}
+            return {
+                "success": False, "reason": f"계좌 조회 실패: {exc}",
+                "results": [], "mode": mode,
+                "open_order_query_status": "SKIPPED",
+                "open_order_query_supported": True,
+                "open_order_query_msg": "",
+            }
 
         if broker_df is None or broker_df.empty:
             return {
                 "success": True, "total": 0, "success_count": 0, "fail_count": 0,
                 "amend_count": 0, "new_sell_count": 0, "cancel_replace_count": 0, "skip_count": 0,
                 "message": "KIS 계좌 보유종목 없음", "results": [], "mode": mode, "dry_run": dry_run,
+                "open_order_query_status": "SKIPPED",
+                "open_order_query_supported": True,
+                "open_order_query_msg": "",
             }
 
         # Step 2: KIS 미체결 매도 주문 조회
         open_sell_map: Dict[str, List[Dict]] = {}  # code → list of pending orders
+        oq_status = "SKIPPED"
+        oq_supported = True
+        oq_msg = ""
         if check_open_orders:
             try:
-                pending_list = self._api.get_open_orders(side="SELL")
-                for order in pending_list:
-                    code = order["stock_code"]
-                    if code not in open_sell_map:
-                        open_sell_map[code] = []
-                    open_sell_map[code].append(order)
+                oq_result = self._api.get_open_orders(side="SELL")
+                oq_status = oq_result.get("query_status", "OK")
+                oq_supported = oq_result.get("open_order_query_supported", True)
+                oq_msg = oq_result.get("query_msg", "")
+
+                if oq_status in ("UNSUPPORTED", "ERROR"):
+                    # REAL: 항상 차단 / MOCK: proceed_without_open_order_check=True일 때만 진행
+                    if mode == TRADE_MODE_REAL or not proceed_without_open_order_check:
+                        block_reason = (
+                            "REAL_MODE_OPEN_ORDER_QUERY_FAILED"
+                            if mode == TRADE_MODE_REAL
+                            else "OPEN_ORDER_QUERY_UNSUPPORTED"
+                        )
+                        logger.warning(
+                            "미체결 주문 조회 %s → 전량매도 차단 mode=%s msg=%s",
+                            oq_status, mode, oq_msg,
+                        )
+                        return {
+                            "success": False,
+                            "reason": block_reason,
+                            "open_order_query_status": oq_status,
+                            "open_order_query_supported": oq_supported,
+                            "open_order_query_msg": oq_msg,
+                            "total": 0, "success_count": 0, "fail_count": 0,
+                            "amend_count": 0, "new_sell_count": 0,
+                            "cancel_replace_count": 0, "skip_count": 0,
+                            "results": [], "mode": mode, "dry_run": dry_run,
+                        }
+                    # MOCK + 사용자 허용 → 경고 후 진행 (정정 검증 불가)
+                    logger.warning(
+                        "미체결 주문 조회 %s (정정 검증 불가) — 사용자 허용으로 신규매도 진행 mode=%s",
+                        oq_status, mode,
+                    )
+                else:
+                    for order in oq_result.get("orders", []):
+                        code = order["stock_code"]
+                        if code not in open_sell_map:
+                            open_sell_map[code] = []
+                        open_sell_map[code].append(order)
             except Exception as exc:
-                logger.warning("미체결 주문 조회 실패 (무시): %s", exc)
+                oq_status = "ERROR"
+                oq_supported = False
+                oq_msg = str(exc)
+                logger.warning("미체결 주문 조회 예외 mode=%s: %s", mode, exc)
+                if mode == TRADE_MODE_REAL or not proceed_without_open_order_check:
+                    return {
+                        "success": False,
+                        "reason": "OPEN_ORDER_QUERY_EXCEPTION",
+                        "open_order_query_status": oq_status,
+                        "open_order_query_supported": False,
+                        "open_order_query_msg": oq_msg,
+                        "total": 0, "success_count": 0, "fail_count": 0,
+                        "amend_count": 0, "new_sell_count": 0,
+                        "cancel_replace_count": 0, "skip_count": 0,
+                        "results": [], "mode": mode, "dry_run": dry_run,
+                    }
 
         order_session = self.calendar.get_market_session()
         diag_meta = self._api.diagnostic_metadata()
@@ -666,6 +738,12 @@ class OrderManager:
                 "resolved_mode": mode,
                 "mock_order_called": mode == TRADE_MODE_MOCK,
                 "real_order_called": mode == TRADE_MODE_REAL,
+                "open_order_query_status": oq_status,
+                "open_order_query_supported": oq_supported,
+                "open_order_query_msg": oq_msg,
+                "proceeded_without_open_order_check": (
+                    oq_status in ("UNSUPPORTED", "ERROR") and proceed_without_open_order_check
+                ),
                 **diag_meta,
             }
 
@@ -815,6 +893,9 @@ class OrderManager:
             "mode": mode,
             "dry_run": dry_run,
             "open_orders_checked": check_open_orders,
+            "open_order_query_status": oq_status,
+            "open_order_query_supported": oq_supported,
+            "open_order_query_msg": oq_msg,
         }
 
     # ------------------------------------------------------------------

@@ -43,6 +43,26 @@ def _show_bulk_result(result: dict, is_dry_run: bool = False) -> None:
     new_n = result.get("new_sell_count", 0)
     cancel_n = result.get("cancel_replace_count", 0)
     skip_n = result.get("skip_count", 0)
+    oq_status = result.get("open_order_query_status", "")
+    oq_msg = result.get("open_order_query_msg", "")
+
+    # 미체결 조회 상태 표시
+    if oq_status == "UNSUPPORTED":
+        st.warning(
+            f"⚠️ 미체결 주문 조회 미지원(UNSUPPORTED): {oq_msg or '해당업무가 제공되지 않습니다'}\n"
+            f"정정 검증 불가 — 미체결 0건과 다릅니다."
+        )
+    elif oq_status == "ERROR":
+        st.warning(f"⚠️ 미체결 주문 조회 오류(ERROR): {oq_msg}")
+
+    # 차단된 경우
+    if not result.get("success") and oq_status in ("UNSUPPORTED", "ERROR"):
+        st.error(
+            f"{prefix}미체결 조회 {oq_status} → 전량매도 차단\n"
+            f"사유: {result.get('reason', '')}\n"
+            f"'미체결 조회 실패해도 신규매도 진행' 체크 후 재시도 (MOCK 전용)."
+        )
+        return
 
     if result.get("success") or is_dry_run:
         st.success(
@@ -331,13 +351,21 @@ st.subheader("전량 일괄매도 (미체결 정정 포함)")
 _bulk_sell_disabled = (sell_mode == "REAL" and not real_sell_confirmed)
 
 # 옵션 체크박스
-_opt_cols = st.columns(3)
+_opt_cols = st.columns(4)
 with _opt_cols[0]:
     opt_check_open = st.checkbox("미체결 매도 주문 먼저 조회", value=True, key="opt_check_open_orders")
 with _opt_cols[1]:
     opt_amend = st.checkbox("미체결 주문은 현재가 기준 정정", value=True, key="opt_amend_unfilled")
 with _opt_cols[2]:
     opt_cancel_replace = st.checkbox("정정 실패 시 취소 후 재매도", value=True, key="opt_cancel_replace")
+with _opt_cols[3]:
+    opt_proceed_without_check = st.checkbox(
+        "미체결 조회 실패해도 KIS 보유수량 기준 신규매도 진행",
+        value=False,
+        key="opt_proceed_without_open_order_check",
+        help="MOCK 전용. REAL은 미체결 조회 실패 시 항상 차단됨.",
+        disabled=(sell_mode == "REAL"),
+    )
 
 # 미체결 주문 조회 버튼
 _bulk_btn_cols = st.columns(3)
@@ -345,7 +373,20 @@ with _bulk_btn_cols[0]:
     if st.button("🔍 미체결 주문 조회", use_container_width=True, key="btn_check_open_orders"):
         with st.spinner("KIS 미체결 매도 주문 조회 중..."):
             oo_result = get_open_sell_orders(mode=sell_mode.lower())
-        if oo_result.get("success"):
+        oo_qstatus = oo_result.get("query_status", "OK")
+        oo_qmsg = oo_result.get("query_msg", "")
+        if oo_qstatus == "UNSUPPORTED":
+            st.warning(
+                f"⚠️ 미체결 조회 미지원(UNSUPPORTED): {oo_qmsg or '해당업무가 제공되지 않습니다'}\n"
+                f"정정 검증 불가 — 미체결 0건과 다릅니다."
+            )
+            st.session_state["open_sell_orders"] = []
+            st.session_state["open_order_query_status"] = "UNSUPPORTED"
+        elif oo_qstatus == "ERROR":
+            st.error(f"미체결 조회 오류(ERROR): {oo_qmsg}")
+            st.session_state["open_sell_orders"] = []
+            st.session_state["open_order_query_status"] = "ERROR"
+        else:
             oo_list = oo_result.get("orders", [])
             if oo_list:
                 _oo_cols = ["stock_code", "stock_name", "order_no", "original_order_no",
@@ -356,11 +397,11 @@ with _bulk_btn_cols[0]:
                     use_container_width=True,
                 )
                 st.session_state["open_sell_orders"] = oo_list
+                st.session_state["open_order_query_status"] = "OK"
             else:
-                st.info("미체결 매도 주문 없음")
+                st.info("미체결 매도 주문 없음 (정상 0건)")
                 st.session_state["open_sell_orders"] = []
-        else:
-            st.error(f"조회 실패: {oo_result.get('message', '')}")
+                st.session_state["open_order_query_status"] = "OK"
 
 # 이전 조회 결과 표시
 if st.session_state.get("open_sell_orders"):
@@ -388,6 +429,7 @@ with _bulk_btn_cols[1]:
                 amend_unfilled=opt_amend,
                 cancel_replace_if_amend_fails=opt_cancel_replace,
                 dry_run=False,
+                proceed_without_open_order_check=opt_proceed_without_check,
             )
         _show_bulk_result(bulk_result)
 
@@ -405,6 +447,7 @@ with _bulk_btn_cols[2]:
                 amend_unfilled=opt_amend,
                 cancel_replace_if_amend_fails=opt_cancel_replace,
                 dry_run=True,
+                proceed_without_open_order_check=opt_proceed_without_check,
             )
         _show_bulk_result(dry_result, is_dry_run=True)
 
