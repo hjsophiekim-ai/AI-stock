@@ -306,6 +306,20 @@ single_mode = st.radio("주문 모드", ["PAPER", "MOCK", "REAL"], index=0, hori
 
 if single_mode == "REAL":
     real_order_warning()
+    # Safety flag check
+    import json as _json
+    _sflag_path = PROJECT_ROOT / "reports" / "real_order_safety_flag.json"
+    if _sflag_path.exists():
+        try:
+            _sflag = _json.load(open(_sflag_path, encoding="utf-8"))
+            if _sflag.get("blocked"):
+                st.error(
+                    f"⛔ 이전 실전 주문이 증권사 주문내역에서 검증되지 않았습니다.\n"
+                    f"주문번호: {_sflag.get('order_no', '?')}, 종목: {_sflag.get('stock_code', '?')}\n"
+                    f"추가 실전 주문이 차단됩니다. 파일 확인 후 삭제: reports/real_order_safety_flag.json"
+                )
+        except Exception:
+            pass
     real_ready = _render_real_conditions()
 else:
     real_ready = False
@@ -368,35 +382,44 @@ if submitted:
                 if single_mode == "MOCK":
                     st.warning("MOCK 개별 주문 테스트는 현재 PAPER 테스트 주문으로 기록합니다.")
                 result = run_paper_order(stock_code, stock_name, int(order_amount), int(order_price))
-        if result.get("success"):
-            st.success(f"주문 성공: {result.get('order_no', '')}")
+        _fill_status = result.get("fill_status", "") or (result.get("result", {}) or {}).get("fill_status", "")
+        _order_no = (result.get("result", {}) or {}).get("order_no", "") or result.get("order_no", "")
+        _order_verify_ok = result.get("order_verify_success", False) or result.get("order_found_in_broker", False)
+
+        if _fill_status == "FILLED":
+            st.success(f"주문 접수 및 체결 완료 — 주문번호 {_order_no}")
+        elif _fill_status in ("ACCEPTED_UNFILLED", "PARTIALLY_FILLED"):
+            label = "주문 접수됨 — 미체결 상태" if _fill_status == "ACCEPTED_UNFILLED" else "일부 체결됨 — 잔량 미체결"
+            st.warning(f"{label} — 주문번호 {_order_no}")
+        elif _fill_status == "SUBMITTED_UNVERIFIED":
+            st.error(
+                f"⚠️ 주문 전송 응답은 받았으나 증권사 주문내역에서 확인되지 않습니다.\n"
+                f"주문번호: {_order_no}\n"
+                f"추가 실전 주문을 중단하고 한국투자증권 앱에서 주문내역을 확인하세요."
+            )
+        elif _fill_status == "DRY_RUN_ONLY":
+            st.info(f"주문 미리보기 성공 — 실제 주문 없음")
+        elif _fill_status == "BLOCKED_BY_SAFETY_FLAG":
+            st.error("이전 실전 주문이 검증되지 않아 추가 실전 주문이 차단됩니다. reports/real_order_safety_flag.json을 확인하세요.")
+        elif result.get("success"):
+            st.success(f"주문 전송 완료 — 주문번호 {_order_no}")
         else:
             st.error(f"주문 실패: {result.get('rejected_reason') or result.get('reason') or result.get('message', '')}")
-            if single_mode == "REAL":
-                st.warning("주문번호가 없으면 실제 주문 접수 실패로 판단합니다. 한국투자증권 앱의 미체결/체결내역도 확인하세요.")
-                if st.button("실전 주문 실패 원인 진단", key="real_order_failure_diagnosis"):
-                    diagnosis = run_real_order_diagnosis(stock_code, int(quantity), int(order_price))
-                    st.write("진단 결과")
-                    st.json({
-                        "verdict": diagnosis.get("verdict"),
-                        "error_category": diagnosis.get("error_category"),
-                        "hashkey_generation_ok": diagnosis.get("hashkey_generation_ok"),
-                        "payload_validation_ok": diagnosis.get("payload_validation_ok"),
-                        "payload_errors": diagnosis.get("payload_errors"),
-                        "orderable_cash": diagnosis.get("orderable_cash"),
-                        "recent_order_check": diagnosis.get("recent_order_check"),
-                        "txt_path": diagnosis.get("txt_path"),
-                        "json_path": diagnosis.get("json_path"),
-                    })
-                verify_order_no = ""
-                if isinstance(result, dict):
-                    verify_order_no = (
-                        result.get("result", {}).get("order_no", "")
-                        if isinstance(result.get("result"), dict)
-                        else result.get("order_no", "")
-                    )
-                if st.button("실전 주문내역 확인", key="real_order_verify_after_failure"):
-                    st.json(run_real_order_verify(stock_code=stock_code, order_no=verify_order_no))
+
+        if single_mode == "REAL" and not _order_verify_ok and _order_no:
+            st.warning("주문번호가 있으나 증권사 주문내역 자동 검증에 실패했습니다. 한국투자증권 앱의 미체결/체결내역도 직접 확인하세요.")
+            if st.button("실전 주문 실패 원인 진단", key="real_order_failure_diagnosis"):
+                diagnosis = run_real_order_diagnosis(stock_code, int(quantity), int(order_price))
+                st.json({
+                    "verdict": diagnosis.get("verdict"),
+                    "error_category": diagnosis.get("error_category"),
+                    "hashkey_generation_ok": diagnosis.get("hashkey_generation_ok"),
+                    "payload_validation_ok": diagnosis.get("payload_validation_ok"),
+                    "payload_errors": diagnosis.get("payload_errors"),
+                    "orderable_cash": diagnosis.get("orderable_cash"),
+                })
+            if st.button("실전 주문내역 재확인", key="real_order_verify_after_failure"):
+                st.json(run_real_order_verify(stock_code=stock_code, order_no=_order_no))
         st.json(result)
 
 st.divider()

@@ -341,7 +341,7 @@ def run_real_order_diagnosis(stock_code: str, quantity: int = 1, price: int = 0)
         return {"success": False, "message": str(e)}
 
 
-def run_real_order_verify(stock_code: str = "", order_no: str = "") -> Dict:
+def run_real_order_verify(stock_code: str = "", order_no: str = "", raw_dump: bool = True) -> Dict:
     inject_to_os_env()
     try:
         from real_order_verify import run_real_order_verify as _run
@@ -349,6 +349,8 @@ def run_real_order_verify(stock_code: str = "", order_no: str = "") -> Dict:
             stock_code=stock_code,
             order_no=order_no,
             config_path=str(PROJECT_ROOT / "config.yaml"),
+            today=True,
+            raw_dump=raw_dump,
         )
     except Exception as e:
         return {"success": False, "message": str(e)}

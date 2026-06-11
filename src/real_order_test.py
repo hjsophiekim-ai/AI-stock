@@ -23,7 +23,41 @@ from safety_gate import SafetyGate
 from trading_calendar import SESSION_REGULAR
 from utils import ensure_dir
 
+_FILL_STATUS_FILLED = "FILLED"
+_FILL_STATUS_ACCEPTED_UNFILLED = "ACCEPTED_UNFILLED"
+_FILL_STATUS_PARTIALLY_FILLED = "PARTIALLY_FILLED"
+_FILL_STATUS_SUBMITTED_UNVERIFIED = "SUBMITTED_UNVERIFIED"
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+_SAFETY_FLAG_PATH = PROJECT_ROOT / "reports" / "real_order_safety_flag.json"
+
+
+def _save_safety_flag(order_no: str, stock_code: str, fill_status: str, msg: str) -> None:
+    """Save a safety flag to block subsequent REAL execute orders."""
+    ensure_dir(str(PROJECT_ROOT / "reports"))
+    flag = {
+        "blocked": True,
+        "reason": "SUBMITTED_UNVERIFIED",
+        "fill_status": fill_status,
+        "order_no": order_no,
+        "stock_code": stock_code,
+        "message": msg,
+        "created_at": datetime.now().isoformat(),
+    }
+    with open(_SAFETY_FLAG_PATH, "w", encoding="utf-8") as f:
+        json.dump(flag, f, ensure_ascii=False, indent=2)
+
+
+def _check_safety_flag() -> dict:
+    """Check if a safety flag exists that blocks REAL execute."""
+    if _SAFETY_FLAG_PATH.exists():
+        try:
+            with open(_SAFETY_FLAG_PATH, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
 
 def _normalize_code(code: str) -> str:
@@ -116,6 +150,16 @@ def run_real_order_test(
         "missing_conditions": ", ".join(readiness.get("missing_conditions", [])),
         "price_lookup_ok": price_lookup_ok,
         "price_lookup_error": price_lookup_error,
+        "fill_status": "",
+        "api_call_success": False,
+        "order_submit_success": False,
+        "order_verify_success": False,
+        "order_found_in_broker": False,
+        "success": "",
+        "KRX_FWDG_ORD_ORGNO": "",
+        "ODNO": "",
+        "ORD_TMD": "",
+        "order_time": "",
     }
 
     # 현재가 조회 실패 시 dry-run에서도 보고서 저장 후 반환 (프로그램 중단 없음)
@@ -141,6 +185,21 @@ def run_real_order_test(
         path = _save_result(row)
         row["report_path"] = path
         return {"success": False, "preview": row, "readiness": readiness, "report_path": path}
+
+    # Safety flag check — block execute if previous REAL order unverified
+    if execute:
+        safety = _check_safety_flag()
+        if safety.get("blocked"):
+            row["rejected_reason"] = (
+                f"이전 실전 주문이 증권사 주문내역에서 검증되지 않았습니다 "
+                f"(주문번호={safety.get('order_no', '?')}, 종목={safety.get('stock_code', '?')}). "
+                f"추가 실전 주문을 차단합니다. reports/real_order_safety_flag.json을 확인하세요."
+            )
+            row["fill_status"] = "BLOCKED_BY_SAFETY_FLAG"
+            row["success"] = False
+            path = _save_result(row)
+            row["report_path"] = path
+            return {"success": False, "preview": row, "readiness": readiness, "report_path": path, "blocked_by_safety_flag": True}
 
     gate = SafetyGate(config_path, runtime_mode="real")
     row["resolved_mode"] = gate.mode
@@ -189,12 +248,27 @@ def run_real_order_test(
         resp = api.place_cash_buy_order(code, int(quantity), order_price, "limit", order_session=SESSION_REGULAR)
         row["rt_cd"] = resp.get("rt_cd", "")
         row["msg"] = resp.get("msg1", resp.get("raw_msg", ""))
-        row["order_no"] = resp.get("output", {}).get("ODNO", "")
+        _output = resp.get("output") or {}
+        row["order_no"] = _output.get("ODNO", resp.get("ODNO", ""))
+        row["ODNO"] = _output.get("ODNO", "")
+        row["KRX_FWDG_ORD_ORGNO"] = _output.get("KRX_FWDG_ORD_ORGNO", "")
+        row["ORD_TMD"] = _output.get("ORD_TMD", "")
+        row["order_time"] = _output.get("ORD_TMD", "")
         row["http_status_code"] = resp.get("http_status_code", "")
         row["response_text"] = str(resp.get("response_text", ""))[:2000]
         row["response_json"] = json.dumps(resp.get("response_json", {}), ensure_ascii=False)[:2000]
         row["error_category"] = resp.get("error_category", "")
-        if row["rt_cd"] == "0" and not row["order_no"]:
+        row["api_call_success"] = True
+        if row["rt_cd"] == "0" and row["order_no"]:
+            row["order_submit_success"] = True
+            # Warn if order_price < current_price (지정가 매수가 현재가보다 낮으면 미체결 가능성 높음)
+            if current_price > 0 and order_price < current_price:
+                import warnings
+                warnings.warn(
+                    f"주의: 매수 지정가({order_price:,}원) < 현재가({current_price:,}원) → 즉시 체결 가능성 낮음",
+                    stacklevel=2,
+                )
+        elif row["rt_cd"] == "0" and not row["order_no"]:
             row["rejected_reason"] = "KIS response returned no order_no; real order receipt failed"
             row["error_category"] = row["error_category"] or "KIS_REAL_ORDER_REJECTED"
         elif row["rt_cd"] != "0":
@@ -202,19 +276,53 @@ def run_real_order_test(
     except Exception as ex:
         row["rejected_reason"] = str(ex)
 
+    import time as _time
+    _time.sleep(2)  # Give KIS time to register the order
     try:
-        verify = run_real_order_verify(stock_code=code, order_no=row["order_no"], config_path=config_path)
+        verify = run_real_order_verify(
+            stock_code=code,
+            order_no=row["order_no"],
+            config_path=config_path,
+            today=True,
+            raw_dump=True,
+        )
         row["verify_order_found"] = bool(verify.get("order_found"))
-        row["verify_csv_path"] = verify.get("csv_path", "")
+        row["order_verify_success"] = bool(verify.get("order_verify_success"))
+        row["order_found_in_broker"] = bool(verify.get("order_found_in_broker"))
+        row["fill_status"] = verify.get("fill_status", "SUBMITTED_UNVERIFIED")
+        row["verify_csv_path"] = verify.get("verify_csv_path", verify.get("csv_path", ""))
     except Exception as ex:
-        verify = {"success": False, "message": str(ex)}
+        verify = {"success": False, "message": str(ex), "fill_status": "SUBMITTED_UNVERIFIED"}
         row["verify_order_found"] = False
+        row["order_verify_success"] = False
+        row["fill_status"] = "SUBMITTED_UNVERIFIED"
+
+    # Determine success based on fill_status
+    fill_status = row.get("fill_status", "")
+    if fill_status in (_FILL_STATUS_FILLED, _FILL_STATUS_ACCEPTED_UNFILLED, _FILL_STATUS_PARTIALLY_FILLED):
+        success = True
+        row["success"] = True
+    elif row["order_submit_success"] and not row["order_verify_success"]:
+        success = False
+        row["success"] = False
+        row["rejected_reason"] = row.get("rejected_reason") or "SUBMITTED_UNVERIFIED: 주문 전송 응답 수신 — 주문내역 검증 실패"
+        # Save safety flag to block further REAL executes
+        _save_safety_flag(order_no=row["order_no"], stock_code=code, fill_status=fill_status, msg=row["rejected_reason"])
+    elif row["rt_cd"] == "0" and row["order_no"] and not fill_status:
+        success = True
+        row["success"] = True
+        row["fill_status"] = "ACCEPTED_UNFILLED"
+    else:
+        success = bool(row["rt_cd"] == "0" and row["order_no"])
+        row["success"] = success
 
     path = _save_result(row)
     row["report_path"] = path
-    success = row["rt_cd"] == "0" and bool(row["order_no"])
     return {
         "success": success,
+        "fill_status": row.get("fill_status", ""),
+        "order_verify_success": row.get("order_verify_success", False),
+        "order_found_in_broker": row.get("order_found_in_broker", False),
         "result": row,
         "readiness": readiness,
         "dry_run_payload": preview,

@@ -1477,7 +1477,7 @@ class KISApiClient:
             "SLL_BUY_DVSN_CD": "00",
             "INQR_DVSN": "00",
             "PDNO": "",
-            "CCLD_DVSN": "01",
+            "CCLD_DVSN": "00",
             "ORD_GNO_BRNO": "",
             "ODNO": order_no,
             "INQR_DVSN_3": "00",
@@ -1490,6 +1490,53 @@ class KISApiClient:
             tr_id,
             params,
         )
+
+    def get_today_orders(
+        self,
+        ccld_dvsn: str = "00",
+        order_no: str = "",
+        stock_code: str = "",
+    ) -> Dict:
+        """당일 주문 조회 (전체/체결/미체결 선택 가능).
+
+        Args:
+            ccld_dvsn: "00"=전체, "01"=체결완료, "02"=미체결
+            order_no: 주문번호 필터 (빈 문자열=전체)
+            stock_code: 종목코드 필터 (빈 문자열=전체)
+        """
+        tr_id = "VTTC8001R" if self._use_mock else "TTTC8001R"
+        from datetime import datetime
+        today = datetime.now().strftime("%Y%m%d")
+        params = {
+            "CANO": self._account_no,
+            "ACNT_PRDT_CD": self._product_code,
+            "INQR_STRT_DT": today,
+            "INQR_END_DT": today,
+            "SLL_BUY_DVSN_CD": "00",
+            "INQR_DVSN": "00",
+            "PDNO": stock_code or "",
+            "CCLD_DVSN": ccld_dvsn,
+            "ORD_GNO_BRNO": "",
+            "ODNO": order_no or "",
+            "INQR_DVSN_3": "00",
+            "INQR_DVSN_1": "",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        result = self._get(
+            "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+            tr_id,
+            params,
+        )
+        result["_query_params"] = {
+            "endpoint": "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+            "tr_id": tr_id,
+            "ccld_dvsn": ccld_dvsn,
+            "order_no": order_no,
+            "stock_code": stock_code,
+            "date": today,
+        }
+        return result
 
     def get_filled_orders(self) -> pd.DataFrame:
         """오늘 체결 내역 조회.

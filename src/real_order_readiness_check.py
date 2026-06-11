@@ -99,12 +99,33 @@ def run_readiness_check(config_path: str = "config.yaml", call_real_api: bool = 
             except Exception:
                 pass
 
+    # Safety flag check
+    safety_flag_path = PROJECT_ROOT / "reports" / "real_order_safety_flag.json"
+    safety_flag_blocked = False
+    safety_flag_info = {}
+    if safety_flag_path.exists():
+        try:
+            import json as _json
+            with open(safety_flag_path, encoding="utf-8") as f:
+                safety_flag_info = _json.load(f)
+            safety_flag_blocked = bool(safety_flag_info.get("blocked"))
+        except Exception:
+            safety_flag_blocked = False
+    checks["safety_flag_clear"] = not safety_flag_blocked
+    checks["safety_flag_info"] = safety_flag_info if safety_flag_blocked else {}
+
+    missing = checks.get("missing_conditions", [])
+    if safety_flag_blocked:
+        missing.append("SAFETY_FLAG: 이전 실전 주문이 검증되지 않음 — reports/real_order_safety_flag.json 확인 후 삭제")
+    checks["missing_conditions"] = missing
+
     ready = (
         checks["real_api_key"]
         and checks["real_token"]
         and checks["real_balance"]
         and checks["orderable_cash"]
         and all(conditions.values())
+        and not safety_flag_blocked
     )
     checks["verdict"] = "READY_FOR_REAL_SINGLE_TEST" if ready else "NOT_READY"
     return checks
