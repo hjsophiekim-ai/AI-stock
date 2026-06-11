@@ -430,7 +430,25 @@ with tab_real:
                 st.success(f"REAL 준비 완료 — {_r.get('message', '')}")
                 _real_readiness_ok = True
             else:
-                st.error(f"⛔ REAL 준비 실패 — 매도/정정 버튼 비활성화\n{_r.get('message', '')}")
+                st.error(f"⛔ REAL 준비 실패 — {_r.get('message', '')}")
+                with st.expander("상세 진단 보기"):
+                    _d = _r.get("details", {})
+                    st.markdown(f"""
+| 항목 | 결과 |
+|------|------|
+| KIS_REAL_APP_KEY | {'✅' if _d.get('real_api_key') else '❌'} {_d.get('real_api_key_masked','')} |
+| KIS_ACCOUNT_NO | {'✅' if _d.get('real_api_key') else '❌'} {_d.get('real_account_masked','')} |
+| 토큰 발급 | {'✅' if _d.get('real_token') else '❌'} |
+| 계좌 조회 | {'✅' if _d.get('real_balance') else '❌'} HTTP={_d.get('http_status_code','')} |
+| 주문가능금액 | {'✅' if _d.get('orderable_cash') else '❌'} {_d.get('orderable_cash_amount',0):,}원 |
+""")
+                    if _d.get("real_api_error"):
+                        st.code(_d.get("real_api_error", "")[:300], language="text")
+                    missing = _d.get("missing_conditions", [])
+                    if missing:
+                        st.warning("미충족 조건: " + ", ".join(missing))
+                    if not _d.get("real_api_key"):
+                        st.info("→ 1_API_설정 페이지에서 REAL 키(KIS_REAL_APP_KEY, KIS_REAL_APP_SECRET, KIS_ACCOUNT_NO)를 입력하세요.")
         else:
             st.info("REAL 준비상태 확인 버튼을 눌러주세요.")
     with _real_col2:

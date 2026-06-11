@@ -516,17 +516,27 @@ def check_real_readiness() -> Dict:
     inject_to_os_env()
     try:
         from real_order_readiness_check import run_readiness_check
+        import importlib, sys
+        # 장시간 실행된 Streamlit 프로세스에서 stale 모듈 캐시 방지
+        if "real_order_readiness_check" in sys.modules:
+            importlib.reload(sys.modules["real_order_readiness_check"])
         result = run_readiness_check(config_path=str(PROJECT_ROOT / "config.yaml"), call_real_api=True)
         verdict = result.get("verdict", "NOT_READY")
         ready = verdict == "READY_FOR_REAL_SINGLE_TEST"
         msg_parts = []
         if not result.get("real_api_key"):
-            msg_parts.append("API 키 없음")
+            masked = result.get("real_api_key_masked", "")
+            if masked:
+                msg_parts.append(f"API 키 불완전(키={masked}, KIS_REAL_APP_SECRET/KIS_ACCOUNT_NO 확인 필요)")
+            else:
+                msg_parts.append("API 키 없음 (1_API_설정 페이지에서 REAL 키 입력 필요)")
         if not result.get("real_token"):
-            msg_parts.append("토큰 발급 실패")
-        if not result.get("real_balance"):
-            msg_parts.append(f"계좌조회 실패 HTTP={result.get('http_status_code','?')}")
-        if not result.get("orderable_cash"):
+            msg_parts.append(f"토큰 발급 실패 — {result.get('real_api_error', '')[:80]}")
+        if result.get("real_token") and not result.get("real_balance"):
+            http = result.get("http_status_code", "?")
+            err = result.get("real_api_error", "")[:80]
+            msg_parts.append(f"계좌조회 실패 HTTP={http} {err}")
+        if result.get("real_balance") and not result.get("orderable_cash"):
             msg_parts.append("주문가능금액 확인 실패")
         missing = result.get("missing_conditions", [])
         if missing:

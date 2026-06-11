@@ -110,20 +110,21 @@ def check_real_keys() -> Dict[str, bool]:
 def inject_to_os_env(env_path: Optional[str] = None) -> Dict[str, object]:
     """현재 .env 값을 os.environ에 주입하고 키 존재 여부를 반환.
 
-    중요: KIS_MOCK_APP_KEY / KIS_MOCK_APP_SECRET / KIS_REAL_APP_KEY / KIS_REAL_APP_SECRET은
-    절대 오버라이드하지 않는다. 각 모드별 전용 키가 항상 올바른 값을 유지해야 한다.
-    전체 키 값은 절대 출력하지 않는다.
+    .env 파일이 API 키의 최종 출처입니다. .env에 값이 있으면 항상 주입합니다.
+    Streamlit 장시간 실행 시 os.environ 캐시 문제를 방지하기 위해 override=True 사용.
+    전체 키 값은 절대 출력하지 않습니다.
     """
     try:
         from dotenv import load_dotenv as _load_dotenv
         target = Path(env_path) if env_path else ENV_PATH
-        _load_dotenv(target, override=False)
+        _load_dotenv(target, override=True)
     except Exception:
         pass
 
     env = load_env()
     for k, v in env.items():
-        os.environ.setdefault(k, v)
+        if v:  # .env에 실제 값이 있을 때만 os.environ 갱신
+            os.environ[k] = v
 
     check_keys = [
         "KIS_MOCK_APP_KEY", "KIS_MOCK_APP_SECRET",

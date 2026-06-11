@@ -1,0 +1,11 @@
+{
+  "real_trade_confirmed": true,
+  "confirmed_at": "2026-06-11T16:51:28.929470",
+  "confirmation_date": "20260611",
+  "confirm_live_trade": true,
+  "allow_real_bulk_order": true,
+  "understand_real_money": true,
+  "understand_no_profit_guarantee": true,
+  "understand_order_may_be_unfilled": true,
+  "understand_user_responsibility": true
+}

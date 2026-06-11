@@ -42,7 +42,7 @@ def _real_api_config_path(config_path: str) -> str:
 
 
 def run_readiness_check(config_path: str = "config.yaml", call_real_api: bool = True) -> dict:
-    load_dotenv(PROJECT_ROOT / ".env")
+    load_dotenv(PROJECT_ROOT / ".env", override=True)
     cfg = load_config(config_path)
     gate = SafetyGate(config_path, runtime_mode="real")
     conditions = gate.get_real_order_conditions()
