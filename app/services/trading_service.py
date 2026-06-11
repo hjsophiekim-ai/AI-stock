@@ -575,11 +575,12 @@ def get_real_bulk_buy_readiness(
     # 5. 금액한도
     budget_within_limit = (planned_total_amount <= max_amount) if planned_total_amount > 0 else True
 
-    # 6. real_bulk_enabled (config)
+    # 6. real_bulk_enabled (config) — only check allow_bulk_buy_after_api_confirmation
+    # NOTE: safety.block_real_bulk_order is intentionally excluded here; it is
+    # a legacy global kill-switch that should not suppress the UI readiness check.
     real_bulk_enabled = (
         real_trade_cfg.get("allow_bulk_buy_after_api_confirmation", True)
         and real_trade_cfg.get("enabled", True)
-        and not cfg.get("safety", {}).get("block_real_bulk_order", False)
     )
 
     # 7. 사용자 최종확인
