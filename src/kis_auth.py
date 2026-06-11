@@ -106,6 +106,92 @@ def get_kis_credentials(mode: str) -> dict:
     }
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 모듈 레벨 토큰 유틸리티 (앱/CLI에서 KISAuth 인스턴스 없이 사용)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_token_cache_path(mode: str = "mock") -> str:
+    """mode별 토큰 캐시 파일 경로 반환."""
+    creds = get_kis_credentials(mode)
+    return creds.get("token_cache_file") or ""
+
+
+def get_token_status(mode: str = "mock") -> Dict:
+    """토큰 캐시 상태 조회 — 토큰 원문 절대 반환 안 함."""
+    mode_u = (mode or "mock").strip().upper()
+    creds = get_kis_credentials(mode_u)
+    cache_file = creds.get("token_cache_file") or ""
+    account_no = creds.get("account_no", "")
+    result: Dict = {
+        "mode": mode_u,
+        "token_cache_file": cache_file,
+        "app_key_masked": creds.get("appkey_fingerprint", ""),
+        "account_masked": fingerprint_key(account_no),
+        "cache_exists": False,
+        "expires_at": None,
+        "expires_at_str": "",
+        "is_expired": True,
+        "remaining_seconds": 0,
+        "token_present": False,
+    }
+    if not cache_file:
+        return result
+    cache_path = Path(cache_file)
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as _f:
+                cache = json.load(_f)
+            expires_at = float(cache.get("expires_at", 0))
+            token = cache.get("access_token", "")
+            remaining = expires_at - time.time()
+            import datetime as _dt
+            result["cache_exists"] = True
+            result["expires_at"] = expires_at
+            result["expires_at_str"] = _dt.datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M:%S") if expires_at else ""
+            result["is_expired"] = remaining <= 0
+            result["remaining_seconds"] = max(0, int(remaining))
+            result["token_present"] = bool(token)
+        except Exception as exc:
+            result["cache_read_error"] = str(exc)
+    return result
+
+
+def delete_token_cache(mode: str = "mock") -> bool:
+    """해당 mode의 토큰 캐시 파일만 삭제. True=삭제됨, False=파일 없음."""
+    cache_file = get_token_cache_path(mode)
+    if not cache_file:
+        return False
+    cache_path = Path(cache_file)
+    if cache_path.exists():
+        cache_path.unlink()
+        logger.info("Token cache deleted: %s (mode=%s)", cache_file, mode)
+        return True
+    return False
+
+
+def refresh_token(mode: str = "mock") -> Dict:
+    """해당 mode의 캐시 삭제 후 새 토큰 발급. 토큰 원문 반환 안 함."""
+    delete_token_cache(mode)
+    try:
+        auth = KISAuth(runtime_mode=mode)
+        token = auth._request_new_token()
+        status = get_token_status(mode)
+        return {"success": bool(token), "mode": (mode or "mock").upper(), "token_refreshed": True, **status}
+    except Exception as exc:
+        logger.error("refresh_token failed mode=%s: %s", mode, exc)
+        return {"success": False, "mode": (mode or "mock").upper(), "token_refreshed": False, "error": str(exc)}
+
+
+def get_token(mode: str = "mock", force_refresh: bool = False) -> str:
+    """캐시 우선, force_refresh=True이면 캐시 삭제 후 새로 발급. 토큰 문자열 반환."""
+    if force_refresh:
+        delete_token_cache(mode)
+    auth = KISAuth(runtime_mode=mode)
+    return auth.get_access_token()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+
 def validate_final_order_headers(
     mode: str,
     headers: Dict[str, str],

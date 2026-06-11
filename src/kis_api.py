@@ -360,8 +360,14 @@ class KISApiClient:
 
     @staticmethod
     def _is_token_expired_response(data: Dict) -> bool:
+        msg_cd = str(data.get("msg_cd", ""))
         msg = " ".join(str(data.get(k, "")) for k in ("msg1", "msg_cd", "message", "error_description"))
-        return "기간이 만료된 token" in msg or "만료된 token" in msg or "expired token" in msg.lower()
+        return (
+            msg_cd == "EGW00123"
+            or "기간이 만료된 token" in msg
+            or "만료된 token" in msg
+            or "expired token" in msg.lower()
+        )
 
     @staticmethod
     def _is_wrong_app_key_response(data: Dict) -> bool:

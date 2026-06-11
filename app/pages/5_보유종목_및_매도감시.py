@@ -30,6 +30,9 @@ from trading_service import (
     run_market_strength,
     run_sell_order,
     sync_broker_to_local,
+    refresh_kis_token,
+    check_kis_connection,
+    get_kis_token_status,
 )
 from mode_badge import render_mode_badge, render_mode_warning
 from warning_box import no_profit_guarantee_notice, real_order_warning
@@ -325,8 +328,35 @@ with tab_mock:
     st.caption("한국투자증권 모의투자 계좌 기준 보유종목입니다. API URL: openapivts | key: KIS_MOCK_APP_KEY")
     st.caption("포지션 파일: data/positions_mock.json | 브로커 캐시: data/broker_positions_mock.json")
 
-    _mock_top = st.columns(4)
+    # 토큰 상태 표시
+    _mock_ts5 = get_kis_token_status("mock")
+    if _mock_ts5.get("cache_exists") and not _mock_ts5.get("is_expired"):
+        _rem5 = _mock_ts5.get("remaining_seconds", 0)
+        st.caption(f"MOCK 토큰: ✅ 유효 (남은 시간 {_rem5 // 3600}h {(_rem5 % 3600) // 60}m)")
+    elif _mock_ts5.get("cache_exists") and _mock_ts5.get("is_expired"):
+        st.warning("MOCK 토큰이 만료되었습니다. 'MOCK 토큰 새로 발급'을 먼저 눌러주세요.")
+    else:
+        st.caption("MOCK 토큰: ❌ 없음 — MOCK 토큰 새로 발급 버튼을 눌러주세요.")
+
+    _mock_top = st.columns(6)
     with _mock_top[0]:
+        if st.button("MOCK 토큰 새로 발급", use_container_width=True, key="mock_token_refresh5"):
+            with st.spinner("MOCK 토큰 발급 중..."):
+                _tr = refresh_kis_token("mock")
+            if _tr.get("success"):
+                st.info(f"MOCK 토큰 발급 완료 | {_tr.get('expires_at_str', '')}")
+            else:
+                st.error(f"MOCK 토큰 발급 실패: {_tr.get('error', '')}")
+            st.rerun()
+    with _mock_top[1]:
+        if st.button("MOCK 연결 확인", use_container_width=True, key="mock_conn_check5"):
+            with st.spinner("MOCK 연결 확인 중..."):
+                _cr = check_kis_connection("mock")
+            if _cr.get("connection_ok"):
+                st.success("MOCK 연결 OK")
+            else:
+                st.error(f"MOCK 연결 실패: {_cr.get('error', '')}")
+    with _mock_top[2]:
         if st.button("KIS MOCK 계좌 새로고침", use_container_width=True, key="mock_refresh"):
             with st.spinner("KIS MOCK 계좌 조회 중..."):
                 _refresh_result = get_broker_positions_result(mode="mock")
@@ -337,7 +367,7 @@ with tab_mock:
                 st.session_state["mock_broker_pos"] = []
                 st.session_state["mock_broker_error"] = _refresh_result.get("message", "알 수 없는 오류")
             st.rerun()
-    with _mock_top[1]:
+    with _mock_top[3]:
         if st.button("MOCK 계좌 동기화 (누락 CLOSED처리)", use_container_width=True, key="mock_sync"):
             result = sync_broker_to_local(mode="mock", apply=True, close_missing=True)
             if result.get("success"):
@@ -345,10 +375,10 @@ with tab_mock:
             else:
                 st.error(result.get("message", "MOCK 동기화 실패"))
             st.rerun()
-    with _mock_top[2]:
+    with _mock_top[4]:
         if st.button("시장강도 계산", use_container_width=True, key="mock_market_strength"):
             st.session_state["market_strength"] = run_market_strength()
-    with _mock_top[3]:
+    with _mock_top[5]:
         if st.button("매도감시 루프 명령어", use_container_width=True, key="mock_cmd"):
             st.code("python src/monitor_take_profit.py --mode mock --loop --sleep 5", language="bash")
 
@@ -418,6 +448,35 @@ with tab_real:
     st.caption("한국투자증권 실전 계좌 기준 보유종목입니다. API URL: openapi | key: KIS_REAL_APP_KEY")
     st.caption("포지션 파일: data/positions_real.json | 브로커 캐시: data/broker_positions_real.json")
 
+    # 토큰 상태 표시
+    _real_ts5 = get_kis_token_status("real")
+    if _real_ts5.get("cache_exists") and not _real_ts5.get("is_expired"):
+        _rrem5 = _real_ts5.get("remaining_seconds", 0)
+        st.caption(f"REAL 토큰: ✅ 유효 (남은 시간 {_rrem5 // 3600}h {(_rrem5 % 3600) // 60}m)")
+    elif _real_ts5.get("cache_exists") and _real_ts5.get("is_expired"):
+        st.warning("REAL 토큰이 만료되었습니다. 'REAL 토큰 새로 발급'을 먼저 눌러주세요.")
+    else:
+        st.caption("REAL 토큰: ❌ 없음 — REAL 토큰 새로 발급 버튼을 눌러주세요.")
+
+    _real_token_cols = st.columns(2)
+    with _real_token_cols[0]:
+        if st.button("REAL 토큰 새로 발급", use_container_width=True, key="real_token_refresh5"):
+            with st.spinner("REAL 토큰 발급 중..."):
+                _tr = refresh_kis_token("real")
+            if _tr.get("success"):
+                st.info(f"REAL 토큰 발급 완료 | {_tr.get('expires_at_str', '')}")
+            else:
+                st.error(f"REAL 토큰 발급 실패: {_tr.get('error', '')}")
+            st.rerun()
+    with _real_token_cols[1]:
+        if st.button("REAL 연결 확인", use_container_width=True, key="real_conn_check5"):
+            with st.spinner("REAL 연결 확인 중..."):
+                _cr = check_kis_connection("real")
+            if _cr.get("connection_ok"):
+                st.success("REAL 연결 OK")
+            else:
+                st.error(f"REAL 연결 실패: {_cr.get('error', '')}")
+
     # REAL readiness check
     if "real_readiness_sell" not in st.session_state:
         st.session_state["real_readiness_sell"] = None
@@ -450,12 +509,7 @@ with tab_real:
                     if not _d.get("real_api_key"):
                         st.info("→ 1_API_설정 페이지에서 REAL 키(KIS_REAL_APP_KEY, KIS_REAL_APP_SECRET, KIS_ACCOUNT_NO)를 입력하세요.")
         else:
-            st.info("REAL 준비상태 확인 버튼을 눌러주세요.")
-    with _real_col2:
-        if st.button("REAL 준비상태 확인", key="btn_real_readiness_sell"):
-            with st.spinner("REAL API 계좌조회 확인 중..."):
-                st.session_state["real_readiness_sell"] = check_real_readiness()
-            st.rerun()
+            st.info("아래 'REAL 준비상태 확인' 버튼을 눌러주세요.")
 
     # Safety flag
     import json as _json5
@@ -469,8 +523,13 @@ with tab_real:
         except Exception:
             pass
 
-    _real_top = st.columns(4)
+    _real_top = st.columns(5)
     with _real_top[0]:
+        if st.button("REAL 준비상태 확인", use_container_width=True, key="btn_real_readiness_sell2"):
+            with st.spinner("REAL API 계좌조회 확인 중..."):
+                st.session_state["real_readiness_sell"] = check_real_readiness()
+            st.rerun()
+    with _real_top[1]:
         if st.button("KIS REAL 계좌 새로고침", use_container_width=True, key="real_refresh", disabled=not _real_readiness_ok):
             with st.spinner("KIS REAL 계좌 조회 중..."):
                 _real_refresh_result = get_broker_positions_result(mode="real")
@@ -481,11 +540,11 @@ with tab_real:
                 st.session_state["real_broker_pos"] = []
                 st.session_state["real_broker_error"] = _real_refresh_result.get("message", "알 수 없는 오류")
             st.rerun()
-    with _real_top[1]:
+    with _real_top[2]:
         if st.button("REAL 계좌 동기화 (조회만)", use_container_width=True, key="real_sync_dry", disabled=not _real_readiness_ok):
             result = sync_broker_to_local(mode="real", apply=False, close_missing=False)
             st.json(result)
-    with _real_top[2]:
+    with _real_top[3]:
         if st.button("REAL 계좌 동기화 (적용)", use_container_width=True, key="real_sync_apply", disabled=not _real_readiness_ok):
             _rc2a = st.checkbox("REAL 포지션 파일 변경 확인", key="real_sync_confirm2")
             if _rc2a:
@@ -495,7 +554,7 @@ with tab_real:
                 else:
                     st.error(result.get("message", "REAL 동기화 실패"))
                 st.rerun()
-    with _real_top[3]:
+    with _real_top[4]:
         if st.button("매도감시 루프 명령어", use_container_width=True, key="real_cmd"):
             st.code("python src/monitor_take_profit.py --mode real --loop --sleep 5", language="bash")
 

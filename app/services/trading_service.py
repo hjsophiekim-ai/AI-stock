@@ -556,6 +556,145 @@ def check_real_readiness() -> Dict:
         }
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# KIS 토큰 / 연결 / 계좌 서비스 함수 (앱 UI에서 호출)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_kis_token_status(mode: str = "mock") -> Dict:
+    """토큰 캐시 상태 조회 (토큰 원문 미포함)."""
+    inject_to_os_env()
+    try:
+        from kis_auth import get_token_status
+        return get_token_status(mode)
+    except Exception as exc:
+        return {"success": False, "mode": (mode or "mock").upper(), "error": str(exc)}
+
+
+def refresh_kis_token(mode: str = "mock") -> Dict:
+    """해당 mode 토큰 캐시 삭제 후 새 토큰 발급."""
+    inject_to_os_env()
+    try:
+        from kis_auth import refresh_token
+        result = refresh_token(mode)
+        return result
+    except Exception as exc:
+        return {"success": False, "mode": (mode or "mock").upper(), "token_refreshed": False, "error": str(exc)}
+
+
+def check_kis_connection(mode: str = "mock") -> Dict:
+    """현재가 조회로 KIS API 연결 가능 여부 확인 (가벼운 1회 호출)."""
+    inject_to_os_env()
+    try:
+        from api_service import _get_api_client
+        api = _get_api_client(runtime_mode=mode)
+        result = api.get_current_price("005930")
+        # get_current_price returns {"current_price": int, ...} or {"output": {...}, ...}
+        connection_ok = bool(result and (result.get("current_price") or result.get("output")))
+        return {"success": connection_ok, "mode": (mode or "mock").upper(), "connection_ok": connection_ok}
+    except Exception as exc:
+        return {"success": False, "mode": (mode or "mock").upper(), "connection_ok": False, "error": str(exc)}
+
+
+def check_kis_account(mode: str = "mock") -> Dict:
+    """계좌 보유종목/잔고 조회."""
+    inject_to_os_env()
+    try:
+        from api_service import _get_api_client
+        api = _get_api_client(runtime_mode=mode)
+        bal = api.get_account_balance()
+        account_ok = isinstance(bal, dict) and bool(bal.get("output1") or bal.get("output2"))
+        broker_count = 0
+        if account_ok:
+            out1 = bal.get("output1", [])
+            if isinstance(out1, list):
+                broker_count = len(out1)
+        return {"success": account_ok, "mode": (mode or "mock").upper(), "account_ok": account_ok, "broker_count": broker_count}
+    except Exception as exc:
+        err_info: Dict = {"success": False, "mode": (mode or "mock").upper(), "account_ok": False, "error": str(exc)}
+        for attr in ("http_status_code", "response_text", "response_json", "error_category"):
+            if hasattr(exc, attr):
+                err_info[attr] = getattr(exc, attr)
+        return err_info
+
+
+def check_orderable_cash(mode: str = "mock") -> Dict:
+    """주문가능금액 조회."""
+    inject_to_os_env()
+    try:
+        from api_service import _get_api_client
+        api = _get_api_client(runtime_mode=mode)
+        cash = api.get_orderable_cash()
+        ok = cash >= 0
+        return {"success": ok, "mode": (mode or "mock").upper(), "orderable_cash_ok": ok, "orderable_cash_amount": int(cash)}
+    except Exception as exc:
+        return {"success": False, "mode": (mode or "mock").upper(), "orderable_cash_ok": False, "orderable_cash_amount": 0, "error": str(exc)}
+
+
+def run_kis_readiness(mode: str = "mock") -> Dict:
+    """token → connection → account → orderable_cash 한 번에 점검."""
+    inject_to_os_env()
+    import time as _time
+    mode_u = (mode or "mock").strip().upper()
+    result: Dict = {
+        "success": False,
+        "mode": mode_u,
+        "resolved_mode": mode_u,
+        "token_status": {},
+        "token_cache_file": "",
+        "token_refreshed": False,
+        "connection_ok": False,
+        "account_ok": False,
+        "broker_count": 0,
+        "orderable_cash_ok": False,
+        "orderable_cash_amount": 0,
+        "http_status_code": "",
+        "response_text": "",
+        "response_json": {},
+        "error_message": "",
+        "verdict": "NOT_READY",
+        "checked_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        ts = get_kis_token_status(mode_u)
+        result["token_status"] = ts
+        result["token_cache_file"] = ts.get("token_cache_file", "")
+
+        if mode_u == "REAL":
+            readiness = check_real_readiness()
+            det = readiness.get("details", {})
+            result["connection_ok"] = bool(det.get("real_token"))
+            result["account_ok"] = bool(det.get("real_balance"))
+            result["orderable_cash_ok"] = bool(det.get("orderable_cash"))
+            result["orderable_cash_amount"] = int(det.get("orderable_cash_amount", 0))
+            result["http_status_code"] = str(det.get("http_status_code", ""))
+            result["response_text"] = str(det.get("response_text", ""))[:500]
+            result["success"] = readiness.get("ready", False)
+            result["verdict"] = readiness.get("verdict", "NOT_READY")
+            result["missing_conditions"] = readiness.get("details", {}).get("missing_conditions", [])
+        else:
+            conn = check_kis_connection(mode_u)
+            result["connection_ok"] = conn.get("connection_ok", False)
+            if result["connection_ok"]:
+                acc = check_kis_account(mode_u)
+                result["account_ok"] = acc.get("account_ok", False)
+                result["broker_count"] = acc.get("broker_count", 0)
+                if not result["account_ok"]:
+                    result["response_text"] = str(acc.get("response_text", acc.get("error", "")))[:500]
+                    result["http_status_code"] = str(acc.get("http_status_code", ""))
+                cash = check_orderable_cash(mode_u)
+                result["orderable_cash_ok"] = cash.get("orderable_cash_ok", False)
+                result["orderable_cash_amount"] = cash.get("orderable_cash_amount", 0)
+            else:
+                result["error_message"] = conn.get("error", "연결 실패")
+            result["success"] = result["connection_ok"] and result["account_ok"]
+            result["verdict"] = "MOCK_READY" if result["success"] else "MOCK_NOT_READY"
+    except Exception as exc:
+        result["error_message"] = str(exc)
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+
 def get_real_bulk_buy_readiness(
     planned_total_amount: int = 0,
     order_plan_id: str = "",

@@ -27,11 +27,44 @@ from env_service import (
     save_mock_keys,
     save_real_keys,
 )
-from trading_service import run_real_order_readiness_check
+from trading_service import (
+    run_real_order_readiness_check,
+    refresh_kis_token,
+    check_kis_connection,
+    check_kis_account,
+    check_orderable_cash,
+    run_kis_readiness,
+    get_kis_token_status,
+)
 
 st.set_page_config(page_title="API 설정", page_icon="API", layout="wide")
 st.title("API 설정")
 st.caption("한국투자증권 API 키와 거래 모드를 설정합니다.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 매일 아침 사용 순서 안내
+# ══════════════════════════════════════════════════════════════════════════════
+with st.expander("매일 아침 사용 순서 (펼치기)", expanded=False):
+    col_guide_m, col_guide_r = st.columns(2)
+    with col_guide_m:
+        st.markdown("""
+**MOCK 모의투자 준비**
+
+1. MOCK 토큰 새로 발급
+2. MOCK 전체 준비상태 점검
+3. MOCK 계좌조회 OK 확인
+""")
+    with col_guide_r:
+        st.markdown("""
+**REAL 실전투자 준비**
+
+1. REAL 토큰 새로 발급
+2. REAL 전체 준비상태 점검
+3. REAL 계좌조회 OK 확인
+4. 보유종목 및 매도감시 → KIS REAL 계좌 새로고침
+5. 예산배분 및 주문 → 파이프라인/주문 미리보기 실행
+6. 주문 실행
+""")
 
 if is_env_file_exists():
     st.success(".env 파일이 있습니다.")
@@ -201,3 +234,169 @@ with st.expander("고급 옵션: 실전 전체 매수 허용 상태"):
         st.success("REAL 전체 리스트 매수 조건 충족 가능 상태입니다. 예산배분 및 주문 화면에서 나머지 조건을 확인하세요.")
     else:
         st.warning("오늘 실전 주문 확인을 먼저 완료하세요.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# KIS API 토큰 및 연결 상태
+# ══════════════════════════════════════════════════════════════════════════════
+st.divider()
+st.subheader("KIS API 토큰 및 연결 상태")
+st.caption("토큰/키/시크릿 원문은 절대 표시되지 않습니다. 마스킹된 정보만 표시됩니다.")
+
+_tab_mock_conn, _tab_real_conn = st.tabs(["MOCK 모의투자", "REAL 실전투자"])
+
+# ── MOCK 탭 ──────────────────────────────────────────────────────────────────
+with _tab_mock_conn:
+    st.subheader("MOCK 모의투자 토큰/연결 상태")
+
+    # 토큰 상태 표시
+    _mock_ts = get_kis_token_status("mock")
+    _mock_st_cols = st.columns(4)
+    with _mock_st_cols[0]:
+        _key_ok = bool(_mock_ts.get("app_key_masked") and _mock_ts.get("app_key_masked") != "MISSING")
+        st.metric("App Key", "✅ 설정됨" if _key_ok else "❌ 없음")
+        st.caption(_mock_ts.get("app_key_masked", ""))
+    with _mock_st_cols[1]:
+        st.metric("계좌번호", _mock_ts.get("account_masked", "") or "❌ 없음")
+    with _mock_st_cols[2]:
+        _mock_cache = _mock_ts.get("cache_exists", False)
+        _mock_exp = _mock_ts.get("is_expired", True)
+        if _mock_cache and not _mock_exp:
+            _rem = _mock_ts.get("remaining_seconds", 0)
+            _rem_h = _rem // 3600
+            st.metric("토큰 상태", "✅ 유효")
+            st.caption(f"남은 시간: {_rem_h}h {(_rem % 3600) // 60}m")
+        elif _mock_cache and _mock_exp:
+            st.metric("토큰 상태", "⚠️ 만료")
+            st.caption(_mock_ts.get("expires_at_str", ""))
+        else:
+            st.metric("토큰 상태", "❌ 없음")
+    with _mock_st_cols[3]:
+        st.metric("캐시 파일", _mock_ts.get("token_cache_file", ""))
+
+    st.divider()
+    _mock_btn_cols = st.columns(5)
+    with _mock_btn_cols[0]:
+        if st.button("MOCK 토큰 새로 발급", use_container_width=True, key="mock_token_refresh"):
+            with st.spinner("MOCK 토큰 발급 중..."):
+                _r = refresh_kis_token("mock")
+            if _r.get("success"):
+                st.info(f"MOCK 토큰 발급 완료 | 만료: {_r.get('expires_at_str', '')}")
+            else:
+                st.error(f"MOCK 토큰 발급 실패: {_r.get('error', '')}")
+            st.rerun()
+    with _mock_btn_cols[1]:
+        if st.button("MOCK 연결 확인", use_container_width=True, key="mock_conn_check"):
+            with st.spinner("MOCK 연결 확인 중..."):
+                _r = check_kis_connection("mock")
+            if _r.get("connection_ok"):
+                st.success("MOCK 연결 OK")
+            else:
+                st.error(f"MOCK 연결 실패: {_r.get('error', '')}")
+    with _mock_btn_cols[2]:
+        if st.button("MOCK 계좌조회 확인", use_container_width=True, key="mock_acct_check"):
+            with st.spinner("MOCK 계좌조회 중..."):
+                _r = check_kis_account("mock")
+            if _r.get("account_ok"):
+                st.success(f"MOCK 계좌조회 OK — {_r.get('broker_count', 0)}개 종목")
+            else:
+                st.error(f"MOCK 계좌조회 실패: {_r.get('error', _r.get('response_text', ''))[:200]}")
+    with _mock_btn_cols[3]:
+        if st.button("MOCK 주문가능금액 확인", use_container_width=True, key="mock_cash_check"):
+            with st.spinner("MOCK 주문가능금액 조회 중..."):
+                _r = check_orderable_cash("mock")
+            if _r.get("orderable_cash_ok"):
+                st.success(f"MOCK 주문가능금액: {_r.get('orderable_cash_amount', 0):,}원")
+            else:
+                st.error(f"MOCK 주문가능금액 조회 실패: {_r.get('error', '')}")
+    with _mock_btn_cols[4]:
+        if st.button("MOCK 전체 준비상태 점검", use_container_width=True, key="mock_readiness", type="primary"):
+            with st.spinner("MOCK 전체 준비상태 점검 중..."):
+                _r = run_kis_readiness("mock")
+            if _r.get("success"):
+                st.success(f"MOCK 준비 완료 — verdict: {_r.get('verdict', '')}")
+            else:
+                st.warning(f"MOCK 준비 미완료 — verdict: {_r.get('verdict', '')} | {_r.get('error_message', '')}")
+            with st.expander("상세 결과"):
+                st.json({k: v for k, v in _r.items() if k not in ("token_status", "response_json")})
+
+# ── REAL 탭 ──────────────────────────────────────────────────────────────────
+with _tab_real_conn:
+    st.error("REAL은 실제 계좌입니다. 조회는 안전하지만 주문은 실제 자금에 반영됩니다.")
+    st.subheader("REAL 실전투자 토큰/연결 상태")
+
+    _real_ts = get_kis_token_status("real")
+    _real_st_cols = st.columns(4)
+    with _real_st_cols[0]:
+        _rkey_ok = bool(_real_ts.get("app_key_masked") and _real_ts.get("app_key_masked") != "MISSING")
+        st.metric("App Key", "✅ 설정됨" if _rkey_ok else "❌ 없음")
+        st.caption(_real_ts.get("app_key_masked", ""))
+    with _real_st_cols[1]:
+        st.metric("계좌번호", _real_ts.get("account_masked", "") or "❌ 없음")
+    with _real_st_cols[2]:
+        _real_cache = _real_ts.get("cache_exists", False)
+        _real_exp = _real_ts.get("is_expired", True)
+        if _real_cache and not _real_exp:
+            _rrem = _real_ts.get("remaining_seconds", 0)
+            _rrem_h = _rrem // 3600
+            st.metric("토큰 상태", "✅ 유효")
+            st.caption(f"남은 시간: {_rrem_h}h {(_rrem % 3600) // 60}m")
+        elif _real_cache and _real_exp:
+            st.metric("토큰 상태", "⚠️ 만료")
+            st.caption(_real_ts.get("expires_at_str", ""))
+        else:
+            st.metric("토큰 상태", "❌ 없음")
+    with _real_st_cols[3]:
+        st.metric("캐시 파일", _real_ts.get("token_cache_file", ""))
+
+    st.divider()
+    _real_btn_cols = st.columns(5)
+    with _real_btn_cols[0]:
+        if st.button("REAL 토큰 새로 발급", use_container_width=True, key="real_token_refresh"):
+            with st.spinner("REAL 토큰 발급 중..."):
+                _r = refresh_kis_token("real")
+            if _r.get("success"):
+                st.info(f"REAL 토큰 발급 완료 | 만료: {_r.get('expires_at_str', '')}")
+            else:
+                st.error(f"REAL 토큰 발급 실패: {_r.get('error', '')}")
+            st.rerun()
+    with _real_btn_cols[1]:
+        if st.button("REAL 연결 확인", use_container_width=True, key="real_conn_check"):
+            with st.spinner("REAL 연결 확인 중..."):
+                _r = check_kis_connection("real")
+            if _r.get("connection_ok"):
+                st.success("REAL 연결 OK")
+            else:
+                st.error(f"REAL 연결 실패: {_r.get('error', '')}")
+    with _real_btn_cols[2]:
+        if st.button("REAL 계좌조회 확인", use_container_width=True, key="real_acct_check"):
+            with st.spinner("REAL 계좌조회 중..."):
+                _r = check_kis_account("real")
+            if _r.get("account_ok"):
+                st.success(f"REAL 계좌조회 OK — {_r.get('broker_count', 0)}개 종목")
+            else:
+                err_detail = _r.get("response_text", _r.get("error", ""))[:300]
+                st.error(f"REAL 계좌조회 실패: {err_detail}")
+                if _r.get("http_status_code"):
+                    st.caption(f"HTTP {_r.get('http_status_code')}")
+    with _real_btn_cols[3]:
+        if st.button("REAL 주문가능금액 확인", use_container_width=True, key="real_cash_check"):
+            with st.spinner("REAL 주문가능금액 조회 중..."):
+                _r = check_orderable_cash("real")
+            if _r.get("orderable_cash_ok"):
+                st.success(f"REAL 주문가능금액: {_r.get('orderable_cash_amount', 0):,}원")
+            else:
+                st.error(f"REAL 주문가능금액 조회 실패: {_r.get('error', '')}")
+    with _real_btn_cols[4]:
+        if st.button("REAL 준비상태 전체 점검", use_container_width=True, key="real_readiness_full", type="primary"):
+            with st.spinner("REAL 준비상태 전체 점검 중..."):
+                _r = run_kis_readiness("real")
+            if _r.get("success"):
+                st.success(f"REAL 준비 완료 — verdict: {_r.get('verdict', '')}")
+            else:
+                st.warning(f"REAL 준비 미완료 — {_r.get('error_message', _r.get('verdict', ''))}")
+            with st.expander("상세 결과"):
+                _diag = {k: v for k, v in _r.items() if k not in ("token_status", "response_json")}
+                st.json(_diag)
+                if _r.get("response_text"):
+                    with st.expander("응답 원문"):
+                        st.code(_r.get("response_text", "")[:500], language="text")
