@@ -18,6 +18,7 @@ for _p in (
 
 from config_service import load_config, get_trade_mode
 from trading_service import (
+    check_real_readiness,
     get_broker_positions,
     get_open_sell_orders,
     get_positions_with_current_price,
@@ -272,13 +273,39 @@ if sell_mode in ("MOCK", "REAL"):
     except Exception as _e:
         st.warning(f"모드 진단 로드 실패: {_e}")
 
-# REAL 선택 시 경고 + 확인 체크박스
+# REAL 선택 시 경고 + readiness 확인 + 확인 체크박스
 real_sell_confirmed = False
+_real_readiness_ok = True
 if sell_mode == "REAL":
     real_order_warning()
+    # REAL 계좌조회 준비상태 확인 (session_state 캐시)
+    if "real_readiness" not in st.session_state:
+        st.session_state["real_readiness"] = None
+    _col_r1, _col_r2 = st.columns([3, 1])
+    with _col_r1:
+        if st.session_state["real_readiness"]:
+            _r = st.session_state["real_readiness"]
+            if _r.get("ready"):
+                st.success(f"REAL 계좌조회 준비 완료 — {_r.get('message', '')}")
+            else:
+                st.error(
+                    f"⛔ REAL 계좌조회 실패 — 매수/매도/정정 버튼 비활성화\n"
+                    f"{_r.get('message', '')}\n"
+                    f"real_api_diagnosis.py --all을 먼저 실행하세요."
+                )
+                _real_readiness_ok = False
+    with _col_r2:
+        if st.button("REAL 준비상태 확인", key="btn_real_readiness_check"):
+            with st.spinner("REAL API 계좌조회 확인 중..."):
+                st.session_state["real_readiness"] = check_real_readiness()
+            st.rerun()
+    if st.session_state["real_readiness"] and not st.session_state["real_readiness"].get("ready"):
+        _real_readiness_ok = False
+
     real_sell_confirmed = st.checkbox(
         "실제 계좌에서 실제 매도 주문이 실행됨을 이해했습니다.",
         key="real_sell_confirm",
+        disabled=not _real_readiness_ok,
     )
     if not real_sell_confirmed:
         st.error("REAL 매도를 진행하려면 위 체크박스를 먼저 선택하세요.")
@@ -299,7 +326,7 @@ if codes:
     reason = st.selectbox("매도 사유", ["manual", "take_profit", "stop_loss", "force_exit", "manual_all"])
 
     # 선택 종목 단일 매도
-    sell_btn_disabled = (sell_mode == "REAL" and not real_sell_confirmed)
+    sell_btn_disabled = (sell_mode == "REAL" and (not real_sell_confirmed or not _real_readiness_ok))
     sell_cols = st.columns(2)
 
     with sell_cols[0]:
@@ -348,7 +375,7 @@ else:
 st.divider()
 st.subheader("전량 일괄매도 (미체결 정정 포함)")
 
-_bulk_sell_disabled = (sell_mode == "REAL" and not real_sell_confirmed)
+_bulk_sell_disabled = (sell_mode == "REAL" and (not real_sell_confirmed or not _real_readiness_ok))
 
 # 옵션 체크박스
 _opt_cols = st.columns(4)

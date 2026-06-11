@@ -63,11 +63,23 @@ def run_real_order_test(
 ) -> dict:
     code = _normalize_code(stock_code)
     readiness = run_readiness_check(config_path=config_path, call_real_api=True)
-    info = _lookup_price(code, config_path)
-    current_price = int(info.get("current_price", 0) or 0)
-    stock_name = info.get("stock_name", code)
+
+    # 현재가 조회 — 실패해도 프로그램이 죽지 않도록
+    current_price = 0
+    stock_name = code
+    price_lookup_ok = False
+    price_lookup_error = ""
+    try:
+        info = _lookup_price(code, config_path)
+        current_price = int(info.get("current_price", 0) or 0)
+        stock_name = info.get("stock_name", code)
+        price_lookup_ok = current_price > 0
+    except Exception as price_exc:
+        price_lookup_error = str(price_exc)
+        price_lookup_ok = False
+
     order_price = int(price)
-    if order_price <= 0:
+    if order_price <= 0 and current_price > 0:
         order_price = adjust_price_to_tick(current_price, side="buy", method="floor")
     amount = int(order_price * quantity)
     row = {
@@ -102,7 +114,33 @@ def run_real_order_test(
         "rejected_reason": "",
         "readiness_verdict": readiness.get("verdict", "NOT_READY"),
         "missing_conditions": ", ".join(readiness.get("missing_conditions", [])),
+        "price_lookup_ok": price_lookup_ok,
+        "price_lookup_error": price_lookup_error,
     }
+
+    # 현재가 조회 실패 시 dry-run에서도 보고서 저장 후 반환 (프로그램 중단 없음)
+    if not price_lookup_ok and order_price <= 0:
+        row["rejected_reason"] = f"REAL_PRICE_LOOKUP_FAILED: {price_lookup_error}"
+        row["readiness_verdict"] = "NOT_READY"
+        path = _save_result(row)
+        row["report_path"] = path
+        return {
+            "success": False,
+            "preview": row,
+            "readiness": readiness,
+            "report_path": path,
+            "rejected_reason": row["rejected_reason"],
+        }
+
+    # REAL execute 전 readiness 차단
+    if execute and readiness.get("verdict") != "READY_FOR_REAL_SINGLE_TEST":
+        row["rejected_reason"] = (
+            "REAL 계좌조회 또는 주문가능금액 확인이 실패하여 실전 주문을 차단했습니다. "
+            "real_api_diagnosis.py --all을 먼저 실행하세요."
+        )
+        path = _save_result(row)
+        row["report_path"] = path
+        return {"success": False, "preview": row, "readiness": readiness, "report_path": path}
 
     gate = SafetyGate(config_path, runtime_mode="real")
     row["resolved_mode"] = gate.mode

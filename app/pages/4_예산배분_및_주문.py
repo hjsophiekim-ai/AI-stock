@@ -19,6 +19,7 @@ for _p in (
 from config_service import load_config, get_trade_mode, get_safety_status
 from trading_service import (
     check_real_order_conditions,
+    check_real_readiness,
     run_budget_allocation,
     run_buy_candidates,
     list_sell_policies,
@@ -204,13 +205,38 @@ if order_mode in ("MOCK", "REAL"):
 
 if order_mode == "REAL":
     real_order_warning()
+    # REAL readiness 확인
+    if "real_readiness_buy" not in st.session_state:
+        st.session_state["real_readiness_buy"] = None
+    _rb_col1, _rb_col2 = st.columns([3, 1])
+    _real_buy_readiness_ok = True
+    with _rb_col1:
+        if st.session_state["real_readiness_buy"]:
+            _rb = st.session_state["real_readiness_buy"]
+            if _rb.get("ready"):
+                st.success(f"REAL 계좌조회 준비 완료 — {_rb.get('message', '')}")
+            else:
+                st.error(
+                    f"⛔ REAL 계좌조회 실패 — 전부 매수 버튼 비활성화\n"
+                    f"{_rb.get('message', '')}"
+                )
+                _real_buy_readiness_ok = False
+    with _rb_col2:
+        if st.button("REAL 준비상태 확인", key="btn_real_readiness_buy"):
+            with st.spinner("REAL API 계좌조회 확인 중..."):
+                st.session_state["real_readiness_buy"] = check_real_readiness()
+            st.rerun()
+    if st.session_state["real_readiness_buy"] and not st.session_state["real_readiness_buy"].get("ready"):
+        _real_buy_readiness_ok = False
+
     real_bulk_ok = (
-        bool(cfg.get("real_trade", {}).get("allow_bulk_buy"))
+        _real_buy_readiness_ok
+        and bool(cfg.get("real_trade", {}).get("allow_bulk_buy"))
         and bool(cfg.get("force_trade", {}).get("allow_real_bulk_order"))
         and bool(cfg.get("safety", {}).get("confirm_live_trade"))
     )
     if not real_bulk_ok:
-        st.error("실전 전체 리스트 매수는 비활성화되어 있습니다. 먼저 개별 종목 1주 테스트를 완료하세요.")
+        st.error("실전 전체 리스트 매수는 비활성화되어 있습니다. 먼저 REAL 준비상태를 확인하고 개별 종목 1주 테스트를 완료하세요.")
 else:
     real_bulk_ok = True
     if order_mode == "MOCK":

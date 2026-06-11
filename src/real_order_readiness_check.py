@@ -68,11 +68,29 @@ def run_readiness_check(config_path: str = "config.yaml", call_real_api: bool = 
             api = KISApiClient(tmp_path, gate=SafetyGate(tmp_path, runtime_mode="real"))
             token = api.auth.get_access_token()
             checks["real_token"] = bool(token)
-            bal = api.get_account_balance()
-            checks["real_balance"] = isinstance(bal, dict) and bool(bal)
-            cash = api.get_orderable_cash()
-            checks["orderable_cash"] = cash >= 0
-            checks["orderable_cash_amount"] = int(cash)
+            try:
+                bal = api.get_account_balance()
+                checks["real_balance"] = isinstance(bal, dict) and bool(bal.get("output1") or bal.get("output2"))
+            except Exception as bal_ex:
+                checks["real_balance"] = False
+                checks["real_api_error"] = str(bal_ex)
+                # 풍부한 예외 정보 추출 (kis_api._get()이 첨부한 속성)
+                if hasattr(bal_ex, "http_status_code"):
+                    checks["request_url"] = getattr(bal_ex, "request_url", "")
+                    checks["tr_id"] = getattr(bal_ex, "tr_id", "")
+                    checks["params_masked"] = getattr(bal_ex, "params_masked", {})
+                    checks["http_status_code"] = getattr(bal_ex, "http_status_code", "")
+                    checks["response_text"] = getattr(bal_ex, "response_text", "")
+                    checks["response_json"] = getattr(bal_ex, "response_json", {})
+                    checks["error_category"] = getattr(bal_ex, "error_category", "")
+            if checks["real_balance"]:
+                try:
+                    cash = api.get_orderable_cash()
+                    checks["orderable_cash"] = cash >= 0
+                    checks["orderable_cash_amount"] = int(cash)
+                except Exception as cash_ex:
+                    checks["orderable_cash"] = False
+                    checks["orderable_cash_error"] = str(cash_ex)
         except Exception as ex:
             checks["real_api_error"] = str(ex)
         finally:
@@ -113,6 +131,16 @@ def save_report(result: dict) -> dict:
         lines.append("부족한 조건: " + ", ".join(result["missing_conditions"]))
     if result.get("real_api_error"):
         lines.append("REAL API 오류: " + str(result["real_api_error"]))
+    if result.get("http_status_code"):
+        lines.append(f"HTTP 상태코드: {result.get('http_status_code')}")
+    if result.get("request_url"):
+        lines.append(f"실패 URL: {result.get('request_url')}")
+    if result.get("tr_id"):
+        lines.append(f"TR_ID: {result.get('tr_id')}")
+    if result.get("error_category"):
+        lines.append(f"오류 분류: {result.get('error_category')}")
+    if result.get("response_text"):
+        lines.append(f"응답 본문(앞 500자): {str(result.get('response_text', ''))[:500]}")
     txt_path.write_text("\n".join(lines), encoding="utf-8")
     json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"txt_path": str(txt_path), "json_path": str(json_path)}

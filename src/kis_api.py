@@ -8,6 +8,7 @@
 """
 
 import os
+import re
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -74,6 +75,19 @@ class KISApiClient:
             raise RuntimeError(f"REAL mode cannot use KIS base_url: {self._base_url}")
         return True
 
+    @staticmethod
+    def _mask_api_response_text(text: str) -> str:
+        """AppKey/AppSecret/토큰/계좌번호 마스킹 (로그용)."""
+        masked = text
+        for env_key in ("KIS_REAL_APP_KEY", "KIS_APP_KEY", "KIS_MOCK_APP_KEY",
+                        "KIS_REAL_APP_SECRET", "KIS_APP_SECRET", "KIS_MOCK_APP_SECRET"):
+            val = os.getenv(env_key, "")
+            if val and len(val) >= 8:
+                masked = masked.replace(val, val[:4] + "****")
+        # Bearer 토큰 마스킹
+        masked = re.sub(r'(Bearer\s+)[A-Za-z0-9\-_.+/]{20,}', r'\1****', masked)
+        return masked
+
     def diagnostic_metadata(self) -> Dict:
         meta = self.auth.diagnostic_metadata()
         meta.update({
@@ -107,8 +121,43 @@ class KISApiClient:
             try:
                 time.sleep(self._sleep)
                 resp = requests.get(url, headers=headers, params=params, timeout=self._timeout)
-                resp.raise_for_status()
-                data = resp.json()
+                # ── 응답 body를 raise_for_status() 전에 캡처 ────────────────
+                _raw_text = ""
+                _raw_json: Dict = {}
+                try:
+                    _raw_text = resp.text or ""
+                except Exception:
+                    pass
+                try:
+                    _raw_json = resp.json()
+                except Exception:
+                    pass
+                # ── HTTP 오류: body 로깅 + 풍부한 예외 정보 첨부 후 재발생 ──
+                try:
+                    resp.raise_for_status()
+                except requests.exceptions.HTTPError as http_exc:
+                    _masked = self._mask_api_response_text(_raw_text[:2000])
+                    logger.error(
+                        "GET HTTP %d tr_id=%s url=%s mode=%s key_type=%s response_body=%s",
+                        resp.status_code, tr_id, url, self.gate.mode,
+                        getattr(self.auth, "key_type_used", ""), _masked,
+                    )
+                    http_exc.http_status_code = resp.status_code
+                    http_exc.response_text = _raw_text[:2000]
+                    http_exc.response_json = _raw_json
+                    http_exc.request_url = url
+                    http_exc.tr_id = tr_id
+                    http_exc.params_masked = {
+                        k: ("****" if k in ("CANO", "ACNT_PRDT_CD") else v)
+                        for k, v in params.items()
+                    }
+                    http_exc.error_category = f"HTTP_{resp.status_code}"
+                    http_exc.mode = self.gate.mode
+                    http_exc.base_url = self._base_url
+                    http_exc.key_type_used = getattr(self.auth, "key_type_used", "")
+                    raise  # 풍부한 예외를 그대로 전파
+                # ─────────────────────────────────────────────────────────────
+                data = _raw_json
                 if self._is_token_expired_response(data) and not token_refreshed:
                     logger.warning("KIS token expired for GET tr_id=%s; refreshing token and retrying once", tr_id)
                     self.auth.invalidate_token_cache()

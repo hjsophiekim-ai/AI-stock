@@ -1256,3 +1256,185 @@ timestamp,operation_type,stock_code,stock_name,quantity,unfilled_qty,original_or
 2026-06-11 10:00:01,NEW_SELL,035420,NAVER,5,0,,34567890,,85000,84800,True,False,MOCK_APP_KEY
 2026-06-11 10:00:02,SKIP,000270,기아,0,0,,,,,,,False,MOCK_APP_KEY
 ```
+
+---
+
+## REAL API 오류 진단 및 Readiness 강제 검증
+
+### 개요
+
+REAL 계좌조회(TTTC8434R) HTTP 500 오류 발생 시 원인을 진단하고, Readiness가 NOT_READY이면 실전 주문을 차단합니다.
+
+```
+흐름:
+  1. kis_api._get() → HTTP 오류 시 body 캡처 + 마스킹 로그
+  2. real_order_readiness_check.py → 실패 시 HTTP 상태·URL·TR_ID·응답 저장
+  3. real_api_diagnosis.py → 파라미터 후보 전수 테스트 → 성공 조합 리포트
+  4. App REAL 버튼 → NOT_READY 시 비활성화
+  5. real_order_test.py --execute → NOT_READY 시 차단
+```
+
+---
+
+### kis_api._get() HTTP 오류 본문 캡처 (kis_api.py)
+
+HTTP 오류 발생 시 응답 body를 캡처한 뒤 AppKey·AppSecret·Bearer 토큰·계좌번호를 마스킹하여 로그에 기록합니다.
+
+```python
+# 로그 예시 (마스킹됨)
+GET HTTP 500 tr_id=TTTC8434R url=https://openapi.koreainvestment.com:9443/uapi/domestic-stock/... \
+  mode=real key_type=REAL_APP_KEY \
+  response_body={"rt_cd":"1","msg_cd":"EGW00201","msg1":"원장에서 허용 가능한 초당 거래건수를 초과하였습니다."}
+```
+
+`requests.exceptions.HTTPError` 예외에 다음 속성이 추가됩니다:
+
+| 속성 | 설명 |
+|---|---|
+| `http_status_code` | HTTP 상태 코드 (예: 500) |
+| `response_text` | 응답 body 텍스트 (최대 2000자) |
+| `response_json` | 응답 JSON 딕셔너리 |
+| `request_url` | 요청 URL |
+| `tr_id` | KIS TR_ID |
+| `params_masked` | CANO·ACNT_PRDT_CD 마스킹된 요청 파라미터 |
+| `error_category` | `HTTP_500` 형식 |
+| `mode` | `real` / `mock` |
+| `base_url` | 기본 URL |
+| `key_type_used` | 사용된 키 타입 |
+
+---
+
+### real_order_readiness_check.py 오류 상세 저장
+
+잔고조회 또는 주문가능금액 조회 실패 시 리포트에 다음 항목을 저장합니다.
+
+| 필드 | 설명 |
+|---|---|
+| `http_status_code` | HTTP 상태 코드 |
+| `request_url` | 실패한 요청 URL |
+| `tr_id` | TR_ID |
+| `response_text` | 응답 본문 (최대 2000자) |
+| `response_json` | 응답 JSON |
+| `error_category` | 오류 분류 (`HTTP_500` 등) |
+
+리포트 경로: `reports/real_order_readiness_YYYYMMDD_HHMMSS.json`
+
+```bash
+python src/real_order_readiness_check.py --config config.yaml
+```
+
+---
+
+### real_api_diagnosis.py — REAL API 파라미터 전수 진단
+
+REAL API 오류 원인을 파악하기 위해 파라미터 후보 조합을 전수 테스트합니다.
+
+```bash
+# 전체 진단 (잔고조회 + 현재가 + 미체결조회)
+python src/real_api_diagnosis.py --all
+
+# 잔고조회만 (16가지 파라미터 조합 테스트)
+python src/real_api_diagnosis.py --balance
+
+# 현재가 조회만
+python src/real_api_diagnosis.py --price --stock-code 005930
+
+# 미체결 조회만 (4가지 INQR_DVSN 조합)
+python src/real_api_diagnosis.py --open-orders
+
+# config 지정
+python src/real_api_diagnosis.py --all --config config.yaml
+```
+
+#### 잔고조회 파라미터 후보 (16조합)
+
+| 파라미터 | 후보값 | 설명 |
+|---|---|---|
+| `INQR_DVSN` | `01` / `02` | 조회 구분 |
+| `UNPR_DVSN` | `01` / `02` | 단가 구분 |
+| `PRCS_DVSN` | `00` / `01` | 처리 구분 |
+| `OFL_YN` | `""` / `N` | 오프라인 여부 |
+
+성공한 조합은 `success_combination` 필드에 저장되며, 이후 `real_order_readiness_check.py`에서 해당 조합을 우선 사용합니다.
+
+#### 리포트 저장
+
+- `reports/real_api_diagnosis_YYYYMMDD_HHMMSS.json` — 전체 결과 JSON
+- `reports/real_api_diagnosis_YYYYMMDD_HHMMSS.txt` — 사람이 읽기 쉬운 요약
+
+---
+
+### Readiness 강제 검증 — App 버튼 비활성화
+
+`app/pages/4_예산배분_및_주문.py` 및 `app/pages/5_보유종목_및_매도감시.py` REAL 모드에서:
+
+- **[REAL Readiness 확인]** 버튼 클릭 → `real_order_readiness_check.run_readiness_check()` 실행
+- `verdict != "READY_FOR_REAL_SINGLE_TEST"` 이면 매수/매도 버튼 **비활성화**
+- NOT_READY 상세 원인과 `real_api_diagnosis.py --all` 실행 안내 표시
+
+```
+verdict: READY_FOR_REAL_SINGLE_TEST  → 버튼 활성화
+verdict: NOT_READY                   → 버튼 비활성화 + 오류 표시
+```
+
+MOCK 모드에는 영향 없습니다.
+
+---
+
+### real_order_test.py — Readiness 차단 및 현재가 조회 실패 처리
+
+#### 현재가 조회 실패 시 (dry-run 포함)
+
+현재가 조회에 실패해도 프로그램이 중단되지 않습니다.  
+`order_price <= 0`이면 리포트에 `rejected_reason=REAL_PRICE_LOOKUP_FAILED`를 저장하고 반환합니다.
+
+```json
+{
+  "success": false,
+  "rejected_reason": "REAL_PRICE_LOOKUP_FAILED: ...",
+  "price_lookup_ok": false,
+  "price_lookup_error": "HTTPError 500 ...",
+  "report_path": "reports/real_order_test_20260611.csv"
+}
+```
+
+#### NOT_READY 시 --execute 차단
+
+```bash
+python src/real_order_test.py --stock-code 005930 --execute
+# → rejected_reason: "REAL 계좌조회 또는 주문가능금액 확인이 실패하여 실전 주문을 차단했습니다. real_api_diagnosis.py --all을 먼저 실행하세요."
+```
+
+`verdict="READY_FOR_REAL_SINGLE_TEST"`이 아니면 `--execute`를 줘도 실전 주문 API를 호출하지 않습니다.
+
+#### real_order_test CSV 추가 컬럼
+
+| 컬럼 | 설명 |
+|---|---|
+| `price_lookup_ok` | 현재가 조회 성공 여부 |
+| `price_lookup_error` | 현재가 조회 오류 메시지 |
+| `readiness_verdict` | Readiness 결과 |
+| `missing_conditions` | NOT_READY 누락 조건 목록 |
+
+---
+
+### 오류 진단 절차 요약
+
+REAL 계좌조회 HTTP 500 발생 시 다음 순서로 진단합니다:
+
+```
+1. python src/real_api_diagnosis.py --balance
+   → reports/real_api_diagnosis_*.txt 확인
+   → success_combination 있으면 → 해당 파라미터 조합으로 재시도 가능
+
+2. python src/real_api_diagnosis.py --all
+   → 잔고조회 + 현재가 + 미체결조회 전체 확인
+
+3. python src/real_order_readiness_check.py
+   → verdict 확인, NOT_READY이면 App 버튼 비활성화됨
+
+4. 원인 파악 후 해결:
+   - EGW00201 (초당 거래건수 초과) → 1초 대기 후 재시도
+   - 인증 토큰 만료 → KIS 개발자 포털에서 재발급
+   - 잘못된 파라미터 조합 → success_combination 사용
+```

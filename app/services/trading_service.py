@@ -443,3 +443,42 @@ def run_bulk_sell_with_amend(
             "results": [],
             "requested_mode": (mode or "mock").upper(),
         }
+
+
+def check_real_readiness() -> Dict:
+    """REAL 계좌조회 준비상태 확인 (주문 없음).
+
+    Returns:
+        {"ready": bool, "verdict": str, "message": str, ...}
+    """
+    inject_to_os_env()
+    try:
+        from real_order_readiness_check import run_readiness_check
+        result = run_readiness_check(config_path=str(PROJECT_ROOT / "config.yaml"), call_real_api=True)
+        verdict = result.get("verdict", "NOT_READY")
+        ready = verdict == "READY_FOR_REAL_SINGLE_TEST"
+        msg_parts = []
+        if not result.get("real_api_key"):
+            msg_parts.append("API 키 없음")
+        if not result.get("real_token"):
+            msg_parts.append("토큰 발급 실패")
+        if not result.get("real_balance"):
+            msg_parts.append(f"계좌조회 실패 HTTP={result.get('http_status_code','?')}")
+        if not result.get("orderable_cash"):
+            msg_parts.append("주문가능금액 확인 실패")
+        missing = result.get("missing_conditions", [])
+        if missing:
+            msg_parts.extend(missing)
+        return {
+            "ready": ready,
+            "verdict": verdict,
+            "message": " | ".join(msg_parts) if msg_parts else "준비 완료",
+            "details": result,
+        }
+    except Exception as exc:
+        return {
+            "ready": False,
+            "verdict": "NOT_READY",
+            "message": f"readiness 확인 실패: {exc}",
+            "details": {},
+        }
