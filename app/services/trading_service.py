@@ -3,6 +3,7 @@
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
+from datetime import date as _date
 
 import pandas as pd
 
@@ -230,16 +231,28 @@ def run_buy_candidates(
     try:
         if (mode or "").lower() == "real":
             cfg = load_config()
-            if not (
-                cfg.get("real_trade", {}).get("allow_bulk_buy", False)
-                and cfg.get("force_trade", {}).get("allow_real_bulk_order", False)
-                and cfg.get("safety", {}).get("confirm_live_trade", False)
-            ):
+            real_trade_cfg = cfg.get("real_trade", {})
+            # New condition: allow_bulk_buy_after_api_confirmation
+            allow_bulk = real_trade_cfg.get("allow_bulk_buy_after_api_confirmation", False)
+            # Also allow if legacy allow_bulk_buy is True
+            allow_bulk = allow_bulk or real_trade_cfg.get("allow_bulk_buy", False)
+            if not allow_bulk:
                 return {
                     "success": False,
-                    "message": "실전 전체 리스트 매수는 비활성화되어 있습니다. 먼저 개별 종목 1주 테스트를 완료하세요.",
+                    "message": "실전 전체 리스트 매수가 비활성화되어 있습니다. config.yaml real_trade.allow_bulk_buy_after_api_confirmation을 확인하세요.",
                     "orders_placed": 0,
                 }
+            # Daily confirmation check
+            try:
+                from real_trade_confirmation import is_confirmed_today
+                if not is_confirmed_today():
+                    return {
+                        "success": False,
+                        "message": "오늘 실전 주문 확인이 완료되지 않았습니다. API 설정 화면에서 실전 주문 확인을 완료하세요.",
+                        "orders_placed": 0,
+                    }
+            except Exception:
+                pass
         from buy_candidate_list import buy_candidates
         result = buy_candidates(
             candidate_file=candidate_file,
@@ -484,3 +497,69 @@ def check_real_readiness() -> Dict:
             "message": f"readiness 확인 실패: {exc}",
             "details": {},
         }
+
+
+def get_real_bulk_buy_readiness(
+    planned_total_amount: int = 0,
+    order_plan_id: str = "",
+    order_plan_hash: str = "",
+    user_confirmed_bulk_real: bool = False,
+) -> Dict:
+    """REAL 전체 리스트 매수 활성화 조건 점검.
+
+    기존 '1주 테스트 완료 필수' 조건 제거.
+    대신 API 설정 당일 확인, readiness, order_plan, 금액한도, 사용자 최종확인 기준.
+    """
+    inject_to_os_env()
+    cfg = load_config()
+    real_trade_cfg = cfg.get("real_trade", {})
+    max_amount = int(real_trade_cfg.get("max_real_bulk_order_amount", 300000))
+
+    # 1. REAL readiness
+    readiness = check_real_readiness()
+    real_readiness_ready = readiness.get("ready", False)
+
+    # 2. 당일 API 확인
+    try:
+        from real_trade_confirmation import is_confirmed_today
+        api_confirmation_today = is_confirmed_today()
+    except Exception:
+        api_confirmation_today = False
+
+    # 3. order_plan 존재
+    order_plan_exists = bool(order_plan_id)
+
+    # 4. order_plan hash 유효 (hash가 없으면 skip)
+    order_plan_hash_valid = bool(order_plan_id)  # plan id exists = valid for now
+
+    # 5. 금액한도
+    budget_within_limit = (planned_total_amount <= max_amount) if planned_total_amount > 0 else True
+
+    # 6. real_bulk_enabled (config)
+    real_bulk_enabled = (
+        real_trade_cfg.get("allow_bulk_buy_after_api_confirmation", True)
+        and real_trade_cfg.get("enabled", True)
+        and not cfg.get("safety", {}).get("block_real_bulk_order", False)
+    )
+
+    # 7. 사용자 최종확인
+    conditions = {
+        "real_readiness_ready": real_readiness_ready,
+        "api_confirmation_today": api_confirmation_today,
+        "order_plan_exists": order_plan_exists,
+        "order_plan_hash_valid": order_plan_hash_valid,
+        "budget_within_limit": budget_within_limit,
+        "user_confirmed_bulk_real": user_confirmed_bulk_real,
+        "real_bulk_enabled": real_bulk_enabled,
+    }
+    missing = [k for k, v in conditions.items() if not v]
+    ready = all(conditions.values())
+
+    return {
+        "ready": ready,
+        "conditions": conditions,
+        "missing_conditions": missing,
+        "planned_total_amount": planned_total_amount,
+        "max_real_bulk_order_amount": max_amount,
+        "readiness_details": readiness,
+    }

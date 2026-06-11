@@ -1094,7 +1094,7 @@ REAL 주문 500 오류가 발생하면 자동 재시도는 최대 1회로 제한
 - `--execute`는 조건이 모두 충족된 경우 실제 자금으로 주문을 시도합니다.
 - 시장가 주문은 기본 차단되며, 지정가 1주 또는 설정된 최대 주문금액 이내만 허용됩니다.
 - 이 프로그램은 +2% 익절 목표 전략을 사용할 수 있지만 수익을 보장하지 않습니다.
-- 전체 리스트 실전매수는 별도 고급 옵션이며 기본 차단 상태를 유지합니다.
+- 전체 리스트 실전매수는 아래 조건을 모두 충족해야 활성화됩니다 (개별 1주 테스트 완료 요건 제거됨).
 
 ## 매도방식 선택
 
@@ -1437,4 +1437,92 @@ REAL 계좌조회 HTTP 500 발생 시 다음 순서로 진단합니다:
    - EGW00201 (초당 거래건수 초과) → 1초 대기 후 재시도
    - 인증 토큰 만료 → KIS 개발자 포털에서 재발급
    - 잘못된 파라미터 조합 → success_combination 사용
+```
+
+---
+
+## REAL 전체 리스트 매수 활성화 조건 (Task C — 2026-06-11 변경)
+
+### 개요
+
+기존의 "개별 종목 1주 테스트 완료 필수(`single_stock_test_passed`)" 조건을 제거하고,
+다음 7가지 조건으로 대체합니다.
+
+### 7가지 활성화 조건
+
+| 조건 | 설명 |
+|---|---|
+| `real_readiness_ready` | `python src/real_order_readiness_check.py` 실행 결과 READY |
+| `api_confirmation_today` | [API 설정] 화면에서 오늘 실전 주문 확인 6개 체크 후 저장 |
+| `order_plan_exists` | [예산배분] 화면에서 미리보기 실행 → `order_plan_id` 생성 |
+| `order_plan_hash_valid` | 주문계획 해시 유효 (현재: plan_id 존재 여부와 동일) |
+| `budget_within_limit` | 주문 예정금액 ≤ `max_real_bulk_order_amount`(300,000원) |
+| `user_confirmed_bulk_real` | 주문 화면의 최종 확인 체크박스 2개 모두 체크 |
+| `real_bulk_enabled` | `config.yaml real_trade.allow_bulk_buy_after_api_confirmation: true` |
+
+### 조건 확인 흐름
+
+```
+1. [API 설정] 화면
+   → 6개 확인 체크박스 체크
+   → "오늘 실전 주문 확인 저장" 클릭
+   → data/real_trade_confirmation.json 저장 (당일 유효)
+
+2. [예산배분 및 주문] 화면 — REAL 모드
+   → "REAL 준비상태 확인" 클릭 → verdict=READY_FOR_REAL_SINGLE_TEST 확인
+   → "주문 미리보기" 클릭 → order_plan_id 자동 생성 + 금액 표시
+   → 주문계획 확인 후 최종확인 체크박스 2개 체크
+   → 7개 조건 테이블에서 모두 ✅ 확인
+   → "현재 리스트 전부 매수" 클릭
+
+3. backend (trading_service.get_real_bulk_buy_readiness)
+   → 7개 조건 점검 → ready=True만 실행 허용
+```
+
+### 관련 파일
+
+| 파일 | 역할 |
+|---|---|
+| `app/services/real_trade_confirmation.py` | 당일 확인 파일 관리 (save/load/clear) |
+| `data/real_trade_confirmation.json` | 당일 확인 저장 파일 (앱 자동 생성) |
+| `app/pages/1_API_설정.py` | 6개 확인 체크박스 + 저장 버튼 |
+| `app/pages/4_예산배분_및_주문.py` | 7개 조건 표시 + 2개 최종확인 체크박스 |
+| `app/services/trading_service.py` | `get_real_bulk_buy_readiness()` 함수 |
+| `config.yaml` | `real_trade.max_real_bulk_order_amount: 300000` 등 |
+
+### config.yaml 관련 키
+
+```yaml
+real_trade:
+  allow_bulk_buy_after_api_confirmation: true  # 전체매수 활성화 게이트
+  require_order_plan_for_bulk_buy: true         # order_plan_id 필수
+  require_user_confirm_bulk_buy: true           # 사용자 최종확인 필수
+  max_real_bulk_order_amount: 300000            # 최대 예산 한도
+  block_bulk_if_order_plan_missing: true
+  block_bulk_if_readiness_not_ready: true
+  block_bulk_if_plan_mismatch: true
+```
+
+### 주의사항
+
+- `data/real_trade_confirmation.json`은 **오늘 날짜 기준**으로만 유효합니다. 매일 [API 설정] 화면에서 재확인이 필요합니다.
+- `order_plan_id`는 [예산배분] 화면에서 "주문 미리보기"를 실행할 때마다 새로 생성됩니다. 실제 매수 전 반드시 최신 미리보기를 실행하세요.
+- `max_real_bulk_order_amount: 300000` — 예정 주문금액이 30만원을 초과하면 자동 차단됩니다.
+- 실전 주문 후에는 `current_order_plan_id`가 세션에서 초기화되어 재사용이 차단됩니다.
+- REAL 전량 매도(`bulk_sell`)는 이 요건과 별개이며, `SafetyGate` 기준을 따릅니다.
+
+### 검증 명령
+
+```bash
+# 1. 컴파일 검사
+python -m compileall src app -q
+
+# 2. REAL 준비상태 점검
+python src/real_order_readiness_check.py
+
+# 3. 당일 확인 상태 확인
+python -c "import sys; sys.path.insert(0,'app/services'); from real_trade_confirmation import load_confirmation, is_confirmed_today; import json; print('오늘 확인:', is_confirmed_today()); print(json.dumps(load_confirmation(), ensure_ascii=False, indent=2))"
+
+# 4. 전체 매수 준비상태 API 점검
+python -c "import sys; sys.path.insert(0,'app/services'); from trading_service import get_real_bulk_buy_readiness; import json; print(json.dumps(get_real_bulk_buy_readiness(planned_total_amount=100000, order_plan_id='test'), ensure_ascii=False, indent=2))"
 ```

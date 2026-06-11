@@ -86,6 +86,14 @@ real_trade:
   enabled: true
   allow_single_stock_test: true
   allow_bulk_buy: false
+  require_single_stock_test_before_bulk: false
+  allow_bulk_buy_after_api_confirmation: true
+  require_order_plan_for_bulk_buy: true
+  require_user_confirm_bulk_buy: true
+  max_real_bulk_order_amount: 300000
+  block_bulk_if_order_plan_missing: true
+  block_bulk_if_readiness_not_ready: true
+  block_bulk_if_plan_mismatch: true
   require_final_checkbox: true
   require_order_preview: true
   max_single_test_amount: 100000

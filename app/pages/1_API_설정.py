@@ -111,38 +111,93 @@ for key, label in [
 st.divider()
 st.subheader("실전 주문 설정")
 st.error("실전 주문은 실제 자금으로 실행됩니다. 이 프로그램은 수익을 보장하지 않으며 +2% 익절 목표 전략만 제공합니다.")
-st.info("기본값은 실전 주문 차단입니다. 아래 5개 확인을 모두 체크해야 개별 종목 1주 테스트 모드만 켤 수 있습니다.")
 
 real_conditions = get_real_order_conditions()
 for key, value in real_conditions.items():
     st.caption(f"{'OK' if value else 'FAIL'} {key}")
 
-ack1 = st.checkbox("실전 주문 위험을 이해했습니다.", key="real_ack_1")
-ack2 = st.checkbox("이 프로그램은 수익을 보장하지 않음을 이해했습니다.", key="real_ack_2")
-ack3 = st.checkbox("실전 주문은 실제 자금으로 실행됨을 이해했습니다.", key="real_ack_3")
-ack4 = st.checkbox("우선 1주 또는 소액 테스트만 진행합니다.", key="real_ack_4")
-ack5 = st.checkbox("실전 주문 결과에 대한 책임은 본인에게 있음을 이해했습니다.", key="real_ack_5")
-all_real_ack = all([ack1, ack2, ack3, ack4, ack5])
+# Daily REAL trade confirmation
+st.subheader("실전 주문 오늘 확인 (매일 1회 필요)")
+st.info("REAL 전체 리스트 매수를 위해 아래 6개를 매일 확인해야 합니다. 앱 재시작 후에도 오늘 날짜로 확인한 경우 유지됩니다.")
+
+# Load current confirmation state
+try:
+    _CONFIRM_PATH = PROJECT_ROOT / "data" / "real_trade_confirmation.json"
+    import json as _json
+    _confirm_data = _json.loads(_CONFIRM_PATH.read_text(encoding="utf-8")) if _CONFIRM_PATH.exists() else {}
+except Exception:
+    _confirm_data = {}
+
+_today_str = __import__("datetime").date.today().strftime("%Y%m%d")
+_confirmed_today = _confirm_data.get("confirmation_date") == _today_str and _confirm_data.get("real_trade_confirmed", False)
+if _confirmed_today:
+    st.success(f"오늘 실전 주문 확인 완료 — {_confirm_data.get('confirmed_at', '')[:19]}")
+else:
+    st.warning("오늘 아직 실전 주문 확인을 완료하지 않았습니다.")
+
+ack1 = st.checkbox("실전 주문 위험을 이해했습니다.", key="real_ack_1", value=bool(_confirm_data.get("confirm_live_trade")))
+ack2 = st.checkbox("이 프로그램은 수익을 보장하지 않음을 이해했습니다.", key="real_ack_2", value=bool(_confirm_data.get("understand_no_profit_guarantee")))
+ack3 = st.checkbox("실전 주문은 실제 자금으로 실행됨을 이해했습니다.", key="real_ack_3", value=bool(_confirm_data.get("understand_real_money")))
+ack4 = st.checkbox("주문이 미체결될 수 있음을 이해했습니다.", key="real_ack_4", value=bool(_confirm_data.get("understand_order_may_be_unfilled")))
+ack5 = st.checkbox("실전 주문 결과에 대한 책임은 본인에게 있음을 이해했습니다.", key="real_ack_5", value=bool(_confirm_data.get("understand_user_responsibility")))
+ack6 = st.checkbox("REAL 전체 리스트 매수를 허용합니다.", key="real_ack_6", value=bool(_confirm_data.get("allow_real_bulk_order")))
+all_real_ack = all([ack1, ack2, ack3, ack4, ack5, ack6])
 
 col_a, col_b, col_c = st.columns(3)
 with col_a:
-    if st.button("실전 개별 주문 테스트 모드 켜기", disabled=not all_real_ack, use_container_width=True):
+    if st.button("실전 개별 주문 테스트 모드 켜기", disabled=not all([ack1, ack2, ack3, ack4, ack5]), use_container_width=True):
         enable_real_single_test_mode()
-        st.success("실전 개별 주문 테스트 모드를 켰습니다. 전체 리스트 REAL 매수는 계속 비활성화됩니다.")
+        st.success("실전 개별 주문 테스트 모드를 켰습니다.")
         st.rerun()
 with col_b:
+    if st.button("오늘 실전 주문 확인 저장", disabled=not all_real_ack, use_container_width=True, type="primary"):
+        try:
+            from real_trade_confirmation import save_confirmation
+            result_save = save_confirmation({
+                "confirm_live_trade": ack1,
+                "understand_no_profit_guarantee": ack2,
+                "understand_real_money": ack3,
+                "understand_order_may_be_unfilled": ack4,
+                "understand_user_responsibility": ack5,
+                "allow_real_bulk_order": ack6,
+            })
+            st.success(f"실전 주문 확인이 저장되었습니다. 오늘({_today_str}) REAL 전체 리스트 매수가 가능합니다.")
+            st.rerun()
+        except Exception as _e:
+            st.error(f"확인 저장 실패: {_e}")
+with col_c:
     if st.button("실전 주문 전체 끄기", use_container_width=True):
         disable_real_ordering()
+        try:
+            from real_trade_confirmation import clear_confirmation
+            clear_confirmation()
+        except Exception:
+            pass
         st.success("실전 주문 설정을 모두 껐습니다.")
         st.rerun()
-with col_c:
+
+_rc, _rd = st.columns(2)
+with _rc:
     if st.button("실전 준비상태 점검 실행", use_container_width=True):
         with st.spinner("실전 준비상태 점검 중..."):
             readiness = run_real_order_readiness_check()
         st.json(readiness)
+with _rd:
+    if st.button("오늘 확인 초기화", use_container_width=True):
+        try:
+            from real_trade_confirmation import clear_confirmation
+            clear_confirmation()
+            st.success("오늘 확인을 초기화했습니다. 다시 확인 후 저장하세요.")
+            st.rerun()
+        except Exception as _e:
+            st.error(f"초기화 실패: {_e}")
 
 with st.expander("고급 옵션: 실전 전체 매수 허용 상태"):
     cfg_now = load_config()
-    st.caption(f"real_trade.allow_bulk_buy = {cfg_now.get('real_trade', {}).get('allow_bulk_buy', False)}")
-    st.caption(f"force_trade.allow_real_bulk_order = {cfg_now.get('force_trade', {}).get('allow_real_bulk_order', False)}")
-    st.warning("실전 전체 리스트 매수는 기본 비활성화입니다. 먼저 개별 종목 1주 테스트를 완료하세요.")
+    st.caption(f"real_trade.allow_bulk_buy_after_api_confirmation = {cfg_now.get('real_trade', {}).get('allow_bulk_buy_after_api_confirmation', False)}")
+    st.caption(f"real_trade.max_real_bulk_order_amount = {cfg_now.get('real_trade', {}).get('max_real_bulk_order_amount', 300000):,}원")
+    st.caption(f"오늘 확인 완료: {_confirmed_today}")
+    if _confirmed_today:
+        st.success("REAL 전체 리스트 매수 조건 충족 가능 상태입니다. 예산배분 및 주문 화면에서 나머지 조건을 확인하세요.")
+    else:
+        st.warning("오늘 실전 주문 확인을 먼저 완료하세요.")
