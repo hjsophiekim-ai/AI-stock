@@ -1248,11 +1248,101 @@ class KISApiClient:
             "QTY_ALL_ORD_YN": "N",
         }
         logger.info("[주문] 취소 | 원주문번호=%s | 종목=%s | 수량=%d", original_order_no, stock_code, quantity)
-        return self._post(
+        resp = self._post(
             "/uapi/domestic-stock/v1/trading/order-rvsecncl",
             tr_id,
             body,
         )
+        enriched = dict(resp)
+        enriched["original_order_no"] = original_order_no
+        enriched["operation_type"] = "CANCEL_SELL"
+        enriched["tr_id"] = tr_id
+        enriched.update(self.diagnostic_metadata())
+        return enriched
+
+    def cancel_and_replace_sell_order(
+        self,
+        stock_code: str,
+        original_order_no: str,
+        unfilled_qty: int,
+        new_price: int,
+        order_session: Optional[str] = None,
+        reason: str = "CANCEL_REPLACE_SELL_UNFILLED",
+    ) -> Dict:
+        """취소 후 재매도 (cancel + new sell).
+
+        정정 실패 시 대안으로 사용한다.
+        REAL 모드는 assert_can_place_real_order() 통과 필수.
+
+        Args:
+            stock_code: 종목코드
+            original_order_no: 취소할 원주문번호
+            unfilled_qty: 재매도할 수량
+            new_price: 신규 매도 가격
+            order_session: 거래 세션 (None이면 자동)
+            reason: 사유 (로그용)
+        """
+        from trading_calendar import TradingCalendar
+
+        if not self.gate.is_mock_allowed():
+            raise RuntimeError("PAPER 모드에서는 취소+재주문 API를 호출할 수 없습니다.")
+        if self.gate.mode == TRADE_MODE_REAL:
+            self.gate.assert_can_place_real_order()
+
+        result: Dict = {
+            "stock_code": str(stock_code).zfill(6),
+            "operation_type": "CANCEL_REPLACE_SELL",
+            "original_order_no": original_order_no,
+            "unfilled_qty": unfilled_qty,
+            "new_price": new_price,
+            "reason": reason,
+        }
+        result.update(self.diagnostic_metadata())
+
+        # Step 1: 취소
+        cancel_resp = self.cancel_order(original_order_no, stock_code, unfilled_qty)
+        result["cancel_rt_cd"] = cancel_resp.get("rt_cd", "")
+        result["cancel_msg"] = cancel_resp.get("msg1", "")
+
+        if cancel_resp.get("rt_cd", "") != "0":
+            result["success"] = False
+            result["rt_cd"] = cancel_resp.get("rt_cd", "")
+            result["msg"] = cancel_resp.get("msg1", "취소 실패")
+            result["rejected_reason"] = f"취소 실패: {result['cancel_msg']}"
+            logger.warning("[CANCEL_REPLACE_SELL] 취소 실패 종목=%s 원주문=%s msg=%s",
+                           stock_code, original_order_no, result["cancel_msg"])
+            return result
+
+        # Step 2: 신규 매도
+        if order_session is None:
+            cal = TradingCalendar(self._config_path)
+            order_session = cal.get_market_session()
+
+        # 호가단위 보정
+        tick_cfg = self.cfg.get("order_price", {})
+        if tick_cfg.get("tick_adjust_enabled", True):
+            method = tick_cfg.get("sell_tick_method", "ceil")
+            adjusted_price = adjust_price_to_tick(int(new_price), side="sell", method=method)
+        else:
+            adjusted_price = int(new_price)
+
+        resp2 = self.place_cash_sell_order(stock_code, unfilled_qty, adjusted_price, "limit", order_session)
+        new_order_no = resp2.get("output", {}).get("ODNO", "")
+        rt_cd2 = resp2.get("rt_cd", "")
+        result["rt_cd"] = rt_cd2
+        result["msg"] = resp2.get("msg1", resp2.get("raw_msg", ""))
+        result["new_order_no"] = new_order_no
+        result["new_price"] = adjusted_price
+        result["success"] = rt_cd2 == "0" and bool(new_order_no)
+
+        if result["success"]:
+            logger.info("[CANCEL_REPLACE_SELL] 취소 후 재주문 성공 종목=%s 신규주문=%s 가격=%d",
+                        stock_code, new_order_no, adjusted_price)
+        else:
+            result["rejected_reason"] = f"재매도 실패: {result['msg']}"
+            logger.warning("[CANCEL_REPLACE_SELL] 재주문 실패 종목=%s msg=%s", stock_code, result["msg"])
+
+        return result
 
     def get_order_status(self, order_no: str) -> Dict:
         """주문 체결 상태 조회.

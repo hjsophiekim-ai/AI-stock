@@ -1125,3 +1125,100 @@ python src/buy_candidate_list.py --file reports/predictions/top100_20260609.csv 
 python src/monitor_take_profit.py --mode mock --sell-policy market_strength_trailing --policy-override
 python src/monitor_take_profit.py --mode mock --loop --sleep 5
 ```
+
+---
+
+## 미체결 주문 정정 포함 전량 일괄매도
+
+### 개요
+
+전량 일괄매도 실행 전 KIS 미체결 매도 주문을 먼저 조회합니다.  
+미체결 주문이 있으면 **신규 중복 매도를 내지 않고 기존 주문을 정정(AMEND)**합니다.
+
+```
+흐름:
+  1. KIS 계좌 보유종목 조회
+  2. KIS 미체결 매도 주문 조회 (TR: VTTC8036R/TTTC8036R)
+  3. 종목별 처리:
+     A. 미체결 있음 → amend_order() 정정 (TR: VTTC0803U/TTTC0803U)
+        정정 실패 → cancel_and_replace_sell_order() 취소 후 재주문
+     B. 미체결 없음 + 보유수량 > 0 → 신규 매도 주문
+     C. 보유수량 0 → SKIP
+  4. 결과 → reports/orders/sell_orders_YYYYMMDD.csv
+  5. 1~2초 대기 → KIS 계좌 동기화 (--apply --close-missing)
+```
+
+### CLI 명령
+
+```bash
+# 미체결 주문 조회만
+python src/manual_sell_diagnosis.py --mode mock --check-open-orders
+
+# dry-run: 미체결 조회 + 정정 예정 목록 출력 (실제 주문 없음)
+python src/manual_sell_diagnosis.py --mode mock --all --dry-run --check-open-orders
+
+# 미체결 정정 포함 전량 일괄매도 실행
+python src/manual_sell_diagnosis.py --mode mock --all --execute --amend-unfilled
+
+# 단일 종목 정정 실행
+python src/manual_sell_diagnosis.py --mode mock --stock-code 035420 --execute --amend-unfilled
+
+# 정정 실패 시 취소 후 재주문 포함
+python src/manual_sell_diagnosis.py --mode mock --all --dry-run --cancel-replace-if-amend-fails
+
+# 전량 매도 후 KIS 계좌 동기화
+python src/sync_broker_positions.py --mode mock --strategy morning_0930 --apply --close-missing
+```
+
+### operation_type 분류
+
+| operation_type | 설명 |
+|---|---|
+| `NEW_SELL` | 미체결 없음 → 신규 매도 주문 |
+| `AMEND_SELL` | 미체결 있음 → 기존 주문 정정 |
+| `CANCEL_SELL` | 미체결 취소만 수행 |
+| `CANCEL_REPLACE_SELL` | 정정 실패 → 취소 후 재주문 |
+| `SKIP` | 보유수량 0 → 주문 없음 |
+
+### positions.json 상태 흐름
+
+```
+OPEN
+→ 매도 주문 접수
+→ OPEN_WITH_PENDING_SELL  (pending_sell_order_no, pending_sell_qty 기록)
+→ KIS 계좌 동기화 후 보유수량=0 확인
+→ CLOSED
+```
+
+매도 주문번호가 있다고 즉시 CLOSED 처리하지 않습니다.  
+`sync_broker_positions.py --apply --close-missing` 실행 후 KIS 실계좌 수량이 0일 때만 CLOSED 처리됩니다.
+
+### config.yaml sell 섹션
+
+```yaml
+sell:
+  open_order_check_before_sell: true   # 전량매도 전 미체결 조회
+  amend_unfilled_on_bulk_sell: true    # 미체결 있으면 정정 우선
+  cancel_replace_if_amend_fails: true  # 정정 실패 시 취소 후 재주문
+  aggressive_limit_sell: true          # 체결 가능성 높은 지정가
+  max_sell_slippage_pct: 1.0           # 최대 허용 슬리피지 %
+  sell_orders_csv_dir: reports/orders
+```
+
+### 추가된 KIS API 함수 (kis_api.py)
+
+| 함수 | TR_ID (MOCK/REAL) | 설명 |
+|---|---|---|
+| `get_open_orders(side, stock_code)` | VTTC8036R / TTTC8036R | 미체결 주문 조회 |
+| `amend_order(stock_code, order_no, qty, price)` | VTTC0803U / TTTC0803U | 주문 정정 |
+| `cancel_order(order_no, stock_code, qty)` | VTTC0803U / TTTC0803U | 주문 취소 |
+| `cancel_and_replace_sell_order(stock_code, order_no, qty, price)` | 취소+신규매도 | 취소 후 재주문 |
+
+### sell_orders CSV 예시
+
+```
+timestamp,operation_type,stock_code,stock_name,quantity,unfilled_qty,original_order_no,new_order_no,old_price,new_price,current_price,success,real_order_called,key_type_used
+2026-06-11 10:00:00,AMEND_SELL,005930,삼성전자,10,10,12345678,23456789,71000,70500,70300,True,False,MOCK_APP_KEY
+2026-06-11 10:00:01,NEW_SELL,035420,NAVER,5,0,,34567890,,85000,84800,True,False,MOCK_APP_KEY
+2026-06-11 10:00:02,SKIP,000270,기아,0,0,,,,,,,False,MOCK_APP_KEY
+```
