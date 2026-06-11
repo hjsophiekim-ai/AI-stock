@@ -327,7 +327,37 @@ with tab_mock:
             st.success("MOCK 로컬과 KIS MOCK 계좌가 일치합니다.")
 
     st.divider()
-    st.subheader("MOCK 매도")
+    st.subheader("MOCK 매도정책 감시")
+    _policies_mock = list_sell_policies()
+    _policy_label_to_id_mock = {p["name"]: p["id"] for p in _policies_mock}
+    _selected_policy_label_mock = st.radio(
+        "감시할 매도방식",
+        list(_policy_label_to_id_mock.keys()),
+        horizontal=True,
+        index=0,
+        key="mock_tab_policy",
+    )
+    _selected_policy_id_mock = _policy_label_to_id_mock[_selected_policy_label_mock]
+
+    _mock_pcols = st.columns(4)
+    with _mock_pcols[0]:
+        if st.button("+2% 기본 자동매도 감시 실행", use_container_width=True, key="mock_tab_sell1"):
+            result = run_force_sell_once(mode="mock", sell_policy_id="fixed_2pct", policy_override=True)
+            st.json({k: v for k, v in result.items() if k != "rows"})
+    with _mock_pcols[1]:
+        if st.button("강한 장 트레일링 감시 실행", use_container_width=True, key="mock_tab_sell2"):
+            result = run_force_sell_once(mode="mock", sell_policy_id="market_strength_trailing", policy_override=True)
+            st.json({k: v for k, v in result.items() if k != "rows"})
+    with _mock_pcols[2]:
+        if st.button("수동보유 종목 알림만 확인", use_container_width=True, key="mock_tab_sell3"):
+            result = run_force_sell_once(mode="mock", sell_policy_id="manual_hold", policy_override=True)
+            st.json({k: v for k, v in result.items() if k != "rows"})
+    with _mock_pcols[3]:
+        if st.button("선택 매도방식으로 1회 감시", use_container_width=True, key="mock_tab_sell4"):
+            result = run_force_sell_once(mode="mock", sell_policy_id=_selected_policy_id_mock, policy_override=True)
+            st.json({k: v for k, v in result.items() if k != "rows"})
+
+    st.subheader("MOCK 수동매도")
     _render_sell_section("MOCK", _mock_open, _mock_broker)
 
 

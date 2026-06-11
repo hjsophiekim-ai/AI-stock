@@ -205,6 +205,9 @@ if order_mode in ("MOCK", "REAL"):
         st.warning(f"모드 진단 로드 실패: {_e}")
 
 if order_mode == "REAL":
+    # Consume rerun flag set by preview button so conditions table reflects new plan_id
+    if st.session_state.pop("order_plan_just_created", False):
+        pass  # rerun already happened; flag consumed
     real_order_warning()
     import json as _json4
     from trading_service import get_real_bulk_buy_readiness
@@ -373,7 +376,9 @@ with col_preview:
                     st.session_state["current_order_plan_id"] = _plan_id
                     st.session_state["current_order_plan_total"] = _plan_total
                     st.session_state["current_order_plan_preview"] = result["allocation_preview"]
+                    st.session_state["order_plan_just_created"] = True
                     st.info(f"주문계획 생성됨: `{_plan_id}` | 예정금액: {_plan_total:,}원")
+                    st.rerun()
             else:
                 st.warning(result.get("message", "미리보기 결과가 없습니다."))
 
