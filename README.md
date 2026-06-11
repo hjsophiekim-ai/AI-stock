@@ -1526,3 +1526,66 @@ python -c "import sys; sys.path.insert(0,'app/services'); from real_trade_confir
 # 4. 전체 매수 준비상태 API 점검
 python -c "import sys; sys.path.insert(0,'app/services'); from trading_service import get_real_bulk_buy_readiness; import json; print(json.dumps(get_real_bulk_buy_readiness(planned_total_amount=100000, order_plan_id='test'), ensure_ascii=False, indent=2))"
 ```
+
+---
+
+## MOCK/REAL/PAPER 포지션 파일 분리 (Task D — 2026-06-11 변경)
+
+### 개요
+
+기존 단일 `data/positions.json`을 MOCK/REAL/PAPER별로 분리합니다.
+`data/positions.json`은 레거시 참조용으로만 유지되며, 신규 주문/매도/RiskManager는 mode별 파일을 사용합니다.
+
+### 포지션 파일 구조
+
+| mode | 로컬 포지션 파일 | 브로커 캐시 파일 | KIS 서버 |
+|---|---|---|---|
+| `mock` | `data/positions_mock.json` | `data/broker_positions_mock.json` | openapivts (KIS_MOCK_APP_KEY) |
+| `real` | `data/positions_real.json` | `data/broker_positions_real.json` | openapi (KIS_REAL_APP_KEY) |
+| `paper` | `data/positions_paper.json` | 없음 (API 미사용) | 없음 |
+
+### 보유종목 및 매도감시 화면 탭 구조
+
+| 탭 | 내용 |
+|---|---|
+| MOCK 계좌 보기 | KIS MOCK 새로고침, MOCK 동기화, MOCK 매도 버튼, positions_mock.json |
+| REAL 계좌 보기 | REAL 준비상태 확인, KIS REAL 새로고침, REAL 동기화, REAL 매도 버튼, positions_real.json |
+| PAPER 가상 포지션 | API 호출 없음, positions_paper.json |
+| 전체 이력/진단 | 모든 포지션 파일 읽기 전용 표시, 매도정책 감시 (MOCK) |
+
+### MOCK/REAL 분리 규칙
+
+- MOCK 탭에서 매도 → `requested_mode=mock`, `positions_mock.json`, `mock_order_called=True`, `real_order_called=False`
+- REAL 탭에서 매도 → `requested_mode=real`, `positions_real.json`, `real_order_called=True`, REAL readiness 필요
+- PAPER 탭 → API 호출 없음
+- MOCK 탭에서 `positions_real.json` 참조 금지
+- REAL 탭에서 `positions_mock.json` 참조 금지
+
+### 관련 파일
+
+| 파일 | 역할 |
+|---|---|
+| `src/position_manager.py` | `get_position_path(mode)` 추가, `__init__(mode=)` 지원 |
+| `src/sync_broker_positions.py` | `PositionManager(mode=mode)`, mode별 broker_positions 파일 |
+| `app/pages/5_보유종목_및_매도감시.py` | 4탭 구조로 전면 개편 |
+| `app/services/trading_service.py` | `get_positions_with_current_price(mode=)`, `get_broker_positions(mode=)` |
+| `data/positions_mock.json` | MOCK 포지션 저장소 (신규) |
+| `data/positions_real.json` | REAL 포지션 저장소 (신규) |
+| `data/positions_paper.json` | PAPER 포지션 저장소 (신규) |
+| `src/verify_mode_separation.py` | 분리 검증 스크립트 |
+
+### 검증 명령
+
+```bash
+# 1. 컴파일 검사
+python -m compileall src app -q
+
+# 2. MOCK 동기화 (적용)
+python src/sync_broker_positions.py --mode mock --strategy morning_0930 --apply --close-missing
+
+# 3. REAL 동기화 (조회만)
+python src/sync_broker_positions.py --mode real --strategy morning_0930
+
+# 4. 분리 검증
+python src/verify_mode_separation.py
+```

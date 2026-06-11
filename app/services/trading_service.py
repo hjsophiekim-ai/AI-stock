@@ -53,20 +53,53 @@ def get_positions() -> List[Dict]:
         return []
 
 
-def get_positions_with_current_price() -> List[Dict]:
+def get_positions_with_current_price(mode: str = "") -> List[Dict]:
     inject_to_os_env()
-    positions = get_positions()
-    cfg = load_config()
-    mode = get_trade_mode(cfg)
+    if mode:
+        from position_manager import PositionManager
+        pm = PositionManager(str(PROJECT_ROOT / "config.yaml"), mode=mode)
+        positions = []
+        _open = pm.get_open_positions() if hasattr(pm, "get_open_positions") else {
+            k: v for k, v in pm.get_all_positions().items() if not getattr(v, "is_closed", False)
+        }
+        for code, pos in _open.items():
+            positions.append({
+                "stock_code": code,
+                "stock_name": getattr(pos, "stock_name", ""),
+                "quantity": getattr(pos, "quantity", 0),
+                "entry_price": getattr(pos, "entry_price", 0),
+                "avg_price": getattr(pos, "avg_price", getattr(pos, "entry_price", 0)),
+                "target_price": getattr(pos, "target_price", 0),
+                "stop_loss_price": getattr(pos, "stop_loss_price", getattr(pos, "stop_price", 0)),
+                "entry_time": str(getattr(pos, "entry_time", "")),
+                "order_no": getattr(pos, "order_no", ""),
+                "strategy_id": getattr(pos, "strategy_id", ""),
+                "strategy_name": getattr(pos, "strategy_name", ""),
+                "sell_policy_id": getattr(pos, "sell_policy_id", "fixed_2pct"),
+                "sell_policy_name": getattr(pos, "sell_policy_name", "기본 자동매도"),
+                "trailing_active": getattr(pos, "trailing_active", False),
+                "trailing_high_price": getattr(pos, "trailing_high_price", 0),
+                "trailing_stop_price": getattr(pos, "trailing_stop_price", 0),
+                "manual_only": getattr(pos, "manual_only", False),
+                "auto_take_profit_enabled": getattr(pos, "auto_take_profit_enabled", True),
+                "allowed_sell_sessions": getattr(pos, "allowed_sell_sessions", []),
+                "status": getattr(pos, "status", "OPEN"),
+                "source": getattr(pos, "source", "local"),
+                "force_trade_mode": getattr(pos, "force_trade_mode", False),
+                "current_price": getattr(pos, "current_price", 0),
+            })
+    else:
+        positions = get_positions()
+    _effective_mode = (mode or "").upper() or get_trade_mode(load_config())
     for pos in positions:
         entry = float(pos.get("entry_price", 0) or 0)
-        current_price = entry
-        if mode != "PAPER":
+        current_price = float(pos.get("current_price", entry) or entry)
+        if _effective_mode != "PAPER":
             try:
                 from api_service import test_current_price
                 current_price = float(test_current_price(pos["stock_code"]).get("price", entry) or entry)
             except Exception:
-                current_price = float(pos.get("current_price", entry) or entry)
+                pass
         qty = int(pos.get("quantity", 0) or 0)
         pnl = (current_price - entry) * qty
         pnl_rate = (current_price / entry - 1) * 100 if entry else 0
@@ -79,11 +112,18 @@ def get_positions_with_current_price() -> List[Dict]:
     return positions
 
 
-def get_broker_positions() -> List[Dict]:
+def get_broker_positions(mode: str = "mock") -> List[Dict]:
     inject_to_os_env()
     try:
         from api_service import get_broker_positions as _api_get
-        return _api_get().get("positions", [])
+        return _api_get(mode=mode).get("positions", [])
+    except TypeError:
+        # fallback: api_service.get_broker_positions doesn't accept mode arg
+        try:
+            from api_service import get_broker_positions as _api_get
+            return _api_get().get("positions", [])
+        except Exception:
+            return []
     except Exception:
         return []
 
