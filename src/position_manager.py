@@ -1,4 +1,4 @@
-"""Local position storage for buy/sell and take-profit monitoring."""
+﻿"""Local position storage for buy/sell and take-profit monitoring."""
 
 import json
 from dataclasses import asdict, dataclass, field

@@ -1,4 +1,4 @@
-"""Synchronize KIS broker positions into data/positions.json."""
+﻿"""Synchronize KIS broker positions into data/positions.json."""
 
 import argparse
 import json

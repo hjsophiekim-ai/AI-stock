@@ -1,4 +1,4 @@
-"""보유종목 및 매도감시 화면."""
+﻿"""보유종목 및 매도감시 화면."""
 
 import sys
 from pathlib import Path

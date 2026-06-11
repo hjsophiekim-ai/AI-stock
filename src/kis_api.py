@@ -1,4 +1,4 @@
-"""한국투자증권 Open API 호출 래퍼 클래스.
+﻿"""한국투자증권 Open API 호출 래퍼 클래스.
 
 공식 문서 기준 재확인 필요:
   모든 endpoint, TR_ID, 요청/응답 필드는 KIS Developers 공식 문서를 최종 기준으로 합니다.

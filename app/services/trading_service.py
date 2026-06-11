@@ -1,4 +1,4 @@
-"""Trading service wrappers used by the Streamlit pages."""
+﻿"""Trading service wrappers used by the Streamlit pages."""
 
 import sys
 from pathlib import Path
