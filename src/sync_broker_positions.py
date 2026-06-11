@@ -46,7 +46,7 @@ def sync_broker_positions(
     gate = SafetyGate(config_path, runtime_mode=mode)
     api = KISApiClient(config_path, gate=gate)
     broker_df = api.get_positions()
-    pm = PositionManager(config_path)
+    pm = PositionManager(config_path, mode=mode)
     local_open_before = pm.get_open_positions()
     strategy_cfg = get_strategy(strategy)
     now = datetime.now()
@@ -58,7 +58,9 @@ def sync_broker_positions(
 
     if broker_df is None:
         broker_df = pd.DataFrame()
-    with open(PROJECT_ROOT / "data" / "broker_positions.json", "w", encoding="utf-8") as f:
+    _mode_lower = (mode or "mock").lower()
+    _broker_pos_file = PROJECT_ROOT / "data" / f"broker_positions_{_mode_lower}.json"
+    with open(_broker_pos_file, "w", encoding="utf-8") as f:
         json.dump(broker_df.to_dict("records"), f, ensure_ascii=False, indent=2)
 
     # Backup positions.json before applying destructive changes
@@ -66,9 +68,9 @@ def sync_broker_positions(
     if apply and (close_missing or purge_missing):
         backup_dir = PROJECT_ROOT / "reports" / "position_backups"
         ensure_dir(str(backup_dir))
-        positions_file = PROJECT_ROOT / "data" / "positions.json"
+        positions_file = PROJECT_ROOT / "data" / f"positions_{_mode_lower}.json"
         if positions_file.exists():
-            backup_path = backup_dir / f"positions_before_sync_{today}.json"
+            backup_path = backup_dir / f"positions_{_mode_lower}_before_sync_{today}.json"
             shutil.copy2(str(positions_file), str(backup_path))
 
     diff_rows = []
@@ -173,6 +175,7 @@ def sync_broker_positions(
         "success": True,
         "mode": mode,
         "resolved_mode": gate.mode,
+        "position_path": str(pm._positions_file),
         "broker_count": int(len(broker_df)),
         "local_count": int(len(pm.get_all_positions())),
         "open_count": open_count,

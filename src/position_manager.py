@@ -70,13 +70,29 @@ class PositionRecord:
 
 
 class PositionManager:
-    def __init__(self, config_path: str = "config.yaml") -> None:
+    @staticmethod
+    def get_position_path(mode: str = "") -> Path:
+        """Return the positions file path for the given trade mode."""
+        _mode = (mode or "").lower().strip()
+        if _mode == "mock":
+            return Path("data/positions_mock.json")
+        elif _mode == "real":
+            return Path("data/positions_real.json")
+        elif _mode == "paper":
+            return Path("data/positions_paper.json")
+        return Path("data/positions.json")
+
+    def __init__(self, config_path: str = "config.yaml", mode: str = "") -> None:
         self.cfg = load_config(config_path)
+        self._mode = (mode or "").lower().strip()
         strategy = self.cfg.get("strategy", {})
         self._target_rate = float(strategy.get("target_profit_rate", 0.02))
         self._stop_rate = float(strategy.get("stop_loss_rate", -0.03))
         self._forced_exit_time = strategy.get("forced_exit_time_next_day", "09:30")
-        self._positions_file = Path(self.cfg.get("data", {}).get("positions_file", "data/positions.json"))
+        if self._mode:
+            self._positions_file = PositionManager.get_position_path(self._mode)
+        else:
+            self._positions_file = Path(self.cfg.get("data", {}).get("positions_file", "data/positions.json"))
         self._positions: Dict[str, PositionRecord] = {}
         self._load_local_positions()
 
