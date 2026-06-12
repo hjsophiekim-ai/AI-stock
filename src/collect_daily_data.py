@@ -255,6 +255,24 @@ def collect_all_daily_data(
         if last_date >= end_date:
             logger.info("이미 최신 데이터가 수집되어 있습니다.")
             return
+
+        # ── 장 마감 전 스킵 로직 ─────────────────────────────────────
+        # 장중(09:00~16:30 KST)에는 오늘의 EOD 데이터가 아직 없으므로
+        # 2607개 종목을 모두 조회해봤자 시간만 낭비된다.
+        # 기존 데이터가 3일 이내(주말 포함)이면 장 마감 후까지 기다린다.
+        _now = datetime.now()
+        _market_closed = (_now.hour > 16) or (_now.hour == 16 and _now.minute >= 30)
+        _last_dt = datetime.strptime(last_date, "%Y%m%d")
+        _end_dt = datetime.strptime(end_date, "%Y%m%d")
+        _days_old = (_end_dt - _last_dt).days
+        if _days_old <= 3 and not _market_closed:
+            logger.info(
+                f"장 마감 전 — 기존 데이터({last_date}, {_days_old}일 전) 사용. "
+                f"장 마감(16:30) 후 재실행하면 오늘({end_date}) 데이터를 수집합니다."
+            )
+            return
+        # ─────────────────────────────────────────────────────────────
+
         start_date = last_date
         all_data.append(existing)
         logger.info(f"기존 데이터 로드 ({len(existing):,}행), {last_date}부터 업데이트")

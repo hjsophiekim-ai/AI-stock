@@ -78,6 +78,23 @@ def load_top_n(n: int, date_str: str):
     return None
 
 
+def load_top_n_latest(n: int, date_str: str):
+    """오늘 파일이 없으면 가장 최근 top{n} 파일을 반환. (date_str, df) 튜플."""
+    df = load_top_n(n, date_str)
+    if df is not None:
+        return date_str, df
+    # 가장 최근 파일 탐색
+    candidates = sorted(predictions_dir.glob(f"top{n}_????????.csv"), reverse=True)
+    for p in candidates:
+        try:
+            df = pd.read_csv(p)
+            found_date = p.stem.split("_")[1]
+            return found_date, df
+        except Exception:
+            continue
+    return date_str, None
+
+
 # ── 파일 상태 ──────────────────────────────────────────────────
 top100_path = predictions_dir / f"top100_{today_str}.csv"
 top20_path = predictions_dir / f"top20_{today_str}.csv"
@@ -168,8 +185,14 @@ with row2[3]:
 st.divider()
 
 # ── Top100 리스트 ────────────────────────────────────────────────
-st.subheader(f"오늘의 AI Top100 후보 ({today_str})")
-df_top100 = load_top_n(100, today_str)
+_top100_date, df_top100 = load_top_n_latest(100, today_str)
+if _top100_date != today_str:
+    st.warning(
+        f"오늘({today_str}) 파이프라인 결과가 아직 없습니다. "
+        f"가장 최근 데이터({_top100_date})를 표시합니다. "
+        f"장 마감(16:30) 후 '전체 파이프라인 실행'을 누르면 오늘 결과가 생성됩니다."
+    )
+st.subheader(f"AI Top100 후보 ({_top100_date})")
 
 if df_top100 is not None and not df_top100.empty:
     # 종목코드 6자리 정규화
@@ -220,7 +243,7 @@ if df_top100 is not None and not df_top100.empty:
     selected_rows = edited[edited["선택"] == True] if "선택" in edited.columns else pd.DataFrame()
 
     csv = df_display.to_csv(index=False, encoding="utf-8-sig")
-    st.download_button(f"Top{show_n} CSV 다운로드", csv, f"top{show_n}_{today_str}.csv", "text/csv")
+    st.download_button(f"Top{show_n} CSV 다운로드", csv, f"top{show_n}_{_top100_date}.csv", "text/csv")
 
     st.divider()
 
