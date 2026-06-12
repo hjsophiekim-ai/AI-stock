@@ -239,22 +239,56 @@ def refresh_candidate_prices_service(
         return {"success": False, "message": str(e), "updated": 0, "price_mode": (mode or "mock").upper()}
 
 
-def run_budget_allocation(budget: int, date_str: Optional[str] = None) -> Dict:
+def run_budget_allocation(
+    budget: int,
+    date_str: Optional[str] = None,
+    candidate_file: Optional[str] = None,
+    mode: str = "mock",
+) -> Dict:
+    """예산배분 계산 — 매수 버튼과 동일한 후보파일·orderable_cash를 사용해 수량 불일치 방지."""
     inject_to_os_env()
     try:
-        from prediction_service import load_top20, get_today_str
+        import pandas as pd
         from budget_allocator import BudgetAllocator
-        ds = date_str or get_today_str()
-        df = load_top20(ds)
-        if df is None or df.empty:
-            return {"success": False, "message": "top20 file not found", "data": None}
+
+        # 매수 버튼과 동일한 후보 파일 로드
+        df = None
+        if candidate_file:
+            _p = Path(candidate_file)
+            if _p.exists():
+                df = pd.read_csv(_p)
+
+        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+            from prediction_service import load_top20, get_today_str
+            ds = date_str or get_today_str()
+            df = load_top20(ds)
+            if df is None or df.empty:
+                return {"success": False, "message": "후보 파일을 찾을 수 없습니다 (top20 fallback도 없음)", "data": None}
+
+        # 매수 버튼의 _get_orderable_cash()와 동일한 로직으로 orderable_cash 결정
+        orderable_cash = int(budget)
+        if (mode or "mock").lower() not in ("paper",):
+            try:
+                from kis_api import KISApiClient
+                from safety_gate import SafetyGate
+                _cfg = str(PROJECT_ROOT / "config.yaml")
+                _gate = SafetyGate(_cfg, runtime_mode=(mode or "mock").lower())
+                _cash = int(KISApiClient(_cfg, gate=_gate).get_orderable_cash() or 0)
+                if _cash > 0:
+                    orderable_cash = _cash
+            except Exception:
+                pass  # fallback: int(budget)
+
         allocator = BudgetAllocator(str(PROJECT_ROOT / "config.yaml"))
-        result = allocator.allocate_until_budget(candidates=df, budget=int(budget), orderable_cash=int(budget))
+        result = allocator.allocate_until_budget(
+            candidates=df, budget=int(budget), orderable_cash=orderable_cash
+        )
         summary = {
             "allocated_count": len(result.allocations),
             "total_order_amount": result.total_order_amount,
             "remaining_budget": result.remaining_budget,
             "input_budget": budget,
+            "orderable_cash": orderable_cash,
             "effective_budget": result.effective_budget,
         }
         return {"success": True, "data": result, "summary": summary}

@@ -35,21 +35,33 @@ from warning_box import no_profit_guarantee_notice, real_order_warning
 from mode_badge import render_mode_badge, render_mode_warning
 
 
-def _load_candidates(date_str: str) -> tuple[pd.DataFrame | None, int, str | None]:
+def _load_candidates(date_str: str):
+    """오늘 날짜 파일 우선, 없으면 가장 최근 파일로 fallback. (df, n, file, loaded_date) 반환."""
     predictions_dir = PROJECT_ROOT / "reports" / "predictions"
     enriched_path = PROJECT_ROOT / "reports" / f"enriched_candidates_{date_str}.csv"
     if enriched_path.exists():
         df = pd.read_csv(enriched_path)
         if not df.empty:
-            return df, 100, str(enriched_path)
+            return df, 100, str(enriched_path), date_str
 
     for n in (100, 50, 20):
         path = predictions_dir / f"top{n}_{date_str}.csv"
         if path.exists():
             df = pd.read_csv(path)
             if not df.empty:
-                return df, n, str(path)
-    return None, 0, None
+                return df, n, str(path), date_str
+
+    # Fallback: 가장 최근 날짜 파일
+    for n in (100, 50, 20):
+        for p in sorted(predictions_dir.glob(f"top{n}_????????.csv"), reverse=True):
+            try:
+                df = pd.read_csv(p)
+                if not df.empty:
+                    found_date = p.stem.split("_")[1]
+                    return df, n, str(p), found_date
+            except Exception:
+                continue
+    return None, 0, None, date_str
 
 
 def _render_budget_metrics(result: dict) -> None:
@@ -88,13 +100,18 @@ render_mode_badge(mode)
 render_mode_warning(mode)
 
 today_str = get_today_str()
-df_candidates, loaded_n, candidate_file = _load_candidates(today_str)
+df_candidates, loaded_n, candidate_file, loaded_date = _load_candidates(today_str)
 
 if df_candidates is None or df_candidates.empty:
-    st.warning("오늘 후보 파일이 없습니다. 먼저 AI 후보 리스트 화면에서 후보를 생성하세요.")
+    st.warning("후보 파일이 없습니다. 먼저 파이프라인을 실행해 AI 후보 리스트를 생성하세요.")
     st.stop()
 
-st.success(f"Top{loaded_n} 후보 파일 로드 완료: {len(df_candidates)}개 종목")
+if loaded_date != today_str:
+    st.warning(
+        f"오늘({today_str}) 파일이 없습니다. 가장 최근({loaded_date}) 데이터를 표시합니다. "
+        f"장 마감(16:30) 후 파이프라인을 실행하면 오늘 결과가 생성됩니다."
+    )
+st.success(f"Top{loaded_n} 후보 파일 로드 완료: {len(df_candidates)}개 종목 ({loaded_date})")
 
 st.subheader("거래전략 선택")
 try:
@@ -151,16 +168,19 @@ with st.expander("후보 목록 미리보기", expanded=False):
 st.divider()
 st.subheader("예산배분 계산")
 if st.button("예산배분 계산", type="primary"):
+    _alloc_mode = st.session_state.get("strategy_order_mode", "MOCK").lower()
     with st.spinner("예산배분 계산 중..."):
-        result = run_budget_allocation(int(budget), today_str)
+        result = run_budget_allocation(int(budget), candidate_file=candidate_file, mode=_alloc_mode)
     if result.get("success"):
         st.success("예산배분 완료")
         summary = result.get("summary", {})
         _render_budget_metrics(
             {
                 "input_budget": int(budget),
+                "orderable_cash": summary.get("orderable_cash", int(budget)),
+                "effective_budget": summary.get("effective_budget", int(budget)),
                 "expected_order_amount": summary.get("total_order_amount", 0),
-                "remaining_budget": int(budget) - int(summary.get("total_order_amount", 0) or 0),
+                "remaining_budget": int(summary.get("effective_budget", int(budget))) - int(summary.get("total_order_amount", 0) or 0),
             }
         )
         data = result.get("data")
