@@ -183,7 +183,7 @@ def buy_candidates(
         held_codes = set()
         try:
             from position_manager import PositionManager
-            held_codes = set(PositionManager(CONFIG_PATH).get_all_positions().keys())
+            held_codes = set(PositionManager(CONFIG_PATH, mode=mode).get_all_positions().keys())
         except Exception:
             pass
 
@@ -247,7 +247,7 @@ def buy_candidates(
             return {**base_result, "success": True, "stage": "preview", "message": f"preview created: {len(preview)} orders", "orders_placed": 0, "allocation_preview": preview, "errors": errors}
 
         from position_manager import PositionManager
-        pm = PositionManager(CONFIG_PATH)
+        pm = PositionManager(CONFIG_PATH, mode=mode)
         order_results = []
         orders_placed = 0
         for a in allocations:

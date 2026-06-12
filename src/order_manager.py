@@ -9,6 +9,7 @@ REAL 모드: SafetyGate + RiskManager 통과 후 실전 API 호출.
 
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -48,9 +49,12 @@ class OrderManager:
         self.cfg = load_config(config_path)
         self.gate = gate if gate is not None else SafetyGate(config_path, runtime_mode=runtime_mode)
         self.risk = RiskManager(config_path)
-        self.pos_mgr = PositionManager(config_path)
+        _pm_mode = (self.gate.mode or "").lower()
+        self.pos_mgr = PositionManager(config_path, mode=_pm_mode)
         self.calendar = TradingCalendar(config_path)
-        self._orders_dir = self.cfg.get("paths", {}).get("orders_dir", "reports/orders")
+        _orders_dir_cfg = self.cfg.get("paths", {}).get("orders_dir", "reports/orders")
+        _project_root = Path(__file__).resolve().parent.parent
+        self._orders_dir = str(_project_root / _orders_dir_cfg) if not Path(_orders_dir_cfg).is_absolute() else _orders_dir_cfg
         self._max_retries = self.cfg.get("safety", {}).get("max_order_retries", 3)
         self._cancel_after_sec = self.cfg.get("order", {}).get("cancel_unfilled_after_seconds", 20)
         self._buy_adj = self.cfg.get("order", {}).get("buy_price_adjustment_rate", 0.001)
