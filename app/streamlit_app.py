@@ -4,8 +4,8 @@
     streamlit run app/streamlit_app.py
 """
 
-import sys
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +21,19 @@ for _p in (
         sys.path.insert(0, _p)
 
 import streamlit as st
+
+# 앱 시작 시 필수 디렉토리 자동 생성
+try:
+    _startup_path = PROJECT_ROOT / "app" / "services" / "startup_service.py"
+    if _startup_path.exists():
+        sys.path.insert(0, str(PROJECT_ROOT / "app" / "services"))
+        from startup_service import ensure_dirs, get_commit_hash
+        ensure_dirs()
+        _COMMIT_HASH = get_commit_hash()
+    else:
+        _COMMIT_HASH = os.environ.get("RENDER_GIT_COMMIT", "UNKNOWN")[:8] or "UNKNOWN"
+except Exception:
+    _COMMIT_HASH = "UNKNOWN"
 
 st.set_page_config(
     page_title="AI Stock 자동매매",
@@ -54,6 +67,9 @@ def main():
         st.page_link("pages/8_로그_및_긴급중단.py", label="8. 로그 및 긴급중단", icon="🚨")
         st.divider()
         st.caption(f"날짜: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        st.caption(f"커밋: `{_COMMIT_HASH}`")
+        if os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"):
+            st.caption("🌐 Render 배포 환경")
 
     # ── 헤더 ────────────────────────────────────────────────────
     st.title("📈 AI Stock 자동매매 대시보드")

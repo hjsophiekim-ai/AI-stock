@@ -1,5 +1,6 @@
 """예산배분 및 주문 화면."""
 
+import os
 import sys
 from pathlib import Path
 
@@ -29,6 +30,8 @@ from trading_service import (
     run_real_order_diagnosis,
     run_real_order_verify,
     run_real_single_order_test,
+    get_kis_token_status,
+    check_kis_account,
 )
 from prediction_service import get_today_str
 from warning_box import no_profit_guarantee_notice, real_order_warning
@@ -104,6 +107,25 @@ df_candidates, loaded_n, candidate_file, loaded_date = _load_candidates(today_st
 
 if df_candidates is None or df_candidates.empty:
     st.warning("후보 파일이 없습니다. 먼저 파이프라인을 실행해 AI 후보 리스트를 생성하세요.")
+
+    # 진단 정보
+    _preds_dir = PROJECT_ROOT / "reports" / "predictions"
+    _preds_exists = _preds_dir.exists()
+    st.subheader("후보 파일 부재 진단")
+    _dc1, _dc2, _dc3 = st.columns(3)
+    _dc1.metric("reports/predictions 폴더", "✅ 있음" if _preds_exists else "❌ 없음")
+    if _preds_exists:
+        _top100_files = list(_preds_dir.glob(f"top100_{today_str}*.csv"))
+        _any_top_files = list(_preds_dir.glob("top*.csv"))
+        _dc2.metric(f"top100_{today_str}.csv", "✅ 있음" if _top100_files else "❌ 없음")
+        _dc3.metric("전체 후보 파일 수", f"{len(_any_top_files)}개")
+        if _any_top_files:
+            _latest = sorted(_any_top_files, key=lambda f: f.stat().st_mtime, reverse=True)[0]
+            st.info(f"가장 최근 후보 파일: {_latest.name}")
+    else:
+        _dc2.metric(f"top100_{today_str}.csv", "❌ 없음")
+        _dc3.metric("전체 후보 파일 수", "0개")
+    st.info("**해결 방법**: AI 후보 리스트 페이지 → '전체 파이프라인 실행' 버튼 클릭")
     st.stop()
 
 if loaded_date != today_str:
@@ -319,16 +341,102 @@ if order_mode == "REAL":
 
     real_bulk_ok = _bulk_readiness.get("ready", False)
 
-else:
+elif order_mode == "MOCK":
+    # ── MOCK 전부 매수 preflight ──────────────────────────────────
+    st.subheader("MOCK 매수 Preflight 체크")
+    st.caption("MOCK 주문은 모의투자 서버(openapivts)와 KIS_MOCK_APP_KEY만 사용합니다.")
+
+    # .env 주입
+    try:
+        from env_service import inject_to_os_env as _inj_mock
+        _inj_mock()
+    except Exception:
+        pass
+
+    # 1. 환경변수
+    _mk_ok = bool(os.environ.get("KIS_MOCK_APP_KEY"))
+    _ms_ok = bool(os.environ.get("KIS_MOCK_APP_SECRET"))
+    _ma_ok = bool(os.environ.get("KIS_MOCK_ACCOUNT_NO"))
+    _mock_env_all_ok = _mk_ok and _ms_ok and _ms_ok and _ma_ok
+
+    # 2. 토큰 캐시 상태
+    _mts = get_kis_token_status("mock")
+    _mock_cache = _mts.get("cache_exists", False)
+    _mock_token_valid = _mock_cache and not _mts.get("is_expired", True)
+
+    # 3. 계좌조회 (세션 상태)
+    _mock_acc_result = st.session_state.get("mock_preflight_account_ok", None)
+
+    # 4. 미리보기 결과 (세션 상태)
+    _mock_alloc_preview = st.session_state.get("mock_allocation_preview", [])
+    _mock_alloc_exists = len(_mock_alloc_preview) > 0
+    _mock_total_qty = sum(int(r.get("quantity", 0) or 0) for r in _mock_alloc_preview)
+    _mock_total_amt = sum(int(r.get("order_amount", 0) or 0) for r in _mock_alloc_preview)
+
+    # preflight 아이템 (None = 미확인, True = OK, False = FAIL)
+    _pf_items = [
+        ("MOCK 환경변수\n(KEY/SECRET/ACCOUNT)", _mock_env_all_ok),
+        ("MOCK 토큰 유효\n(캐시 상태)", _mock_token_valid if _mock_cache else (None if _mock_env_all_ok else False)),
+        ("MOCK 계좌조회", _mock_acc_result),
+        ("주문계획 존재\n(미리보기 필요)", _mock_alloc_exists),
+        ("주문계획 해시\n(MOCK: 자동 OK)", True),
+        ("주문수량 > 0", (_mock_total_qty > 0) if _mock_alloc_exists else None),
+        ("예상주문금액 > 0", (_mock_total_amt > 0) if _mock_alloc_exists else None),
+    ]
+
+    # 테이블 표시
+    _pf_cols = st.columns(len(_pf_items))
+    for _col, (_lbl, _val) in zip(_pf_cols, _pf_items):
+        if _val is None:
+            _col.metric(_lbl, "⬜ 미확인")
+        elif _val:
+            _col.metric(_lbl, "✅ OK")
+        else:
+            _col.metric(_lbl, "❌ FAIL")
+
+    # 계좌조회 버튼
+    if st.button("MOCK 계좌조회 확인", key="mock_preflight_acc_btn"):
+        with st.spinner("MOCK 계좌조회 중..."):
+            _acc_r = check_kis_account("mock")
+        if _acc_r.get("account_ok"):
+            st.session_state["mock_preflight_account_ok"] = True
+            st.success(f"MOCK 계좌조회 OK — {_acc_r.get('broker_count', 0)}개 종목")
+        else:
+            st.session_state["mock_preflight_account_ok"] = False
+            _acc_err = (_acc_r.get("response_text") or _acc_r.get("error") or "")[:200]
+            st.error(f"MOCK 계좌조회 실패: {_acc_err}")
+        st.rerun()
+
+    # 실패 사유 표시
+    _fail_reasons = [_lbl.replace("\n", " ") for _lbl, _val in _pf_items if _val is False]
+    if _fail_reasons:
+        st.error(f"MOCK 전부 매수 차단 사유: {' | '.join(_fail_reasons)}")
+        if not _mock_env_all_ok:
+            st.error(
+                "❌ KIS_MOCK_APP_KEY / KIS_MOCK_APP_SECRET / KIS_MOCK_ACCOUNT_NO 가 누락되었습니다.\n\n"
+                "**Render Dashboard > Environment Variables에 MOCK 키를 입력하세요.**"
+            )
+
+    _fail_definite = [_val for _, _val in _pf_items if _val is False]
     real_bulk_ok = True
+    mock_bulk_ok = len(_fail_definite) == 0
     _real_confirm1 = False
     _real_confirm2 = False
-    if order_mode == "MOCK":
-        st.info("MOCK 주문은 모의투자 서버 openapivts와 KIS_MOCK_APP_KEY만 사용해야 합니다.")
+
+else:  # PAPER
+    real_bulk_ok = True
+    mock_bulk_ok = True
+    _real_confirm1 = False
+    _real_confirm2 = False
 
 col_buy, col_preview = st.columns(2)
 with col_buy:
-    if st.button("현재 리스트 전부 매수", type="primary", use_container_width=True, disabled=(order_mode == "REAL" and not real_bulk_ok)):
+    # REAL: real_bulk_ok 조건 / MOCK: mock_bulk_ok 조건 / PAPER: 항상 허용
+    _buy_disabled = (
+        (order_mode == "REAL" and not real_bulk_ok)
+        or (order_mode == "MOCK" and not locals().get("mock_bulk_ok", True))
+    )
+    if st.button("현재 리스트 전부 매수", type="primary", use_container_width=True, disabled=_buy_disabled):
         if not candidate_file:
             st.error("후보 파일이 없습니다.")
         else:
@@ -398,6 +506,13 @@ with col_preview:
                     st.session_state["current_order_plan_preview"] = result["allocation_preview"]
                     st.session_state["order_plan_just_created"] = True
                     st.info(f"주문계획 생성됨: `{_plan_id}` | 예정금액: {_plan_total:,}원")
+                    st.rerun()
+                # MOCK 모드: preflight 수량/금액 체크용으로 저장
+                elif order_mode == "MOCK":
+                    st.session_state["mock_allocation_preview"] = result["allocation_preview"]
+                    _mock_qty = sum(int(r.get("quantity", 0) or 0) for r in result["allocation_preview"])
+                    _mock_amt = sum(int(r.get("order_amount", 0) or 0) for r in result["allocation_preview"])
+                    st.info(f"MOCK 미리보기 저장됨 — 총 {_mock_qty}주, 예상금액 {_mock_amt:,}원")
                     st.rerun()
             else:
                 st.warning(result.get("message", "미리보기 결과가 없습니다."))

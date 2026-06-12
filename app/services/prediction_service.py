@@ -52,10 +52,19 @@ def load_force_candidates(date_str: Optional[str] = None) -> Optional[pd.DataFra
 
 
 def run_script(script_name: str, timeout: int = 120, args: Optional[List] = None) -> Dict:
-    """src/ 스크립트를 subprocess로 실행."""
+    """src/ 스크립트를 subprocess로 실행.
+
+    항상 stdout, stderr, returncode 를 반환한다.
+    """
     script_path = str(PROJECT_ROOT / "src" / script_name)
     if not os.path.exists(script_path):
-        return {"success": False, "message": f"스크립트 없음: {script_name}"}
+        return {
+            "success": False,
+            "message": f"스크립트 없음: {script_name}",
+            "stdout": "",
+            "stderr": f"파일을 찾을 수 없습니다: {script_path}",
+            "returncode": -1,
+        }
     try:
         cmd = [sys.executable, script_path] + (args or [])
         result = subprocess.run(
@@ -63,13 +72,88 @@ def run_script(script_name: str, timeout: int = 120, args: Optional[List] = None
             capture_output=True, text=True, timeout=timeout,
             cwd=str(PROJECT_ROOT),
         )
+        stdout = (result.stdout or "")[-4000:]
+        stderr = (result.stderr or "")[-4000:]
         if result.returncode == 0:
-            return {"success": True, "message": f"{script_name} 완료", "stdout": result.stdout[-2000:]}
-        return {"success": False, "message": f"{script_name} 실패", "stderr": result.stderr[-2000:]}
+            return {
+                "success": True,
+                "message": f"{script_name} 완료",
+                "stdout": stdout,
+                "stderr": stderr,
+                "returncode": 0,
+            }
+        return {
+            "success": False,
+            "message": f"{script_name} 실패 (exit {result.returncode})",
+            "stdout": stdout,
+            "stderr": stderr,
+            "returncode": result.returncode,
+        }
     except subprocess.TimeoutExpired:
-        return {"success": False, "message": f"{script_name} 타임아웃 ({timeout}초)"}
+        return {
+            "success": False,
+            "message": f"{script_name} 타임아웃 ({timeout}초)",
+            "stdout": "",
+            "stderr": f"TimeoutExpired after {timeout}s",
+            "returncode": -1,
+        }
     except Exception as e:
-        return {"success": False, "message": f"{script_name} 오류: {e}"}
+        return {
+            "success": False,
+            "message": f"{script_name} 오류: {e}",
+            "stdout": "",
+            "stderr": str(e),
+            "returncode": -1,
+        }
+
+
+def _run_pipeline_steps_individually(years: int = 3, top_n: int = 100) -> Dict:
+    """run_ai_prediction_pipeline.py 가 없을 때 단계별로 실행하는 fallback.
+
+    각 단계의 stdout/stderr/returncode 를 모아서 반환한다.
+    """
+    steps = [
+        ("데이터 수집",  "collect_daily_data.py",  1800),
+        ("피처 생성",    "make_features.py",        600),
+        ("라벨 생성",    "make_labels.py",          300),
+        ("모델 학습",    "train_model.py",          900),
+        ("예측 생성",    "predict_candidates.py",   300),
+        (f"Top{top_n} 생성", "select_top_candidates.py", 120),
+    ]
+
+    created_files: List[str] = []
+    step_results: List[Dict] = []
+
+    for stage_name, script, timeout in steps:
+        r = run_script(script, timeout=timeout)
+        step_results.append({"stage": stage_name, **r})
+        if not r.get("success"):
+            return {
+                "success": False,
+                "stage": stage_name,
+                "message": f"[{stage_name}] 실패: {r.get('message', '')}",
+                "stdout": r.get("stdout", ""),
+                "stderr": r.get("stderr", ""),
+                "returncode": r.get("returncode", -1),
+                "errors": [r.get("stderr") or r.get("message") or ""],
+                "created_files": created_files,
+                "step_results": step_results,
+                "predictions_file": None,
+                "top100_file": None,
+            }
+        created_files.extend(r.get("created_files", []))
+
+    today = datetime.now().strftime("%Y%m%d")
+    pred_file = PROJECT_ROOT / "reports" / "predictions" / f"top{top_n}_{today}.csv"
+    return {
+        "success": True,
+        "stage": "complete",
+        "message": f"전체 파이프라인 완료 ({len(steps)}단계)",
+        "created_files": created_files,
+        "step_results": step_results,
+        "predictions_file": str(pred_file) if pred_file.exists() else None,
+        "top100_file": str(pred_file) if pred_file.exists() else None,
+    }
 
 
 def run_full_pipeline(
@@ -92,10 +176,14 @@ def run_full_pipeline(
             }
         return result
     except ImportError:
-        r = run_script("run_ai_prediction_pipeline.py", timeout=3600)
-        if not isinstance(r, dict):
-            return {"success": False, "stage": "import_fallback", "message": "subprocess 반환값 없음", "errors": []}
-        return r
+        pipeline_script = PROJECT_ROOT / "src" / "run_ai_prediction_pipeline.py"
+        if pipeline_script.exists():
+            r = run_script("run_ai_prediction_pipeline.py", timeout=3600)
+            if not isinstance(r, dict):
+                return {"success": False, "stage": "import_fallback", "message": "subprocess 반환값 없음", "errors": []}
+            return r
+        # 파이프라인 통합 스크립트가 없으면 단계별 실행
+        return _run_pipeline_steps_individually(years=years, top_n=top_n)
     except Exception as ex:
         return {
             "success": False, "stage": "exception",

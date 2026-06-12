@@ -114,6 +114,26 @@ st.divider()
 st.subheader("데이터 파이프라인 실행")
 st.caption("순서대로 실행하세요: 데이터 수집 → 피처 생성 → 라벨 생성 → 모델학습 → 예측 → Top100")
 
+def _show_script_result(r: dict, label: str) -> None:
+    """스크립트 실행 결과를 화면에 표시 (성공/실패 + stdout/stderr)."""
+    if not isinstance(r, dict):
+        st.error(f"{label}: 반환값 오류 (None)")
+        return
+    if r.get("success"):
+        st.success(f"{label} 완료")
+        if r.get("stdout"):
+            with st.expander("실행 출력 (stdout)"):
+                st.code(r["stdout"][-2000:], language="text")
+    else:
+        st.error(f"❌ {label} 실패: {r.get('message', '')}")
+        if r.get("stderr"):
+            with st.expander("오류 상세 (stderr)", expanded=True):
+                st.code(r["stderr"][-3000:], language="text")
+        if r.get("stdout"):
+            with st.expander("실행 출력 (stdout)"):
+                st.code(r["stdout"][-2000:], language="text")
+
+
 row1 = st.columns(4)
 pipeline_steps = [
     ("1. 데이터 수집", "collect_daily_data.py"),
@@ -126,30 +146,22 @@ for i, (label, script) in enumerate(pipeline_steps):
         if st.button(label, use_container_width=True):
             with st.spinner(f"{label} 실행 중..."):
                 r = run_script(script, timeout=1800)
-            if r and r.get("success"):
-                st.success(f"{label} 완료")
-            else:
-                st.error(f"실패: {(r or {}).get('message','')}")
+            _show_script_result(r, label)
 
 row2 = st.columns(4)
 with row2[0]:
     if st.button("5. 예측 생성", use_container_width=True):
         with st.spinner("예측 생성 중..."):
             r = run_script("predict_candidates.py", timeout=300)
-        if r and r.get("success"):
-            st.success("예측 완료")
-        else:
-            st.error(f"실패: {(r or {}).get('message','')}")
+        _show_script_result(r, "5. 예측 생성")
 
 with row2[1]:
     if st.button("6. Top100 생성", use_container_width=True):
         with st.spinner("Top100 생성 중..."):
             r = run_script("select_top_candidates.py", timeout=120)
+        _show_script_result(r, "6. Top100 생성")
         if r and r.get("success"):
-            st.success("Top100 생성 완료")
             st.rerun()
-        else:
-            st.error(f"실패: {(r or {}).get('message','')}")
 
 with row2[2]:
     if st.button("7. force_trade 후보", use_container_width=True):
@@ -169,15 +181,42 @@ with row2[3]:
             st.error("파이프라인 반환값 오류 (None)")
         elif r.get("success"):
             st.success("파이프라인 완료!")
+            step_results = r.get("step_results", [])
+            if step_results:
+                for sr in step_results:
+                    st.caption(f"✅ {sr.get('stage', '')}")
             created = r.get("created_files", [])
             if created:
                 st.caption(f"생성된 파일: {', '.join([Path(f).name for f in created])}")
             st.rerun()
         else:
-            st.error(f"실패 단계: {r.get('stage','')} — {r.get('message','')}")
+            failed_stage = r.get("stage", "")
+            failed_msg = r.get("message", "")
+            st.error(f"❌ 실패 단계: {failed_stage}  |  {failed_msg}")
+
+            # 단계별 결과 (단계별 실행 fallback 시 표시)
+            step_results = r.get("step_results", [])
+            if step_results:
+                st.write("단계별 실행 결과:")
+                for sr in step_results:
+                    icon = "✅" if sr.get("success") else "❌"
+                    st.caption(f"{icon} {sr.get('stage', '')}: {sr.get('message', '')}")
+
+            # stderr 표시 (가장 중요한 오류 원인)
+            if r.get("stderr"):
+                with st.expander("오류 상세 (stderr)", expanded=True):
+                    st.code(r["stderr"][-4000:], language="text")
+
+            # stdout 표시
+            if r.get("stdout"):
+                with st.expander("실행 출력 (stdout)"):
+                    st.code(r["stdout"][-2000:], language="text")
+
+            # errors 목록 (파이프라인 직접 임포트 경로)
             errs = r.get("errors", [])
-            if errs:
-                st.text_area("오류 상세", "\n".join(str(e) for e in errs[:3]), height=100)
+            if errs and not r.get("stderr"):
+                st.text_area("오류 상세", "\n".join(str(e) for e in errs[:5]), height=120)
+
             created = r.get("created_files", [])
             if created:
                 st.caption(f"부분 생성: {', '.join([Path(f).name for f in created])}")
