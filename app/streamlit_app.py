@@ -22,13 +22,13 @@ for _p in (
 
 import streamlit as st
 
-# 앱 시작 시 필수 디렉토리 자동 생성
+# 앱 시작 시 환경변수 로딩 + 필수 디렉토리 자동 생성 (가장 먼저 실행)
 try:
     _startup_path = PROJECT_ROOT / "app" / "services" / "startup_service.py"
     if _startup_path.exists():
         sys.path.insert(0, str(PROJECT_ROOT / "app" / "services"))
-        from startup_service import ensure_dirs, get_commit_hash
-        ensure_dirs()
+        from startup_service import initialize_app_environment, get_commit_hash
+        initialize_app_environment()
         _COMMIT_HASH = get_commit_hash()
     else:
         _COMMIT_HASH = os.environ.get("RENDER_GIT_COMMIT", "UNKNOWN")[:8] or "UNKNOWN"

@@ -14,10 +14,11 @@ import streamlit as st
 import pandas as pd
 from config_service import load_config, get_trade_mode
 from prediction_service import (
-    load_top20, load_force_candidates, run_script, run_full_pipeline,
+    load_top20, load_force_candidates, run_script,
     run_force_trade_selector, run_no_trade_analysis,
     get_today_str, get_top20_path, get_force_candidates_path,
 )
+from pipeline_service import run_full_pipeline, find_latest_candidate_file
 from trading_service import run_buy_candidates, list_sell_policies
 from tables import render_candidates_table
 from warning_box import force_trade_disclaimer, no_profit_guarantee_notice
@@ -194,27 +195,36 @@ with row2[2]:
 with row2[3]:
     if st.button("전체 파이프라인 실행", use_container_width=True, type="primary"):
         with st.spinner("전체 파이프라인 실행 중 (시간이 걸립니다)..."):
-            r = run_full_pipeline(years=3)
+            r = run_full_pipeline(mode="mock", top_n=100, refresh_prices=True, years=3)
+
         if not isinstance(r, dict):
-            st.error("파이프라인 반환값 오류 — stdout이 JSON이 아님")
+            # 절대 발생하면 안 되지만 방어 처리
+            st.error("파이프라인 반환값 오류 — dict가 아닌 값 반환됨")
             st.code(str(r)[:2000], language="text")
+
         elif r.get("success"):
-            st.success(f"파이프라인 완료! Top100: {r.get('candidate_count', 0)}개 종목")
+            st.success(f"전체 파이프라인 완료 — Top100: {r.get('candidate_count', 0)}개 종목")
+            # 후보 파일을 session_state에 저장 (다른 페이지에서 사용)
+            _cf = r.get("candidate_file", "")
+            if _cf:
+                st.session_state["latest_candidate_file"] = _cf
+                st.caption(f"후보 파일: {_cf}")
             # 단계별 결과 표
             _steps = r.get("steps", [])
             if _steps:
                 _sdf = pd.DataFrame([{
                     "단계": s.get("step", ""),
-                    "성공": "✅" if s.get("success") else "❌",
+                    "결과": "✅ 성공" if s.get("success") else "❌ 실패",
                     "소요(초)": s.get("duration_sec", 0),
+                    "returncode": s.get("returncode", 0),
                 } for s in _steps])
                 st.dataframe(_sdf, use_container_width=True, hide_index=True)
             st.rerun()
+
         else:
-            # failed_step (신규 키) 또는 stage (구 키) 사용
-            _failed = r.get("failed_step") or r.get("stage", "")
+            _failed = r.get("failed_step") or r.get("stage", "알 수 없음")
             _errmsg = r.get("error_message") or r.get("message", "")
-            st.error(f"❌ 실패 단계: {_failed}")
+            st.error(f"전체 파이프라인 실패 — 실패 단계: {_failed}")
             if _errmsg:
                 st.caption(_errmsg)
 
@@ -223,19 +233,20 @@ with row2[3]:
             if _steps:
                 _sdf = pd.DataFrame([{
                     "단계": s.get("step", ""),
-                    "성공": "✅" if s.get("success") else "❌",
+                    "결과": "✅ 성공" if s.get("success") else "❌ 실패",
                     "소요(초)": s.get("duration_sec", 0),
+                    "returncode": s.get("returncode", 0),
                 } for s in _steps])
                 st.dataframe(_sdf, use_container_width=True, hide_index=True)
 
-            # stderr/stdout (신규 키 우선, 구 키 fallback)
+            # 실패 단계 stderr / stdout
             _stderr = r.get("stderr_raw") or r.get("stderr", "")
             _stdout = r.get("stdout_raw") or r.get("stdout", "")
             if _stderr:
-                with st.expander("오류 상세 (stderr)", expanded=True):
+                with st.expander(f"오류 상세 (stderr) — {_failed}", expanded=True):
                     st.code(_stderr[-4000:], language="text")
             if _stdout:
-                with st.expander("실행 출력 (stdout)"):
+                with st.expander(f"실행 출력 (stdout) — {_failed}"):
                     st.code(_stdout[-2000:], language="text")
 
             # errors 목록 (구 형식 호환)
@@ -243,7 +254,6 @@ with row2[3]:
             if _errs and not _stderr:
                 st.text_area("오류 상세", "\n".join(str(e) for e in _errs[:5]), height=120)
 
-            # log_path
             _lp = r.get("log_path", "")
             if _lp:
                 st.caption(f"로그: {_lp}")

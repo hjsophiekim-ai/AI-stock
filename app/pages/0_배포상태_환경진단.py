@@ -35,15 +35,24 @@ except Exception as _e:
     st.error(f"startup_service 로드 실패: {_e}")
     st.stop()
 
-# ── .env 주입 ───────────────────────────────────────────────────────
+# ── 환경변수 로딩 + 필수 디렉토리 자동 생성 ─────────────────────────
 try:
-    from env_service import inject_to_os_env
-    inject_to_os_env()
+    from startup_service import initialize_app_environment
+    _init_result = initialize_app_environment()
+    _created_dirs = _init_result.get("dirs_created", [])
+    _env_file_exists = _init_result.get("env_file_exists", False)
+    _env_loaded = _init_result.get("env_loaded", False)
+    _is_render = _init_result.get("running_on_render", False)
 except Exception:
-    pass
-
-# ── 필수 디렉토리 자동 생성 ──────────────────────────────────────────
-_created_dirs = ensure_dirs()
+    try:
+        from env_service import inject_to_os_env
+        inject_to_os_env()
+    except Exception:
+        pass
+    _created_dirs = ensure_dirs()
+    _env_file_exists = (PROJECT_ROOT / ".env").exists()
+    _env_loaded = False
+    _is_render = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"))
 
 # ── 1. 기본 환경 정보 ──────────────────────────────────────────────
 st.subheader("1. 기본 환경 정보")
@@ -77,8 +86,40 @@ if render_info["is_render"]:
 
 st.divider()
 
+# ── 1b. .env 파일 및 환경변수 로딩 상태 ──────────────────────────
+st.subheader("1b. .env / 환경변수 로딩 상태")
+_ev_c1, _ev_c2, _ev_c3, _ev_c4 = st.columns(4)
+_ev_c1.metric(".env 파일", "✅ 있음" if _env_file_exists else "❌ 없음")
+_ev_c2.metric(".env 로딩", "✅ 완료" if _env_loaded else ("미설치(fallback)" if _env_file_exists else "파일 없음"))
+_ev_c3.metric("Render 환경", "✅ YES" if _is_render else "NO (로컬)")
+_dart_ok = bool(os.environ.get("DART_API_KEY"))
+_mock_ok = bool(os.environ.get("KIS_MOCK_APP_KEY"))
+_real_ok = bool(os.environ.get("KIS_REAL_APP_KEY"))
+_ev_c4.metric("핵심 키 상태",
+    "✅ 모두 OK" if (_dart_ok and _mock_ok) else
+    "⚠️ 일부 MISSING")
+
+_kc1, _kc2, _kc3 = st.columns(3)
+_kc1.metric("DART_API_KEY", "✅ OK" if _dart_ok else "❌ MISSING")
+_kc2.metric("KIS_MOCK_APP_KEY", "✅ OK" if _mock_ok else "❌ MISSING")
+_kc3.metric("KIS_REAL_APP_KEY", "✅ OK" if _real_ok else "❌ MISSING")
+
+if not _env_file_exists and not _is_render:
+    st.warning(
+        ".env 파일이 없습니다. 로컬 실행 시 프로젝트 루트에 .env 파일을 생성하거나 "
+        "Render Dashboard > Environment Variables에서 키를 설정하세요."
+    )
+elif _is_render and not (_dart_ok and _mock_ok):
+    st.warning(
+        "Render 환경입니다. Render Dashboard > Environment Variables에서 "
+        "DART_API_KEY, KIS_MOCK_APP_KEY 등을 설정하세요. "
+        "값 원문은 절대 표시되지 않습니다."
+    )
+
+st.divider()
+
 # ── 2. 필수 환경변수 OK/MISSING ───────────────────────────────────
-st.subheader("2. 필수 환경변수")
+st.subheader("2. 필수 환경변수 (전체)")
 st.caption("값은 표시되지 않습니다. OK = 설정됨, MISSING = 미설정")
 
 REQUIRED_ENV_VARS = [
