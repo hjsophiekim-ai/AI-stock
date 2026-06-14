@@ -35,6 +35,11 @@ def ensure_dirs() -> List[str]:
     return created
 
 
+def ensure_runtime_directories() -> List[str]:
+    """ensure_dirs() 별칭 — pipeline_service 등에서 호출."""
+    return ensure_dirs()
+
+
 def get_commit_hash() -> str:
     """현재 commit hash 반환 (짧은 형식). 실패 시 UNKNOWN.
 

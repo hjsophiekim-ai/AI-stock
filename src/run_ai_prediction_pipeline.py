@@ -14,12 +14,16 @@ import os
 import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(__file__))
+_SRC_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _SRC_DIR.parent
+
+sys.path.insert(0, str(_SRC_DIR))
 from utils import get_today_str, load_config, setup_logger
 
-logger = setup_logger(__name__, "logs/run_pipeline.log")
-cfg = load_config("config.yaml")
+logger = setup_logger(__name__, str(_PROJECT_ROOT / "logs" / "run_pipeline.log"))
+cfg = load_config(str(_PROJECT_ROOT / "config.yaml"))
 
 GREEN = ""
 RED = ""
@@ -38,7 +42,7 @@ def run_step(label: str, cmd: list, timeout: int = 600) -> bool:
             cmd,
             capture_output=False,  # 실시간 출력
             timeout=timeout,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            cwd=str(_PROJECT_ROOT),
         )
         if result.returncode == 0:
             print(f"  [{label}] 완료")
@@ -94,9 +98,11 @@ def main() -> None:
         print(f"  종목 제한: {args.limit}개 (테스트 모드)")
     print("=" * 60)
 
+    _src_dir = str(_SRC_DIR)
+
     # 0. 의존성 확인
     print("\n[0/7] 의존성 확인")
-    dep_ok = run_step("의존성확인", [python, "src/check_dependencies.py"], timeout=60)
+    dep_ok = run_step("의존성확인", [python, os.path.join(_src_dir, "check_dependencies.py")], timeout=60)
     if not dep_ok:
         print("  주의: 일부 패키지 누락. 계속 시도합니다.")
         print("  권장: pip install pykrx FinanceDataReader lightgbm")
@@ -104,7 +110,7 @@ def main() -> None:
     # 1. 데이터 수집
     if not args.skip_collect:
         print("\n[1/7] 일봉 데이터 수집")
-        collect_cmd = [python, "src/collect_daily_data.py", "--years", str(args.years)]
+        collect_cmd = [python, os.path.join(_src_dir, "collect_daily_data.py"), "--years", str(args.years)]
         if args.force_refresh:
             collect_cmd.append("--force-refresh")
         if args.all:
@@ -114,10 +120,10 @@ def main() -> None:
         results["collect"] = run_step("데이터수집", collect_cmd, timeout=3600)
     else:
         print("\n[1/7] 데이터 수집 건너뜀")
-        results["collect"] = os.path.exists(cfg["data"]["raw_daily_path"])
+        results["collect"] = os.path.exists(os.path.join(str(_PROJECT_ROOT), cfg["data"]["raw_daily_path"]))
 
     if not results["collect"]:
-        daily_path = cfg["data"]["raw_daily_path"]
+        daily_path = os.path.join(str(_PROJECT_ROOT), cfg["data"]["raw_daily_path"])
         if not os.path.exists(daily_path):
             print(f"\n오류: 데이터 파일이 없습니다: {daily_path}")
             print("  pip install pykrx 후 다시 실행하거나 --limit 100으로 시도하세요")
@@ -126,39 +132,39 @@ def main() -> None:
 
     # 2. 피처 생성
     print("\n[2/7] 피처 생성")
-    results["features"] = run_step("피처생성", [python, "src/make_features.py"], timeout=600)
-    if not results["features"] and not os.path.exists(cfg["data"]["processed_features_path"]):
+    results["features"] = run_step("피처생성", [python, os.path.join(_src_dir, "make_features.py")], timeout=600)
+    if not results["features"] and not os.path.exists(os.path.join(str(_PROJECT_ROOT), cfg["data"]["processed_features_path"])):
         print("\n오류: 피처 생성 실패. 파이프라인을 중단합니다.")
         sys.exit(1)
 
     # 3. 라벨 생성
     print("\n[3/7] 라벨 생성")
-    results["labels"] = run_step("라벨생성", [python, "src/make_labels.py"], timeout=300)
-    if not results["labels"] and not os.path.exists(cfg["data"]["processed_labels_path"]):
+    results["labels"] = run_step("라벨생성", [python, os.path.join(_src_dir, "make_labels.py")], timeout=300)
+    if not results["labels"] and not os.path.exists(os.path.join(str(_PROJECT_ROOT), cfg["data"]["processed_labels_path"])):
         print("\n오류: 라벨 생성 실패.")
         sys.exit(1)
 
     # 4. 모델 학습
     if not args.skip_train:
         print("\n[4/7] 모델 학습")
-        results["train"] = run_step("모델학습", [python, "src/train_model.py"], timeout=1800)
+        results["train"] = run_step("모델학습", [python, os.path.join(_src_dir, "train_model.py")], timeout=1800)
     else:
         print("\n[4/7] 모델 학습 건너뜀")
-        results["train"] = os.path.exists(cfg["paths"]["model_path"])
+        results["train"] = os.path.exists(os.path.join(str(_PROJECT_ROOT), cfg["paths"]["model_path"]))
 
-    if not results["train"] and not os.path.exists(cfg["paths"]["model_path"]):
+    if not results["train"] and not os.path.exists(os.path.join(str(_PROJECT_ROOT), cfg["paths"]["model_path"])):
         print("\n오류: 모델 파일이 없습니다. train_model.py를 실행하세요.")
         sys.exit(1)
 
     # 5. 예측 생성
     print("\n[5/7] 예측 생성")
-    results["predict"] = run_step("예측생성", [python, "src/predict_candidates.py"], timeout=300)
+    results["predict"] = run_step("예측생성", [python, os.path.join(_src_dir, "predict_candidates.py")], timeout=300)
 
     # 6. Top100 후보 생성
     print("\n[6/7] Top100 후보 생성")
     results["top100"] = run_step(
         "Top100생성",
-        [python, "src/select_top_candidates.py", "--top-n", "100", "--all"],
+        [python, os.path.join(_src_dir, "select_top_candidates.py"), "--top-n", "100", "--all"],
         timeout=120,
     )
 
@@ -267,7 +273,7 @@ def run_pipeline(
         today = _dt.now().strftime("%Y%m%d")
 
     python = sys.executable
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    project_root = str(_PROJECT_ROOT)
 
     def _run(label, cmd, timeout=600):
         try:
@@ -282,7 +288,7 @@ def run_pipeline(
 
     safe_cfg = {}
     try:
-        safe_cfg = load_config("config.yaml") or {}
+        safe_cfg = load_config(str(_PROJECT_ROOT / "config.yaml")) or {}
     except Exception as ex:
         errors.append(f"config 로드 실패: {ex}")
 
@@ -292,10 +298,12 @@ def run_pipeline(
     top100_file = os.path.join(project_root, predictions_dir, f"top100_{today}.csv")
     force_file = os.path.join(project_root, "reports", f"force_trade_candidates_{today}.csv")
 
+    _src = str(_SRC_DIR)
+
     try:
         # Step 1: 데이터 수집
         if not skip_collect:
-            collect_cmd = [python, "src/collect_daily_data.py", "--years", str(years)]
+            collect_cmd = [python, os.path.join(_src, "collect_daily_data.py"), "--years", str(years)]
             if all_stocks:
                 collect_cmd.append("--all")
             elif limit:
@@ -313,7 +321,7 @@ def run_pipeline(
                     }
 
         # Step 2: 피처 생성
-        ok, err = _run("피처생성", [python, "src/make_features.py"], timeout=600)
+        ok, err = _run("피처생성", [python, os.path.join(_src, "make_features.py")], timeout=600)
         if not ok:
             feat_path = os.path.join(project_root, data_cfg.get("processed_features_path", "data/processed/features.csv"))
             if not os.path.exists(feat_path):
@@ -326,7 +334,7 @@ def run_pipeline(
                 }
 
         # Step 3: 라벨 생성
-        ok, err = _run("라벨생성", [python, "src/make_labels.py"], timeout=300)
+        ok, err = _run("라벨생성", [python, os.path.join(_src, "make_labels.py")], timeout=300)
         if not ok:
             lbl_path = os.path.join(project_root, data_cfg.get("processed_labels_path", "data/processed/labeled_dataset.csv"))
             if not os.path.exists(lbl_path):
@@ -334,7 +342,7 @@ def run_pipeline(
 
         # Step 4: 모델 학습
         if not skip_train:
-            ok, err = _run("모델학습", [python, "src/train_model.py"], timeout=1800)
+            ok, err = _run("모델학습", [python, os.path.join(_src, "train_model.py")], timeout=1800)
             if not ok:
                 model_path = os.path.join(project_root, paths_cfg.get("model_path", "models/model.joblib"))
                 if not os.path.exists(model_path):
@@ -347,23 +355,22 @@ def run_pipeline(
                     }
 
         # Step 5: 예측 생성
-        ok, err = _run("예측생성", [python, "src/predict_candidates.py"], timeout=300)
+        ok, err = _run("예측생성", [python, os.path.join(_src, "predict_candidates.py")], timeout=300)
         pred_file = os.path.join(project_root, predictions_dir, f"predictions_{today}.csv")
         if os.path.exists(pred_file):
             created_files.append(pred_file)
 
         # Step 6: Top100 생성
-        ok, err = _run("Top100생성", [python, "src/select_top_candidates.py", "--top-n", "100", "--all"], timeout=120)
+        ok, err = _run("Top100생성", [python, os.path.join(_src, "select_top_candidates.py"), "--top-n", "100", "--all"], timeout=120)
         if os.path.exists(top100_file):
             created_files.append(top100_file)
 
         # Step 6b: 현재가 갱신 (top100 생성 직후 자동 실행)
         if refresh_prices and os.path.exists(top100_file):
             refresh_mode = (refresh_prices_mode or "mock").lower()
-            print(f"\n[6b] 현재가 갱신 — mode={refresh_mode.upper()} top={top_n}")
             ok_r, err_r = _run(
                 "현재가갱신",
-                [python, "src/refresh_candidate_prices.py",
+                [python, os.path.join(_src, "refresh_candidate_prices.py"),
                  "--mode", refresh_mode,
                  "--top", str(top_n),
                  "--date", today],
@@ -371,16 +378,13 @@ def run_pipeline(
             )
             if not ok_r:
                 errors.append(f"현재가 갱신 실패 (파이프라인은 계속): {err_r}")
-                print(f"  [WARN] 현재가 갱신 실패 (무시하고 계속): {err_r}")
-            else:
-                print("  [OK] 현재가 갱신 완료")
 
         # (선택) 예산 배분
         if budget:
-            _run("예산배분", [python, "src/budget_allocator.py", "--budget", str(budget), "--max-orders", "100"], timeout=120)
+            _run("예산배분", [python, os.path.join(_src, "budget_allocator.py"), "--budget", str(budget), "--max-orders", "100"], timeout=120)
 
         # force_trade 후보
-        _run("force_trade후보", [python, "src/force_trade_selector.py"], timeout=60)
+        _run("force_trade후보", [python, os.path.join(_src, "force_trade_selector.py")], timeout=60)
         if os.path.exists(force_file):
             created_files.append(force_file)
 

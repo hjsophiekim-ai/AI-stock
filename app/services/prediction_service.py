@@ -107,90 +107,185 @@ def run_script(script_name: str, timeout: int = 120, args: Optional[List] = None
         }
 
 
-def _run_pipeline_steps_individually(years: int = 3, top_n: int = 100) -> Dict:
-    """run_ai_prediction_pipeline.py 가 없을 때 단계별로 실행하는 fallback.
-
-    각 단계의 stdout/stderr/returncode 를 모아서 반환한다.
-    """
-    steps = [
-        ("데이터 수집",  "collect_daily_data.py",  1800),
-        ("피처 생성",    "make_features.py",        600),
-        ("라벨 생성",    "make_labels.py",          300),
-        ("모델 학습",    "train_model.py",          900),
-        ("예측 생성",    "predict_candidates.py",   300),
-        (f"Top{top_n} 생성", "select_top_candidates.py", 120),
-    ]
-
-    created_files: List[str] = []
-    step_results: List[Dict] = []
-
-    for stage_name, script, timeout in steps:
-        r = run_script(script, timeout=timeout)
-        step_results.append({"stage": stage_name, **r})
-        if not r.get("success"):
-            return {
-                "success": False,
-                "stage": stage_name,
-                "message": f"[{stage_name}] 실패: {r.get('message', '')}",
-                "stdout": r.get("stdout", ""),
-                "stderr": r.get("stderr", ""),
-                "returncode": r.get("returncode", -1),
-                "errors": [r.get("stderr") or r.get("message") or ""],
-                "created_files": created_files,
-                "step_results": step_results,
-                "predictions_file": None,
-                "top100_file": None,
-            }
-        created_files.extend(r.get("created_files", []))
-
-    today = datetime.now().strftime("%Y%m%d")
-    pred_file = PROJECT_ROOT / "reports" / "predictions" / f"top{top_n}_{today}.csv"
-    return {
-        "success": True,
-        "stage": "complete",
-        "message": f"전체 파이프라인 완료 ({len(steps)}단계)",
-        "created_files": created_files,
-        "step_results": step_results,
-        "predictions_file": str(pred_file) if pred_file.exists() else None,
-        "top100_file": str(pred_file) if pred_file.exists() else None,
-    }
-
-
 def run_full_pipeline(
     years: int = 3,
     limit: Optional[int] = None,
     budget: Optional[int] = None,
     top_n: int = 100,
 ) -> Dict:
-    """전체 AI 예측 파이프라인 실행. 항상 dict를 반환한다 — 절대 None 반환 없음."""
+    """전체 AI 예측 파이프라인 실행. 항상 JSON-직렬화 가능한 dict를 반환한다.
+
+    반환 키:
+      success, failed_step, steps, candidate_file, candidate_count,
+      error_message, stdout_raw, stderr_raw, log_path
+    """
+    import time
+
+    # 필수 폴더 생성
     try:
-        sys.path.insert(0, str(PROJECT_ROOT / "src"))
-        from run_ai_prediction_pipeline import run_pipeline
-        result = run_pipeline(years=years, limit=limit, budget=budget, top_n=top_n)
-        if not isinstance(result, dict):
-            return {
-                "success": False, "stage": "unknown",
-                "message": f"파이프라인 반환값이 dict가 아님: {type(result).__name__}",
-                "errors": ["None or non-dict result from run_pipeline"],
-                "created_files": [], "predictions_file": None, "top100_file": None,
-            }
-        return result
-    except ImportError:
-        pipeline_script = PROJECT_ROOT / "src" / "run_ai_prediction_pipeline.py"
-        if pipeline_script.exists():
-            r = run_script("run_ai_prediction_pipeline.py", timeout=3600)
-            if not isinstance(r, dict):
-                return {"success": False, "stage": "import_fallback", "message": "subprocess 반환값 없음", "errors": []}
-            return r
-        # 파이프라인 통합 스크립트가 없으면 단계별 실행
-        return _run_pipeline_steps_individually(years=years, top_n=top_n)
-    except Exception as ex:
-        return {
-            "success": False, "stage": "exception",
-            "message": f"파이프라인 오류: {ex}",
-            "errors": [str(ex)], "created_files": [],
-            "predictions_file": None, "top100_file": None,
+        from startup_service import ensure_dirs
+        ensure_dirs()
+    except Exception:
+        pass
+
+    today = datetime.now().strftime("%Y%m%d")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = str(PROJECT_ROOT / "logs" / f"pipeline_{ts}.log")
+
+    step_defs = [
+        {
+            "step": "collect_daily_data",
+            "script": "collect_daily_data.py",
+            "timeout": 3600,
+            "args": ["--years", str(years)] + (["--limit", str(limit)] if limit else []),
+        },
+        {
+            "step": "make_features",
+            "script": "make_features.py",
+            "timeout": 600,
+            "args": [],
+        },
+        {
+            "step": "make_labels",
+            "script": "make_labels.py",
+            "timeout": 300,
+            "args": [],
+        },
+        {
+            "step": "train_model",
+            "script": "train_model.py",
+            "timeout": 1800,
+            "args": [],
+        },
+        {
+            "step": "predict_candidates",
+            "script": "predict_candidates.py",
+            "timeout": 300,
+            "args": [],
+        },
+        {
+            "step": "select_top_candidates",
+            "script": "select_top_candidates.py",
+            "timeout": 120,
+            "args": ["--top-n", str(top_n), "--all"],
+        },
+    ]
+
+    step_results: List[Dict] = []
+    failed_step = ""
+
+    for s in step_defs:
+        t0 = time.time()
+        script_path = PROJECT_ROOT / "src" / s["script"]
+        cmd = [sys.executable, str(script_path)] + s.get("args", [])
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=s["timeout"],
+                cwd=str(PROJECT_ROOT),
+            )
+            success = proc.returncode == 0
+            stdout = (proc.stdout or "")[-4000:]
+            stderr = (proc.stderr or "")[-4000:]
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired:
+            success = False
+            stdout = ""
+            stderr = f"TimeoutExpired after {s['timeout']}s"
+            returncode = -1
+        except Exception as ex:
+            success = False
+            stdout = ""
+            stderr = str(ex)
+            returncode = -1
+
+        duration = round(time.time() - t0, 1)
+        sr: Dict = {
+            "step": s["step"],
+            "success": success,
+            "returncode": returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "duration_sec": duration,
         }
+        step_results.append(sr)
+
+        if not success:
+            failed_step = s["step"]
+            return {
+                "success": False,
+                "failed_step": failed_step,
+                "steps": step_results,
+                "candidate_file": "",
+                "candidate_count": 0,
+                "error_message": f"[{s['step']}] 실패 (exit {returncode})\n{stderr[-500:]}",
+                "stdout_raw": stdout,
+                "stderr_raw": stderr,
+                "log_path": log_path,
+                # 하위 호환 키
+                "stage": failed_step,
+                "message": f"[{s['step']}] 실패 (exit {returncode})",
+                "stderr": stderr,
+                "stdout": stdout,
+                "errors": [stderr[-500:]],
+                "created_files": [],
+                "predictions_file": None,
+                "top100_file": None,
+            }
+
+    # Top100 파일 존재 확인
+    candidate_file = PROJECT_ROOT / "reports" / "predictions" / f"top100_{today}.csv"
+    candidate_count = 0
+
+    if candidate_file.exists():
+        try:
+            df_c = pd.read_csv(candidate_file)
+            candidate_count = len(df_c)
+        except Exception:
+            pass
+    else:
+        last = step_results[-1] if step_results else {}
+        return {
+            "success": False,
+            "failed_step": "select_top_candidates",
+            "steps": step_results,
+            "candidate_file": str(candidate_file),
+            "candidate_count": 0,
+            "error_message": "Top100 파일이 생성되지 않았습니다.",
+            "stdout_raw": last.get("stdout", ""),
+            "stderr_raw": last.get("stderr", ""),
+            "log_path": log_path,
+            # 하위 호환 키
+            "stage": "select_top_candidates",
+            "message": "Top100 파일이 생성되지 않았습니다.",
+            "stderr": last.get("stderr", ""),
+            "stdout": last.get("stdout", ""),
+            "errors": ["Top100 파일 미생성"],
+            "created_files": [],
+            "predictions_file": None,
+            "top100_file": None,
+        }
+
+    return {
+        "success": True,
+        "failed_step": "",
+        "steps": step_results,
+        "candidate_file": str(candidate_file),
+        "candidate_count": candidate_count,
+        "error_message": "",
+        "stdout_raw": "",
+        "stderr_raw": "",
+        "log_path": log_path,
+        # 하위 호환 키
+        "stage": "completed",
+        "message": f"전체 파이프라인 완료 — Top100: {candidate_count}개 종목",
+        "created_files": [str(candidate_file)],
+        "predictions_file": str(candidate_file),
+        "top100_file": str(candidate_file),
+    }
 
 
 def run_backtest_service(

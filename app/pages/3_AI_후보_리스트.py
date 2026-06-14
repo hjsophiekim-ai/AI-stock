@@ -83,12 +83,21 @@ def load_top_n_latest(n: int, date_str: str):
     df = load_top_n(n, date_str)
     if df is not None:
         return date_str, df
-    # 가장 최근 파일 탐색
+    # 1순위: top{n}_YYYYMMDD.csv
     candidates = sorted(predictions_dir.glob(f"top{n}_????????.csv"), reverse=True)
     for p in candidates:
         try:
             df = pd.read_csv(p)
             found_date = p.stem.split("_")[1]
+            return found_date, df
+        except Exception:
+            continue
+    # 2순위: candidates_YYYYMMDD.csv
+    for p in sorted(predictions_dir.glob("candidates_????????.csv"), reverse=True):
+        try:
+            df = pd.read_csv(p)
+            stem_parts = p.stem.split("_")
+            found_date = stem_parts[-1] if stem_parts else date_str
             return found_date, df
         except Exception:
             continue
@@ -107,6 +116,15 @@ col1.metric("3년치 데이터", "있음 ✅" if daily_path.exists() else "없�
 col2.metric("학습 모델", "있음 ✅" if model_path.exists() else "없음 ❌")
 col3.metric("Top100 파일", "있음 ✅" if top100_path.exists() else "없음 ❌")
 col4.metric("force_trade 후보", "있음 ✅" if force_path.exists() else "없음 ❌")
+
+st.divider()
+
+# ── 환경변수 상태 ──────────────────────────────────────────────
+st.subheader("환경변수 상태 (파이프라인 실행 전 확인)")
+_env_keys = ["DART_API_KEY", "KIS_MOCK_APP_KEY", "KIS_REAL_APP_KEY"]
+_env_cols = st.columns(len(_env_keys))
+for _ec, _ek in zip(_env_cols, _env_keys):
+    _ec.metric(_ek, "OK ✅" if os.environ.get(_ek) else "MISSING ❌")
 
 st.divider()
 
@@ -178,48 +196,57 @@ with row2[3]:
         with st.spinner("전체 파이프라인 실행 중 (시간이 걸립니다)..."):
             r = run_full_pipeline(years=3)
         if not isinstance(r, dict):
-            st.error("파이프라인 반환값 오류 (None)")
+            st.error("파이프라인 반환값 오류 — stdout이 JSON이 아님")
+            st.code(str(r)[:2000], language="text")
         elif r.get("success"):
-            st.success("파이프라인 완료!")
-            step_results = r.get("step_results", [])
-            if step_results:
-                for sr in step_results:
-                    st.caption(f"✅ {sr.get('stage', '')}")
-            created = r.get("created_files", [])
-            if created:
-                st.caption(f"생성된 파일: {', '.join([Path(f).name for f in created])}")
+            st.success(f"파이프라인 완료! Top100: {r.get('candidate_count', 0)}개 종목")
+            # 단계별 결과 표
+            _steps = r.get("steps", [])
+            if _steps:
+                _sdf = pd.DataFrame([{
+                    "단계": s.get("step", ""),
+                    "성공": "✅" if s.get("success") else "❌",
+                    "소요(초)": s.get("duration_sec", 0),
+                } for s in _steps])
+                st.dataframe(_sdf, use_container_width=True, hide_index=True)
             st.rerun()
         else:
-            failed_stage = r.get("stage", "")
-            failed_msg = r.get("message", "")
-            st.error(f"❌ 실패 단계: {failed_stage}  |  {failed_msg}")
+            # failed_step (신규 키) 또는 stage (구 키) 사용
+            _failed = r.get("failed_step") or r.get("stage", "")
+            _errmsg = r.get("error_message") or r.get("message", "")
+            st.error(f"❌ 실패 단계: {_failed}")
+            if _errmsg:
+                st.caption(_errmsg)
 
-            # 단계별 결과 (단계별 실행 fallback 시 표시)
-            step_results = r.get("step_results", [])
-            if step_results:
-                st.write("단계별 실행 결과:")
-                for sr in step_results:
-                    icon = "✅" if sr.get("success") else "❌"
-                    st.caption(f"{icon} {sr.get('stage', '')}: {sr.get('message', '')}")
+            # 단계별 결과 표
+            _steps = r.get("steps", [])
+            if _steps:
+                _sdf = pd.DataFrame([{
+                    "단계": s.get("step", ""),
+                    "성공": "✅" if s.get("success") else "❌",
+                    "소요(초)": s.get("duration_sec", 0),
+                } for s in _steps])
+                st.dataframe(_sdf, use_container_width=True, hide_index=True)
 
-            # stderr 표시 (가장 중요한 오류 원인)
-            if r.get("stderr"):
+            # stderr/stdout (신규 키 우선, 구 키 fallback)
+            _stderr = r.get("stderr_raw") or r.get("stderr", "")
+            _stdout = r.get("stdout_raw") or r.get("stdout", "")
+            if _stderr:
                 with st.expander("오류 상세 (stderr)", expanded=True):
-                    st.code(r["stderr"][-4000:], language="text")
-
-            # stdout 표시
-            if r.get("stdout"):
+                    st.code(_stderr[-4000:], language="text")
+            if _stdout:
                 with st.expander("실행 출력 (stdout)"):
-                    st.code(r["stdout"][-2000:], language="text")
+                    st.code(_stdout[-2000:], language="text")
 
-            # errors 목록 (파이프라인 직접 임포트 경로)
-            errs = r.get("errors", [])
-            if errs and not r.get("stderr"):
-                st.text_area("오류 상세", "\n".join(str(e) for e in errs[:5]), height=120)
+            # errors 목록 (구 형식 호환)
+            _errs = r.get("errors", [])
+            if _errs and not _stderr:
+                st.text_area("오류 상세", "\n".join(str(e) for e in _errs[:5]), height=120)
 
-            created = r.get("created_files", [])
-            if created:
-                st.caption(f"부분 생성: {', '.join([Path(f).name for f in created])}")
+            # log_path
+            _lp = r.get("log_path", "")
+            if _lp:
+                st.caption(f"로그: {_lp}")
 
 st.divider()
 
