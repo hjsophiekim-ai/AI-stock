@@ -230,94 +230,89 @@ with row2[2]:
 with row2[3]:
     if st.button("전체 파이프라인 실행", use_container_width=True, type="primary"):
         print("[PIPELINE] BUTTON_CLICKED full_pipeline", flush=True)
-        from pipeline_service import run_pipeline_step, ensure_runtime_directories
-        from datetime import datetime as _dt
+        # ── 핵심 수정: run_full_pipeline()을 직접 호출 ──────────────────
+        # 이전 방식: st.write() → run_pipeline_step() 루프
+        #   → WebSocket 끊기면 st.write()에서 StopException → 루프 종료
+        #   → make_features 이후 단계가 실행되지 않음
+        # 새 방식: run_full_pipeline() 내부에서 print()만 사용
+        #   → WebSocket과 무관하게 모든 단계가 Render에서 실행됨
+        #   → Render Logs에 ABOUT_TO_START / START / END 로그가 반드시 남음
+        try:
+            _info_box = st.empty()
+            _info_box.info(
+                "파이프라인 실행 중입니다. 데이터 수집에 최대 30분 소요될 수 있습니다.\n\n"
+                "연결이 끊겨도 서버에서 계속 실행됩니다 — Render Dashboard > Logs에서 진행 상황을 확인하세요."
+            )
+        except Exception:
+            pass
 
-        ensure_runtime_directories()
-        _today = _dt.now().strftime("%Y%m%d")
-        _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
-        _log_path = str(PROJECT_ROOT / "logs" / f"pipeline_{_ts}.log")
-
-        _full_step_defs = [
-            {"step": "collect_daily_data", "label": "1. 데이터 수집", "script": "collect_daily_data.py",
-             "timeout": 3600, "args": ["--years", "3"]},
-            {"step": "make_features", "label": "2. 피처 생성", "script": "make_features.py",
-             "timeout": 900, "args": []},
-            {"step": "make_labels", "label": "3. 라벨 생성", "script": "make_labels.py",
-             "timeout": 600, "args": []},
-            {"step": "train_model", "label": "4. 모델 학습", "script": "train_model.py",
-             "timeout": 1800, "args": []},
-            {"step": "predict_candidates", "label": "5. 예측 생성", "script": "predict_candidates.py",
-             "timeout": 300, "args": []},
-            {"step": "select_top_candidates", "label": "6. Top100 선정", "script": "select_top_candidates.py",
-             "timeout": 120, "args": ["--top-n", "100", "--all"]},
-        ]
-
-        _step_results = []
-        _pipeline_failed = False
-        _failed_step = ""
-
-        with st.status("전체 파이프라인 실행 중...", expanded=True) as _status:
-            for _s in _full_step_defs:
-                st.write(f"⏳ {_s['label']} 실행 중...")
-                _sr = run_pipeline_step(_s["step"], _s["script"], _s.get("args", []), _s["timeout"])
-                _step_results.append(_sr)
-                if _sr["success"]:
-                    st.write(f"✅ {_s['label']} 완료 — {_sr['duration_sec']}초")
-                else:
-                    st.write(f"❌ {_s['label']} 실패 (exit {_sr['returncode']}) — {_sr['duration_sec']}초")
-                    if _sr.get("stderr"):
-                        st.code(_sr["stderr"][-2000:], language="text")
-                    _pipeline_failed = True
-                    _failed_step = _s["step"]
-                    _status.update(label=f"파이프라인 실패: {_s['label']}", state="error")
-                    break
-
-            if not _pipeline_failed:
-                _cand_path = PROJECT_ROOT / "reports" / "predictions" / f"top100_{_today}.csv"
-                if _cand_path.exists():
-                    _status.update(label="전체 파이프라인 완료!", state="complete")
-                else:
-                    _pipeline_failed = True
-                    _failed_step = "select_top_candidates"
-                    _status.update(label="Top100 파일 미생성 — 실패", state="error")
-
-        _r = {
-            "success": not _pipeline_failed,
-            "failed_step": _failed_step,
-            "steps": _step_results,
-            "candidate_file": str(PROJECT_ROOT / "reports" / "predictions" / f"top100_{_today}.csv"),
-            "candidate_count": 0,
-            "error_message": f"{_failed_step} 실패" if _pipeline_failed else "",
-            "stdout_raw": "",
-            "stderr_raw": (_step_results[-1].get("stderr", "") if _step_results else ""),
-            "log_path": _log_path,
-        }
-        if not _pipeline_failed:
-            try:
-                _r["candidate_count"] = len(pd.read_csv(str(PROJECT_ROOT / "reports" / "predictions" / f"top100_{_today}.csv")))
-            except Exception:
-                pass
-            st.session_state["latest_candidate_file"] = _r["candidate_file"]
-
+        _r = run_full_pipeline(mode="mock", top_n=100, refresh_prices=True, years=3)
         st.session_state["last_pipeline_result"] = _r
 
-        if not _pipeline_failed:
-            st.success(f"전체 파이프라인 완료 — Top100: {_r['candidate_count']}개 종목")
-            with st.expander("단계별 결과", expanded=False):
-                st.dataframe(pd.DataFrame([{
-                    "단계": s.get("step", ""), "결과": "✅" if s.get("success") else "❌",
-                    "소요(초)": s.get("duration_sec", 0),
-                } for s in _step_results]), use_container_width=True, hide_index=True)
-            st.rerun()
-        else:
-            _last_sr = _step_results[-1] if _step_results else {}
-            st.error(f"파이프라인 실패 — 단계: {_failed_step}")
-            if _last_sr.get("stderr"):
-                with st.expander("오류 상세 (stderr)", expanded=True):
-                    st.code(_last_sr["stderr"][-4000:], language="text")
-            with st.expander("전체 결과 JSON", expanded=False):
-                st.json(_r)
+        try:
+            _info_box.empty()
+        except Exception:
+            pass
+
+        try:
+            if _r.get("success"):
+                st.session_state["latest_candidate_file"] = _r.get("candidate_file", "")
+                st.success(
+                    f"전체 파이프라인 완료 — Top100: {_r.get('candidate_count', 0)}개 종목\n\n"
+                    f"로그: {_r.get('log_path', '')}"
+                )
+                # ── 단계별 결과 표 ──────────────────────────────────────
+                _steps_data = []
+                for _s in _r.get("steps", []):
+                    _art = _s.get("artifacts_after", {})
+                    _steps_data.append({
+                        "단계": _s.get("step", ""),
+                        "결과": "✅" if _s.get("success") else "❌",
+                        "소요(초)": _s.get("duration_sec", 0),
+                        "종료코드": _s.get("returncode", -1),
+                        "raw파일": _art.get("raw_count", "-"),
+                        "processed": _art.get("processed_count", "-"),
+                        "top100": _art.get("top100_count", "-"),
+                    })
+                with st.expander("단계별 결과", expanded=True):
+                    if _steps_data:
+                        st.dataframe(pd.DataFrame(_steps_data), use_container_width=True, hide_index=True)
+                    # 최종 산출물 현황
+                    _af = _r.get("artifacts_final", {})
+                    if _af:
+                        _af_cols = st.columns(6)
+                        _af_cols[0].metric("raw 파일", f"{_af.get('raw_count', 0)}개")
+                        _af_cols[1].metric("processed", f"{_af.get('processed_count', 0)}개")
+                        _af_cols[2].metric("models", f"{_af.get('models_count', 0)}개")
+                        _af_cols[3].metric("top100", f"{_af.get('top100_count', 0)}개")
+                        _af_cols[4].metric("buy_top20", f"{_af.get('buy_top20_count', 0)}개")
+                        _af_cols[5].metric("buy_top20 파일", "✅" if _r.get("buy_top20_file") else "없음")
+                st.rerun()
+            else:
+                _failed = _r.get("failed_step", "?")
+                _msg = _r.get("error_message", "알 수 없는 오류")
+                st.error(f"파이프라인 실패 — 단계: {_failed}\n\n{_msg[:500]}")
+                # 실패 단계 stderr
+                _fail_stderr = _r.get("stderr_raw", "")
+                if _fail_stderr:
+                    with st.expander("실패 단계 stderr", expanded=True):
+                        st.code(_fail_stderr[-4000:], language="text")
+                # 산출물 현황 (실패 지점까지 생성된 파일 확인)
+                _af_fail = _r.get("artifacts_final", {})
+                if _af_fail:
+                    with st.expander("실패 시점 산출물 현황", expanded=True):
+                        _afc = st.columns(5)
+                        _afc[0].metric("raw", f"{_af_fail.get('raw_count',0)}개 / daily:{_af_fail.get('raw_daily_exists',False)}")
+                        _afc[1].metric("features", "✅" if _af_fail.get("features_exists") else "❌")
+                        _afc[2].metric("labels", "✅" if _af_fail.get("labels_exists") else "❌")
+                        _afc[3].metric("models", f"{_af_fail.get('models_count',0)}개")
+                        _afc[4].metric("top100", f"{_af_fail.get('top100_count',0)}개")
+                # 모든 단계 결과 JSON
+                with st.expander("전체 결과 JSON (Render 디버그용)", expanded=False):
+                    st.json(_r)
+        except Exception as _disp_ex:
+            # WebSocket이 끊긴 경우에도 파이프라인은 완료됨 — 재접속 후 확인 가능
+            print(f"[PIPELINE] UI_DISPLAY_ERROR: {_disp_ex}", flush=True)
 
 # ── 빠른 후보 생성 (Render 권장) ─────────────────────────────────
 row3 = st.columns(2)
@@ -364,17 +359,56 @@ with row3[0]:
 with row3[1]:
     if st.button("최신 파이프라인 로그 보기", use_container_width=True):
         _log_dir = PROJECT_ROOT / "logs"
-        _log_files = sorted(_log_dir.glob("pipeline_*.log"), reverse=True) if _log_dir.exists() else []
+        # JSON 로그 우선, 없으면 .log fallback
+        _log_files = sorted(_log_dir.glob("pipeline_????????_*.json"), reverse=True) if _log_dir.exists() else []
+        if not _log_files:
+            _log_files = sorted(_log_dir.glob("pipeline_*.log"), reverse=True) if _log_dir.exists() else []
         if _log_files:
             _lf = _log_files[0]
             try:
                 _log_content = _lf.read_text(encoding="utf-8", errors="replace")
                 with st.expander(f"로그: {_lf.name}", expanded=True):
-                    st.code(_log_content[-5000:], language="text")
+                    if _lf.suffix == ".json":
+                        try:
+                            import json as _json_log
+                            st.json(_json_log.loads(_log_content))
+                        except Exception:
+                            st.code(_log_content[-5000:], language="json")
+                    else:
+                        st.code(_log_content[-5000:], language="text")
             except Exception as _ex:
                 st.error(f"로그 읽기 실패: {_ex}")
         else:
-            st.info("로그 파일이 없습니다 (logs/pipeline_*.log)")
+            st.info("로그 파일이 없습니다 (logs/pipeline_*.json)")
+
+# ── Render 파이프라인 Probe ──────────────────────────────────────────
+_probe_cols = st.columns(2)
+with _probe_cols[0]:
+    if st.button("Render 파이프라인 Probe 실행", use_container_width=True):
+        import subprocess as _spp, sys as _spsy
+        from pipeline_service import ensure_runtime_directories as _erd
+        _erd()
+        try:
+            _probe_result = _spp.run(
+                [_spsy.executable, "-u", str(PROJECT_ROOT / "src" / "render_pipeline_probe.py")],
+                cwd=str(PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=__import__("os").environ.copy(),
+            )
+            if _probe_result.returncode == 0:
+                try:
+                    _probe_json = __import__("json").loads(_probe_result.stdout)
+                    with st.expander("Probe 결과 (JSON)", expanded=True):
+                        st.json(_probe_json)
+                except Exception:
+                    st.code(_probe_result.stdout[:3000], language="json")
+            else:
+                st.error(f"Probe 실패 (exit {_probe_result.returncode})")
+                st.code(_probe_result.stderr[:2000], language="text")
+        except Exception as _probe_ex:
+            st.error(f"Probe 실행 오류: {_probe_ex}")
 
 # ── 장중 매수 Top20 필터 실행 ──────────────────────────────────────
 st.divider()
