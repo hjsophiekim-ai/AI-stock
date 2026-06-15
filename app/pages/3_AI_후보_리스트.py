@@ -112,11 +112,14 @@ force_path = PROJECT_ROOT / "reports" / f"force_trade_candidates_{today_str}.csv
 model_path = PROJECT_ROOT / "models" / "model.joblib"
 daily_path = PROJECT_ROOT / "data" / "raw" / "daily_prices.csv"
 
-col1, col2, col3, col4 = st.columns(4)
+buy_top20_path = predictions_dir / f"buy_top20_{today_str}.csv"
+
+col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("3년치 데이터", "있음 ✅" if daily_path.exists() else "없음 ❌")
 col2.metric("학습 모델", "있음 ✅" if model_path.exists() else "없음 ❌")
 col3.metric("Top100 파일", "있음 ✅" if top100_path.exists() else "없음 ❌")
-col4.metric("force_trade 후보", "있음 ✅" if force_path.exists() else "없음 ❌")
+col4.metric("장중 Top20 파일", "있음 ✅" if buy_top20_path.exists() else "없음 ❌")
+col5.metric("force_trade 후보", "있음 ✅" if force_path.exists() else "없음 ❌")
 
 # 후보 파일 폴더 상태
 _preds_dir_exists = predictions_dir.exists()
@@ -354,6 +357,59 @@ with row3[1]:
                 st.error(f"로그 읽기 실패: {_ex}")
         else:
             st.info("로그 파일이 없습니다 (logs/pipeline_*.log)")
+
+# ── 장중 매수 Top20 필터 실행 ──────────────────────────────────────
+st.divider()
+row4 = st.columns(3)
+with row4[0]:
+    _intraday_mode = st.selectbox(
+        "장중 필터 모드",
+        ["paper", "mock", "real"],
+        index=0,
+        key="intraday_filter_mode",
+        help="paper: API 미사용 / mock: KIS 모의 OHLCV 조회 / real: KIS 실전 OHLCV 조회",
+    )
+
+with row4[1]:
+    if st.button("장중 매수 Top20 필터 실행", use_container_width=True, type="primary"):
+        print("[PIPELINE] BUTTON_CLICKED intraday_top20_filter", flush=True)
+        from pipeline_service import run_pipeline_step
+        _intra_today = datetime.now().strftime("%Y%m%d")
+        with st.spinner(f"장중 Top20 필터 실행 중 (mode={_intraday_mode})..."):
+            _intra_r = run_pipeline_step(
+                step_name="select_intraday_buy_candidates",
+                script_name="select_intraday_buy_candidates.py",
+                args=["--mode", _intraday_mode, "--date", _intra_today, "--top-n", "20"],
+                timeout=300,
+            )
+        st.session_state["last_intraday_result"] = _intra_r
+        if _intra_r.get("success"):
+            st.success("장중 Top20 필터 완료")
+            _intra_out = predictions_dir / f"buy_top20_{_intra_today}.csv"
+            if _intra_out.exists():
+                _intra_df = pd.read_csv(_intra_out)
+                st.metric("선정 종목 수", f"{len(_intra_df)}개")
+                st.dataframe(_intra_df.head(20), use_container_width=True)
+            with st.expander("상세 결과 JSON", expanded=False):
+                st.json(_intra_r)
+            st.rerun()
+        else:
+            st.error(f"장중 Top20 필터 실패: {_intra_r.get('stderr', '')[:1000]}")
+            with st.expander("오류 상세", expanded=True):
+                st.code(_intra_r.get("stderr", "")[-3000:], language="text")
+
+with row4[2]:
+    _buy_top20_today = predictions_dir / f"buy_top20_{today_str}.csv"
+    if _buy_top20_today.exists():
+        try:
+            _bt20 = pd.read_csv(_buy_top20_today)
+            st.metric("오늘 buy_top20", f"{len(_bt20)}개")
+            if st.button("buy_top20 CSV 미리보기", use_container_width=True):
+                st.dataframe(_bt20, use_container_width=True)
+        except Exception:
+            st.metric("오늘 buy_top20", "읽기 오류")
+    else:
+        st.metric("오늘 buy_top20", "없음")
 
 # ── 최근 파이프라인 결과 (session_state 보존) ───────────────────
 if "last_pipeline_result" in st.session_state:

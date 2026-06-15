@@ -663,3 +663,203 @@ git push origin HEAD
 | P1 | 수동매도 진단 CLI | `manual_sell_diagnosis.py` |
 | P2 | 자동매도 공통 경로 | `force_sell_monitor` 통합 |
 | P2 | 검증 시스템 보강 | `full_system_verification.py` |
+
+---
+
+## 장중 모멘텀 필터 및 Top20 강제 요구사항 (2026-06-15 추가)
+
+### 배경 및 목적
+
+- AI Top100 후보 중 장중 실시간 데이터(OHLCV)를 기반으로 최종 매수 후보 Top20을 선정해야 한다.
+- 예산배분 및 주문 화면에서 최대 주문 건수를 20개로 제한한다.
+- `buy_top20_YYYYMMDD.csv` 파일을 파이프라인 최종 출력물로 등록한다.
+
+### N. 장중 매수 후보 Top20 필터 (`src/select_intraday_buy_candidates.py`)
+
+#### CLI 인터페이스
+
+```
+python src/select_intraday_buy_candidates.py --mode paper --date 20260615 --top-n 20
+python src/select_intraday_buy_candidates.py --mode mock
+python src/select_intraday_buy_candidates.py --mode real
+```
+
+#### 입출력
+
+- 입력: `reports/predictions/top100_YYYYMMDD.csv`
+- 출력: `reports/predictions/buy_top20_YYYYMMDD.csv`
+- stdout: JSON (success, candidate_count, output_file, filter_pass_count, warnings)
+
+#### 모드별 동작
+
+| 모드 | 동작 |
+|------|------|
+| paper | KIS API 미사용. CSV 기존 데이터(close) 활용. 필터 미적용(데이터 없음) |
+| mock | KIS 모의 API `get_current_price()` → OHLCV 보강 → 필터 적용 |
+| real | KIS 실전 API `get_current_price()` (현재가 조회만, 주문 없음) |
+
+#### 장중 필터 항목 (config.yaml `intraday_filter` 섹션)
+
+| 필터 | config 키 | 기본값 |
+|------|-----------|--------|
+| 거래대금 | `min_trading_value_krw` | 30,000,000,000 (300억) |
+| 최소 상승률 | `min_change_rate_pct` | 1.5% |
+| 최대 상승률 | `max_change_rate_pct` | 12.0% |
+| 고가 근접도 | `min_high_proximity` | 0.97 (현재가/고가 ≥ 97%) |
+| 고점 낙폭 | `max_high_drawdown_pct` | -3.0% |
+| VWAP 위 | `require_above_vwap` | true |
+| 갭상승 후 밀림 제외 | `exclude_gap_and_fade` | true |
+
+#### 최종 점수 공식
+
+```
+final_buy_score =
+  ai_score_norm       × 0.30
+  + trading_value_score × 0.20
+  + change_rate_score   × 0.15
+  + high_proximity_score × 0.15
+  + vwap_score          × 0.10
+  + recent_momentum_score × 0.10
+```
+
+- 가중치는 `config.yaml > intraday_filter > score_weights` 에서 관리
+- paper 모드: 필터 미적용, ai_score 기준 정렬만 수행
+
+#### Fallback 전략 (필터 통과 종목 부족 시)
+
+1. 통과 ≥ top_n: 정상 선정
+2. fallback_min ≤ 통과 < top_n: 통과분 전체 사용
+3. 통과 < fallback_min: 필터 완화 (거래대금 1/3, 고가근접 0.94, 상승률 0.5%, VWAP 비요구)
+4. 완화 후도 부족: 전체 점수 기준 선정 (경고 표시)
+
+#### allocation_version
+
+- 모든 buy_top20 CSV에 `allocation_version = "TOP20_INTRADAY_FILTERED_V1"` 컬럼 저장
+
+---
+
+### O. 파이프라인 통합 (전체/빠른 파이프라인 마지막 단계)
+
+#### `app/services/pipeline_service.py` 수정 내용
+
+- `run_full_pipeline()`: `refresh_candidate_prices` 이후 `select_intraday_buy_candidates` 단계 추가
+- `run_fast_candidate_pipeline()`: `select_top_candidates` 이후 `select_intraday_buy_candidates` 단계 추가
+- 두 파이프라인 모두: 이 단계 실패 시 파이프라인 전체 실패로 처리하지 않음 (soft fail)
+
+---
+
+### P. 예산배분 및 주문 화면 Top20 강제 (`app/pages/4_예산배분_및_주문.py`)
+
+#### 변경 사항
+
+- [x] `_load_candidates()`: buy_top20 파일 최우선 탐색 (enriched/top100보다 앞)
+- [x] 최대 주문 건수 number_input: `max_value=100` → `max_value=20`, `min(loaded_n, 100)` → `min(loaded_n, 20)`
+- [x] "현재 리스트 전부 매수" 버튼: 후보 > 20개이면 주문 차단 + 오류 메시지
+- [x] run_buy_candidates 호출 직전 `_safe_max_orders = min(int(max_orders), 20)` 강제
+- [x] 주문 미리보기에도 동일 cap 적용
+
+#### buy_top20 파일 탐색 우선순위
+
+1. `reports/predictions/buy_top20_YYYYMMDD.csv` (오늘)
+2. `reports/enriched_candidates_YYYYMMDD.csv` (오늘)
+3. `reports/predictions/top100_YYYYMMDD.csv` (오늘)
+4. 최신 buy_top20_*.csv (fallback)
+5. 최신 top100_*.csv (fallback)
+
+---
+
+### Q. buy_candidates 함수 Top20 강제 (`src/buy_candidate_list.py`)
+
+- [x] 기본값 `max_orders=100` → `max_orders=20`
+- [x] 함수 진입 즉시 `max_orders = min(int(max_orders), 20)` 강제 적용
+- [x] allocations > 20개면 첫 20개만 사용
+- [x] `base_result["allocation_version"] = "TOP20_BUDGET_DISTRIBUTION_V1"` 항상 저장
+
+---
+
+### R. 진단 CLI
+
+#### `src/diagnose_intraday_selection.py`
+
+```
+python src/diagnose_intraday_selection.py
+python src/diagnose_intraday_selection.py --date 20260615
+python src/diagnose_intraday_selection.py --show-filtered
+```
+
+- buy_top20 파일 유무/내용 확인
+- 종목별 score/filter 상태 출력
+- `--show-filtered`: Top100 중 필터 제외 종목 표시
+
+#### `src/diagnose_budget_allocation.py`
+
+```
+python src/diagnose_budget_allocation.py
+python src/diagnose_budget_allocation.py --date 20260615 --budget 300000
+python src/diagnose_budget_allocation.py --candidate-file reports/predictions/buy_top20_20260615.csv
+```
+
+- 균등 예산배분 시뮬레이션 출력
+- Top20 준수 여부 확인
+- allocation_version 표시
+
+---
+
+### S. 앱 화면 추가 (`app/pages/3_AI_후보_리스트.py`)
+
+- [x] 파일 상태 메트릭에 "장중 Top20 파일" 추가
+- [x] "장중 매수 Top20 필터 실행" 버튼 (모드 선택 포함: paper/mock/real)
+- [x] 실행 성공 시 선정 종목 테이블 즉시 표시
+
+---
+
+### T. config.yaml `intraday_filter` 섹션
+
+```yaml
+intraday_filter:
+  min_trading_value_krw: 30000000000
+  min_change_rate_pct: 1.5
+  max_change_rate_pct: 12.0
+  min_high_proximity: 0.97
+  max_high_drawdown_pct: -3.0
+  require_above_vwap: true
+  exclude_gap_and_fade: true
+  fallback_min_candidates: 10
+  score_weights:
+    ai_score: 0.30
+    trading_value_score: 0.20
+    change_rate_score: 0.15
+    high_proximity_score: 0.15
+    vwap_score: 0.10
+    recent_momentum_score: 0.10
+```
+
+---
+
+### U. 검증 명령어
+
+```powershell
+# 장중 필터 (paper 모드)
+python src/select_intraday_buy_candidates.py --mode paper
+
+# 장중 선정 진단
+python src/diagnose_intraday_selection.py
+
+# 예산배분 진단
+python src/diagnose_budget_allocation.py --budget 300000
+
+# buy_candidate_list Top20 강제 확인
+python -c "import sys; sys.path.insert(0,'src'); from buy_candidate_list import buy_candidates; import inspect; src=inspect.getsource(buy_candidates); print('max_orders=20' if 'max_orders = min(int(max_orders), 20)' in src else 'FAIL')"
+```
+
+---
+
+## 요구사항 우선순위 업데이트 (2026-06-15)
+
+| 순위 | 기능 | 설명 |
+|------|------|------|
+| P0 | 장중 필터 선정 | `select_intraday_buy_candidates.py` |
+| P0 | Top20 강제 | 예산배분/주문 최대 20건 cap |
+| P0 | buy_top20 파이프라인 통합 | 전체/빠른 파이프라인 마지막 단계 |
+| P1 | 진단 CLI | `diagnose_intraday_selection.py`, `diagnose_budget_allocation.py` |
+| P1 | 앱 UI 통합 | 장중 Top20 필터 실행 버튼 |

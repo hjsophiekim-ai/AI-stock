@@ -289,6 +289,15 @@ def run_full_pipeline(
         )
         step_results.append(refresh_sr)
 
+    # 장중 Top20 필터 (실패해도 파이프라인 성공으로 처리)
+    intraday_sr = run_pipeline_step(
+        step_name="select_intraday_buy_candidates",
+        script_name="select_intraday_buy_candidates.py",
+        args=["--mode", mode, "--date", today, "--top-n", "20"],
+        timeout=300,
+    )
+    step_results.append(intraday_sr)
+
     print("[PIPELINE] END run_full_pipeline success=True", flush=True)
     return {
         "success": True,
@@ -395,6 +404,15 @@ def run_fast_candidate_pipeline(
         candidate_count = len(df_c)
     except Exception:
         pass
+
+    # 장중 Top20 필터 (실패해도 파이프라인 성공으로 처리)
+    intraday_sr = run_pipeline_step(
+        step_name="select_intraday_buy_candidates",
+        script_name="select_intraday_buy_candidates.py",
+        args=["--mode", mode, "--date", today, "--top-n", "20"],
+        timeout=300,
+    )
+    step_results.append(intraday_sr)
 
     print(
         f"[PIPELINE] END run_fast_candidate_pipeline success=True count={candidate_count}",

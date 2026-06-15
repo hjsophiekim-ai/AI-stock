@@ -146,7 +146,7 @@ def buy_candidates(
     mode: str = "paper",
     strategy_id: str = "morning_0930",
     min_orders: int = 1,
-    max_orders: int = 100,
+    max_orders: int = 20,
     selected_codes: Optional[List[str]] = None,
     refresh_prices: bool = False,
     preview_only: bool = False,
@@ -158,6 +158,7 @@ def buy_candidates(
     mode = (mode or "paper").lower()
     today = datetime.now().strftime("%Y%m%d")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    max_orders = min(int(max_orders), 20)
 
     try:
         if not os.path.exists(candidate_file):
@@ -208,8 +209,12 @@ def buy_candidates(
             "strategy_name": strategy_cfg["name"],
             "sell_policy_id": sell_policy["id"],
             "sell_policy_name": sell_policy["name"],
+            "allocation_version": "TOP20_BUDGET_DISTRIBUTION_V1",
         }
         _save_budget_usage(base_result, allocations, today)
+
+        if len(allocations) > 20:
+            allocations = allocations[:20]
 
         if not allocations:
             return {**base_result, "success": False, "message": "no orderable candidates within budget", "errors": errors, "orders_placed": 0, "allocation_preview": []}

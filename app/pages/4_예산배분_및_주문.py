@@ -39,22 +39,50 @@ from mode_badge import render_mode_badge, render_mode_warning
 
 
 def _load_candidates(date_str: str):
-    """오늘 날짜 파일 우선, 없으면 가장 최근 파일로 fallback. (df, n, file, loaded_date) 반환."""
+    """buy_top20 우선 탐색, 없으면 top100/enriched fallback. (df, n, file, loaded_date) 반환."""
     predictions_dir = PROJECT_ROOT / "reports" / "predictions"
+
+    # 1순위: 장중 필터 선정 buy_top20 (오늘)
+    buy20_path = predictions_dir / f"buy_top20_{date_str}.csv"
+    if buy20_path.exists():
+        try:
+            df = pd.read_csv(buy20_path)
+            if not df.empty:
+                return df, 20, str(buy20_path), date_str
+        except Exception:
+            pass
+
+    # 2순위: enriched_candidates
     enriched_path = PROJECT_ROOT / "reports" / f"enriched_candidates_{date_str}.csv"
     if enriched_path.exists():
-        df = pd.read_csv(enriched_path)
-        if not df.empty:
-            return df, 100, str(enriched_path), date_str
+        try:
+            df = pd.read_csv(enriched_path)
+            if not df.empty:
+                return df, 100, str(enriched_path), date_str
+        except Exception:
+            pass
 
+    # 3순위: top100/top50/top20 (오늘)
     for n in (100, 50, 20):
         path = predictions_dir / f"top{n}_{date_str}.csv"
         if path.exists():
-            df = pd.read_csv(path)
-            if not df.empty:
-                return df, n, str(path), date_str
+            try:
+                df = pd.read_csv(path)
+                if not df.empty:
+                    return df, n, str(path), date_str
+            except Exception:
+                continue
 
-    # Fallback: 가장 최근 날짜 파일
+    # Fallback: 가장 최근 날짜 파일 (buy_top20 우선)
+    for p in sorted(predictions_dir.glob("buy_top20_????????.csv"), reverse=True):
+        try:
+            df = pd.read_csv(p)
+            if not df.empty:
+                found_date = p.stem.split("_")[2]
+                return df, 20, str(p), found_date
+        except Exception:
+            continue
+
     for n in (100, 50, 20):
         for p in sorted(predictions_dir.glob(f"top{n}_????????.csv"), reverse=True):
             try:
@@ -173,7 +201,7 @@ with col1:
 with col2:
     min_orders = st.number_input("최소 주문 건수", min_value=1, max_value=100, value=1)
 with col3:
-    max_orders = st.number_input("최대 주문 건수", min_value=1, max_value=100, value=min(loaded_n, 100))
+    max_orders = st.number_input("최대 주문 건수", min_value=1, max_value=20, value=min(loaded_n, 20))
 
 st.caption(f"현재 후보 {len(df_candidates)}개, 예산 {int(budget):,}원, 최대 {int(max_orders)}건 주문")
 
@@ -439,14 +467,17 @@ with col_buy:
     if st.button("현재 리스트 전부 매수", type="primary", use_container_width=True, disabled=_buy_disabled):
         if not candidate_file:
             st.error("후보 파일이 없습니다.")
+        elif len(df_candidates) > 20:
+            st.error(f"후보 종목이 {len(df_candidates)}개입니다. 최대 20개까지만 주문 가능합니다. 장중 Top20 필터를 먼저 실행하세요.")
         else:
+            _safe_max_orders = min(int(max_orders), 20)
             with st.spinner(f"{order_mode} 전략 매수 실행 중..."):
                 result = run_buy_candidates(
                     candidate_file=candidate_file,
                     budget=int(budget),
                     mode=order_mode.lower(),
                     strategy_id=strategy_id,
-                    max_orders=int(max_orders),
+                    max_orders=_safe_max_orders,
                     sell_policy_id=sell_policy_id,
                 )
             if result.get("success"):
@@ -482,13 +513,14 @@ with col_preview:
         if not candidate_file:
             st.error("후보 파일이 없습니다.")
         else:
+            _safe_max_orders = min(int(max_orders), 20)
             with st.spinner("미리보기 생성 중..."):
                 result = run_buy_candidates(
                     candidate_file=candidate_file,
                     budget=int(budget),
                     mode=order_mode.lower(),
                     strategy_id=strategy_id,
-                    max_orders=int(max_orders),
+                    max_orders=_safe_max_orders,
                     preview_only=True,
                     sell_policy_id=sell_policy_id,
                 )

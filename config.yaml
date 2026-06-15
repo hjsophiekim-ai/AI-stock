@@ -308,3 +308,19 @@ sell:
   aggressive_limit_sell: true
   max_sell_slippage_pct: 1.0
   sell_orders_csv_dir: reports/orders
+intraday_filter:
+  min_trading_value_krw: 30000000000
+  min_change_rate_pct: 1.5
+  max_change_rate_pct: 12.0
+  min_high_proximity: 0.97
+  max_high_drawdown_pct: -3.0
+  require_above_vwap: true
+  exclude_gap_and_fade: true
+  fallback_min_candidates: 10
+  score_weights:
+    ai_score: 0.30
+    trading_value_score: 0.20
+    change_rate_score: 0.15
+    high_proximity_score: 0.15
+    vwap_score: 0.10
+    recent_momentum_score: 0.10
