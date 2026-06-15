@@ -274,7 +274,7 @@ def _fail_result(
 
 
 def run_full_pipeline(
-    mode: str = "mock",
+    mode: str = "paper",
     top_n: int = 100,
     refresh_prices: bool = True,
     years: int = 3,
@@ -449,13 +449,22 @@ def run_full_pipeline(
         pass
 
     # ── 현재가 갱신 (선택) ─────────────────────────────────────────────
+    optional_mode = (mode or "paper").lower().strip()
+    if optional_mode not in {"paper", "mock", "real"}:
+        optional_mode = "paper"
+
     if refresh_prices:
         print(f"[PIPELINE] ABOUT_TO_START refresh_candidate_prices", flush=True)
         refresh_sr = run_pipeline_step(
             step_name="refresh_candidate_prices",
             script_name="refresh_candidate_prices.py",
-            args=["--mode", mode, "--top", str(top_n), "--date", today],
-            timeout=300,
+            args=[
+                "--mode", optional_mode,
+                "--input", str(candidate_file_path),
+                "--top", str(top_n),
+                "--date", today,
+            ],
+            timeout=120 if optional_mode == "paper" else 300,
         )
         step_results.append(refresh_sr)
 
@@ -464,8 +473,8 @@ def run_full_pipeline(
     intraday_sr = run_pipeline_step(
         step_name="select_intraday_buy_candidates",
         script_name="select_intraday_buy_candidates.py",
-        args=["--mode", mode, "--date", today, "--top-n", "20"],
-        timeout=300,
+        args=["--mode", optional_mode, "--date", today, "--top-n", "20"],
+        timeout=120 if optional_mode == "paper" else 300,
     )
     step_results.append(intraday_sr)
 
@@ -611,7 +620,7 @@ def _save_pipeline_result(
 
 
 def run_fast_candidate_pipeline(
-    mode: str = "mock",
+    mode: str = "paper",
     top_n: int = 100,
 ) -> Dict:
     """빠른 후보 생성 파이프라인 - 데이터 수집/모델 학습 생략.
@@ -696,6 +705,9 @@ def run_fast_candidate_pipeline(
     ]
 
     step_results: List[Dict] = []
+    optional_mode = (mode or "paper").lower().strip()
+    if optional_mode not in {"paper", "mock", "real"}:
+        optional_mode = "paper"
 
     for s in step_defs:
         print(f"[PIPELINE] ABOUT_TO_START {s['step']}", flush=True)
@@ -765,8 +777,8 @@ def run_fast_candidate_pipeline(
     intraday_sr = run_pipeline_step(
         step_name="select_intraday_buy_candidates",
         script_name="select_intraday_buy_candidates.py",
-        args=["--mode", mode, "--date", today, "--top-n", "20"],
-        timeout=300,
+        args=["--mode", optional_mode, "--date", today, "--top-n", "20"],
+        timeout=120 if optional_mode == "paper" else 300,
     )
     step_results.append(intraday_sr)
 

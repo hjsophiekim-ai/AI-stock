@@ -264,7 +264,7 @@ with row2[3]:
         except Exception:
             pass
 
-        _r = run_full_pipeline(mode="mock", top_n=100, refresh_prices=True, years=3)
+        _r = run_full_pipeline(mode="paper", top_n=100, refresh_prices=True, years=3)
         st.session_state["last_pipeline_result"] = _r
 
         try:
@@ -339,7 +339,7 @@ with row3[0]:
         print("[PIPELINE] BUTTON_CLICKED fast_pipeline", flush=True)
         st.write("🔄 빠른 후보 생성 시작 (predict → select_top)...")
         with st.spinner("빠른 후보 생성 중 (predict_candidates + select_top_candidates)..."):
-            r = run_fast_candidate_pipeline(mode="mock", top_n=100)
+            r = run_fast_candidate_pipeline(mode="paper", top_n=100)
 
         st.session_state["last_pipeline_result"] = r
 
