@@ -42,10 +42,10 @@ from mode_badge import render_mode_badge, render_mode_warning
 
 
 def _load_candidates(date_str: str):
-    """buy_top20 우선 탐색, 없으면 top100/enriched fallback. (df, n, file, loaded_date) 반환."""
+    """buy_top20만 주문 후보로 반환. top100/enriched fallback 없음. (df, n, file, loaded_date) 반환."""
     predictions_dir = PROJECT_ROOT / "reports" / "predictions"
 
-    # 1순위: 장중 필터 선정 buy_top20 (오늘)
+    # 1순위: 오늘 buy_top20
     buy20_path = predictions_dir / f"buy_top20_{date_str}.csv"
     if buy20_path.exists():
         try:
@@ -55,28 +55,7 @@ def _load_candidates(date_str: str):
         except Exception:
             pass
 
-    # 2순위: enriched_candidates
-    enriched_path = PROJECT_ROOT / "reports" / f"enriched_candidates_{date_str}.csv"
-    if enriched_path.exists():
-        try:
-            df = pd.read_csv(enriched_path)
-            if not df.empty:
-                return df, 100, str(enriched_path), date_str
-        except Exception:
-            pass
-
-    # 3순위: top100/top50/top20 (오늘)
-    for n in (100, 50, 20):
-        path = predictions_dir / f"top{n}_{date_str}.csv"
-        if path.exists():
-            try:
-                df = pd.read_csv(path)
-                if not df.empty:
-                    return df, n, str(path), date_str
-            except Exception:
-                continue
-
-    # Fallback: 가장 최근 날짜 파일 (buy_top20 우선)
+    # 2순위: 가장 최근 buy_top20 (오늘 파일 없을 때)
     for p in sorted(predictions_dir.glob("buy_top20_????????.csv"), reverse=True):
         try:
             df = pd.read_csv(p)
@@ -86,15 +65,6 @@ def _load_candidates(date_str: str):
         except Exception:
             continue
 
-    for n in (100, 50, 20):
-        for p in sorted(predictions_dir.glob(f"top{n}_????????.csv"), reverse=True):
-            try:
-                df = pd.read_csv(p)
-                if not df.empty:
-                    found_date = p.stem.split("_")[1]
-                    return df, n, str(p), found_date
-            except Exception:
-                continue
     return None, 0, None, date_str
 
 
@@ -108,8 +78,12 @@ def _render_budget_metrics(result: dict) -> None:
     ]
     cols = st.columns(len(labels))
     for col, (label, key) in zip(cols, labels):
-        value = int(float(result.get(key, 0) or 0))
-        col.metric(label, f"{value:,}원")
+        raw = result.get(key)
+        if raw is None:
+            col.metric(label, "조회 실패")
+        else:
+            value = int(float(raw or 0))
+            col.metric(label, f"{value:,}원")
 
 
 def _render_real_conditions() -> bool:
@@ -137,8 +111,11 @@ today_str = get_today_str()
 df_candidates, loaded_n, candidate_file, loaded_date = _load_candidates(today_str)
 
 if df_candidates is None or df_candidates.empty:
-    st.warning("후보 파일이 없습니다. 먼저 파이프라인을 실행해 AI 후보 리스트를 생성하세요.")
-
+    st.error("buy_top20 파일이 없습니다. 주문 불가.")
+    st.info(
+        "**해결 방법**: AI 후보 리스트 페이지 → '장중 매수 Top20 필터 실행' 버튼 클릭 "
+        "(top100 파일이 있어야 합니다. 없으면 '전체 파이프라인 실행' 먼저 클릭)"
+    )
     # 진단 정보
     _preds_dir = PROJECT_ROOT / "reports" / "predictions"
     _preds_exists = _preds_dir.exists()
@@ -146,17 +123,16 @@ if df_candidates is None or df_candidates.empty:
     _dc1, _dc2, _dc3 = st.columns(3)
     _dc1.metric("reports/predictions 폴더", "✅ 있음" if _preds_exists else "❌ 없음")
     if _preds_exists:
-        _top100_files = list(_preds_dir.glob(f"top100_{today_str}*.csv"))
-        _any_top_files = list(_preds_dir.glob("top*.csv"))
-        _dc2.metric(f"top100_{today_str}.csv", "✅ 있음" if _top100_files else "❌ 없음")
-        _dc3.metric("전체 후보 파일 수", f"{len(_any_top_files)}개")
-        if _any_top_files:
-            _latest = sorted(_any_top_files, key=lambda f: f.stat().st_mtime, reverse=True)[0]
-            st.info(f"가장 최근 후보 파일: {_latest.name}")
+        _buy20_files = list(_preds_dir.glob(f"buy_top20_{today_str}*.csv"))
+        _any_buy20_files = list(_preds_dir.glob("buy_top20_????????.csv"))
+        _dc2.metric(f"buy_top20_{today_str}.csv", "✅ 있음" if _buy20_files else "❌ 없음")
+        _dc3.metric("전체 buy_top20 파일 수", f"{len(_any_buy20_files)}개")
+        if _any_buy20_files:
+            _latest = sorted(_any_buy20_files, key=lambda f: f.stat().st_mtime, reverse=True)[0]
+            st.info(f"가장 최근 buy_top20 파일: {_latest.name}")
     else:
-        _dc2.metric(f"top100_{today_str}.csv", "❌ 없음")
-        _dc3.metric("전체 후보 파일 수", "0개")
-    st.info("**해결 방법**: AI 후보 리스트 페이지 → '전체 파이프라인 실행' 버튼 클릭")
+        _dc2.metric(f"buy_top20_{today_str}.csv", "❌ 없음")
+        _dc3.metric("전체 buy_top20 파일 수", "0개")
     st.stop()
 
 if loaded_date != today_str:
@@ -320,11 +296,12 @@ if st.button("예산배분 계산", type="primary"):
                 "실시간 가격이 아닙니다. 실제 주문가격과 다를 수 있습니다."
             )
 
-        _orderable_cash_display = summary.get("orderable_cash", int(budget))
+        _ord_ok = summary.get("orderable_cash_success", True)
+        _ord_cash_raw = summary.get("orderable_cash")
         _render_budget_metrics(
             {
                 "input_budget": int(budget),
-                "orderable_cash": _orderable_cash_display if _orderable_cash_display is not None else int(budget),
+                "orderable_cash": int(_ord_cash_raw) if (_ord_ok and _ord_cash_raw is not None) else None,
                 "effective_budget": summary.get("effective_budget", int(budget)),
                 "expected_order_amount": summary.get("total_order_amount", 0),
                 "remaining_budget": int(summary.get("effective_budget", int(budget))) - int(summary.get("total_order_amount", 0) or 0),

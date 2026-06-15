@@ -827,7 +827,7 @@ def run_kis_readiness(mode: str = "mock") -> Dict:
         "account_ok": False,
         "broker_count": 0,
         "orderable_cash_ok": False,
-        "orderable_cash_amount": 0,
+        "orderable_cash_amount": None,
         "http_status_code": "",
         "response_text": "",
         "response_json": {},
