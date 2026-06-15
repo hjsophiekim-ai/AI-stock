@@ -68,26 +68,67 @@ SAMPLE_STOCKS = [
 ]
 
 
+def _pykrx_with_timeout(func, *args, timeout_sec: int = 20):
+    """pykrx 함수를 별도 스레드에서 실행하고 timeout_sec 초 내 완료 안 되면 None 반환."""
+    import threading
+    result = [None]
+    exc = [None]
+
+    def _run():
+        try:
+            result[0] = func(*args)
+        except Exception as e:
+            exc[0] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+    if t.is_alive():
+        raise TimeoutError(f"pykrx 호출 {timeout_sec}초 초과 — Render/네트워크 지연 의심")
+    if exc[0]:
+        raise exc[0]
+    return result[0]
+
+
 def get_ticker_list_pykrx(market: str = "ALL") -> Optional[pd.DataFrame]:
-    """pykrx로 종목 리스트 수집."""
+    """pykrx로 종목 리스트 수집 (스레드 타임아웃 적용)."""
     try:
         from pykrx import stock
         today = get_today_str("%Y%m%d")
         rows = []
         markets = ["KOSPI", "KOSDAQ"] if market == "ALL" else [market]
         for mkt in markets:
-            tickers = stock.get_market_ticker_list(today, market=mkt)
+            # 전체 종목 코드 리스트 — 타임아웃 30초
+            tickers = _pykrx_with_timeout(
+                stock.get_market_ticker_list, today, market=mkt, timeout_sec=30
+            )
+            if not tickers:
+                continue
+
+            # 종목명 일괄 조회: stock.get_market_ticker_name 은 건당 HTTP 요청 발생
+            # → 배치로 묶어 전체에 20초 타임아웃 적용
+            def _fetch_names(tickers_inner):
+                return {t: stock.get_market_ticker_name(t) for t in tickers_inner}
+
+            try:
+                name_map = _pykrx_with_timeout(_fetch_names, tickers, timeout_sec=120)
+            except TimeoutError:
+                logger.warning(f"[pykrx] {mkt} 종목명 일괄 조회 타임아웃 — 코드만 사용")
+                name_map = {t: t for t in tickers}
+
             for t in tickers:
-                name = stock.get_market_ticker_name(t)
                 rows.append({
                     "stock_code": str(t).zfill(6),
-                    "stock_name": name,
+                    "stock_name": name_map.get(t, t),
                     "market": mkt,
                 })
+
         if rows:
             df = pd.DataFrame(rows)
             logger.info(f"[pykrx] 종목 리스트 수집 완료: {len(df)}개")
             return df
+    except TimeoutError as te:
+        logger.warning(f"pykrx 타임아웃: {te}")
     except Exception as e:
         logger.warning(f"pykrx 종목 리스트 수집 실패: {e}")
     return None
@@ -154,15 +195,17 @@ def filter_tickers(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def fetch_daily_pykrx(stock_code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    """pykrx로 일봉 데이터 조회."""
+def fetch_daily_pykrx(stock_code: str, start: str, end: str, timeout_sec: int = 15) -> Optional[pd.DataFrame]:
+    """pykrx로 일봉 데이터 조회 (종목별 타임아웃 적용)."""
+    def _fetch():
+        from pykrx import stock as _stock
+        return _stock.get_market_ohlcv_by_date(start, end, stock_code)
+
     try:
-        from pykrx import stock
-        df = stock.get_market_ohlcv_by_date(start, end, stock_code)
+        df = _pykrx_with_timeout(_fetch, timeout_sec=timeout_sec)
         if df is None or df.empty:
             return None
         df = df.reset_index()
-        # 한글 컬럼명 → 영어로 매핑 (위치 아닌 이름 기반 — 버전별 컬럼 수 차이 대응)
         KR_COL_MAP = {
             "날짜": "date",
             "시가": "open",
@@ -170,18 +213,18 @@ def fetch_daily_pykrx(stock_code: str, start: str, end: str) -> Optional[pd.Data
             "저가": "low",
             "종가": "close",
             "거래량": "volume",
-            "거래대금": "trading_value",  # 일부 버전에서는 없을 수 있음
+            "거래대금": "trading_value",
         }
         df = df.rename(columns=KR_COL_MAP)
-        # 첫 번째 컬럼이 아직 date로 바뀌지 않은 경우 (날짜 외 인덱스명 처리)
         if "date" not in df.columns:
             df = df.rename(columns={df.columns[0]: "date"})
-        # 거래대금 컬럼이 없으면 close * volume 으로 계산
         if "trading_value" not in df.columns:
             df["trading_value"] = df["close"] * df["volume"]
         df["date"] = pd.to_datetime(df["date"])
         df = df[df["volume"] > 0]
         return df[["date", "open", "high", "low", "close", "volume", "trading_value"]]
+    except TimeoutError as te:
+        raise RuntimeError(f"pykrx 타임아웃 [{stock_code}]: {te}")
     except Exception as e:
         raise RuntimeError(f"pykrx 조회 실패: {e}")
 
@@ -392,7 +435,19 @@ def main() -> None:
         os.remove(output_path)
         logger.info("기존 데이터 파일 삭제 (강제 재수집)")
 
+    # Render 환경 자동 감지 — 종목 수 제한 (RENDER=true 또는 RENDER_EXTERNAL_URL 존재 시)
+    _is_render = bool(
+        os.environ.get("RENDER")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or os.environ.get("RENDER_SERVICE_ID")
+    )
+    _render_limit = int(os.environ.get("RENDER_COLLECT_LIMIT", "300"))
+
     limit = None if args.all else args.limit
+    if _is_render and limit is None and not args.all:
+        limit = _render_limit
+        logger.info(f"[Render] 환경 감지 — 종목 수 자동 제한: {limit}개 (RENDER_COLLECT_LIMIT={_render_limit})")
+        print(f"[RENDER] 환경 감지: 종목 수 {limit}개로 자동 제한합니다.", flush=True)
 
     logger.info("=== 일봉 데이터 수집 시작 ===")
     logger.info(f"수집 기간: {lookback_years}년 ({start_date} ~ {end_date})")

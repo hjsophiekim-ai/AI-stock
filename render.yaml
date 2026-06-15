@@ -21,6 +21,10 @@ services:
         value: "1"
       - key: RENDER
         value: "true"
+      # 데이터 수집 종목 수 제한 (Render 환경에서 자동 적용, 기본 300)
+      # 늘리면 파이프라인 소요 시간이 길어집니다 (300개 ≈ 20~30분)
+      - key: RENDER_COLLECT_LIMIT
+        value: "300"
       # 아래 키들은 Render Dashboard > Environment Variables에서 직접 입력하세요.
       # 절대 이 파일에 실제 값을 커밋하지 마세요.
       # - key: KIS_MOCK_APP_KEY

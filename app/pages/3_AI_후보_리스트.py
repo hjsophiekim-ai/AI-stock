@@ -51,6 +51,24 @@ mode = get_trade_mode(cfg)
 render_mode_badge(mode)
 
 today_str = get_today_str()
+
+# ── Render 환경 감지 배너 ──────────────────────────────────────────
+import os as _os
+_IS_RENDER = bool(
+    _os.environ.get("RENDER")
+    or _os.environ.get("RENDER_EXTERNAL_URL")
+    or _os.environ.get("RENDER_SERVICE_ID")
+)
+if _IS_RENDER:
+    _render_limit = int(_os.environ.get("RENDER_COLLECT_LIMIT", "300"))
+    st.info(
+        f"**Render 배포 환경 감지됨**  \n"
+        f"- 데이터 수집: 자동으로 상위 {_render_limit}개 종목으로 제한됩니다.  \n"
+        f"- **'전체 파이프라인 실행'은 30~60분 소요**됩니다. 최초 1회만 필요합니다.  \n"
+        f"- 이후 재실행은 **'빠른 후보 생성 (Render 권장)'** 버튼을 사용하세요 (2~5분).  \n"
+        f"- 수집 종목 수를 늘리려면 Render Dashboard → Environment Variables에서 "
+        f"`RENDER_COLLECT_LIMIT=500` 등으로 설정하세요."
+    )
 _hdr_col1, _hdr_col2 = st.columns([3, 1])
 with _hdr_col1:
     st.caption(f"오늘 날짜: {today_str}")

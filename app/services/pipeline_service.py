@@ -19,6 +19,20 @@ from typing import Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
+
+def _is_render_env() -> bool:
+    """Render 배포 환경 여부 감지."""
+    return bool(
+        os.environ.get("RENDER")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or os.environ.get("RENDER_SERVICE_ID")
+    )
+
+
+def _render_collect_limit() -> int:
+    """Render에서 데이터 수집 종목 수 제한 (환경변수 RENDER_COLLECT_LIMIT, 기본 300)."""
+    return int(os.environ.get("RENDER_COLLECT_LIMIT", "300"))
+
 REQUIRED_DIRS = [
     "data",
     "data/raw",
@@ -187,7 +201,12 @@ def run_full_pipeline(
             "step": "collect_daily_data",
             "script": "collect_daily_data.py",
             "timeout": 3600,
-            "args": ["--years", str(years)] + (["--limit", str(limit)] if limit else []),
+            "args": (
+                ["--years", str(years)]
+                + (["--limit", str(limit)] if limit else (
+                    ["--limit", str(_render_collect_limit())] if _is_render_env() else []
+                ))
+            ),
         },
         {
             "step": "make_features",
