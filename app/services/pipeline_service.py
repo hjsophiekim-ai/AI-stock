@@ -468,15 +468,40 @@ def run_full_pipeline(
         )
         step_results.append(refresh_sr)
 
-    # ── 장중 Top20 필터 ───────────────────────────────────────────────
-    print(f"[PIPELINE] ABOUT_TO_START select_intraday_buy_candidates", flush=True)
-    intraday_sr = run_pipeline_step(
-        step_name="select_intraday_buy_candidates",
-        script_name="select_intraday_buy_candidates.py",
-        args=["--mode", optional_mode, "--date", today, "--top-n", "20"],
-        timeout=120 if optional_mode == "paper" else 300,
+    # ── Intraday AI buy_top20 generation ─────────────────────────────
+    print(f"[PIPELINE] ABOUT_TO_START predict_intraday_candidates", flush=True)
+    intraday_pred_sr = run_pipeline_step(
+        step_name="predict_intraday_candidates",
+        script_name="predict_intraday_candidates.py",
+        args=["--date", today],
+        timeout=180,
     )
-    step_results.append(intraday_sr)
+    step_results.append(intraday_pred_sr)
+    if not intraday_pred_sr["success"]:
+        _save_pipeline_result(log_path, step_results, False, "predict_intraday_candidates", str(candidate_file_path), candidate_count, intraday_pred_sr.get("stderr", ""), today)
+        return _fail_result(
+            "predict_intraday_candidates",
+            step_results,
+            f"[predict_intraday_candidates] 실패\n{intraday_pred_sr.get('stderr', '')[-500:]}",
+            log_path,
+        )
+
+    print(f"[PIPELINE] ABOUT_TO_START select_today_buy_top20", flush=True)
+    buy20_sr = run_pipeline_step(
+        step_name="select_today_buy_top20",
+        script_name="select_today_buy_top20.py",
+        args=["--date", today, "--safe-mode", "--mode", "mock"],
+        timeout=120,
+    )
+    step_results.append(buy20_sr)
+    if not buy20_sr["success"]:
+        _save_pipeline_result(log_path, step_results, False, "select_today_buy_top20", str(candidate_file_path), candidate_count, buy20_sr.get("stderr", ""), today)
+        return _fail_result(
+            "select_today_buy_top20",
+            step_results,
+            f"[select_today_buy_top20] 실패\n{buy20_sr.get('stderr', '')[-500:]}",
+            log_path,
+        )
 
     buy_top20_file = ""
     buy20_path = PROJECT_ROOT / "reports" / "predictions" / f"buy_top20_{today}.csv"
@@ -772,15 +797,52 @@ def run_fast_candidate_pipeline(
     except Exception:
         pass
 
-    # 장중 Top20 필터 (실패해도 파이프라인 성공으로 처리)
-    print(f"[PIPELINE] ABOUT_TO_START select_intraday_buy_candidates", flush=True)
-    intraday_sr = run_pipeline_step(
-        step_name="select_intraday_buy_candidates",
-        script_name="select_intraday_buy_candidates.py",
-        args=["--mode", optional_mode, "--date", today, "--top-n", "20"],
-        timeout=120 if optional_mode == "paper" else 300,
+    # Intraday AI buy_top20 generation. This is required for orderable output.
+    print(f"[PIPELINE] ABOUT_TO_START predict_intraday_candidates", flush=True)
+    intraday_pred_sr = run_pipeline_step(
+        step_name="predict_intraday_candidates",
+        script_name="predict_intraday_candidates.py",
+        args=["--date", today],
+        timeout=180,
     )
-    step_results.append(intraday_sr)
+    step_results.append(intraday_pred_sr)
+    if not intraday_pred_sr["success"]:
+        return {
+            "success": False,
+            "failed_step": "predict_intraday_candidates",
+            "steps": step_results,
+            "candidate_file": str(candidate_file_path),
+            "buy_top20_file": "",
+            "candidate_count": candidate_count,
+            "error_message": f"[predict_intraday_candidates] 실패\n{intraday_pred_sr.get('stderr', '')[-500:]}",
+            "stdout_raw": intraday_pred_sr.get("stdout", ""),
+            "stderr_raw": intraday_pred_sr.get("stderr", ""),
+            "log_path": log_path,
+            "artifacts_final": inspect_runtime_artifacts(),
+        }
+
+    print(f"[PIPELINE] ABOUT_TO_START select_today_buy_top20", flush=True)
+    buy20_sr = run_pipeline_step(
+        step_name="select_today_buy_top20",
+        script_name="select_today_buy_top20.py",
+        args=["--date", today, "--safe-mode", "--mode", "mock"],
+        timeout=120,
+    )
+    step_results.append(buy20_sr)
+    if not buy20_sr["success"]:
+        return {
+            "success": False,
+            "failed_step": "select_today_buy_top20",
+            "steps": step_results,
+            "candidate_file": str(candidate_file_path),
+            "buy_top20_file": "",
+            "candidate_count": candidate_count,
+            "error_message": f"[select_today_buy_top20] 실패\n{buy20_sr.get('stderr', '')[-500:]}",
+            "stdout_raw": buy20_sr.get("stdout", ""),
+            "stderr_raw": buy20_sr.get("stderr", ""),
+            "log_path": log_path,
+            "artifacts_final": inspect_runtime_artifacts(),
+        }
 
     buy_top20_file = ""
     buy20_path = PROJECT_ROOT / "reports" / "predictions" / f"buy_top20_{today}.csv"

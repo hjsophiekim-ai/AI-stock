@@ -197,6 +197,15 @@ def buy_candidates(
     try:
         if not os.path.exists(candidate_file):
             return {"success": False, "message": f"file not found: {candidate_file}", "errors": [candidate_file], "orders_placed": 0, "allocation_preview": []}
+        candidate_name = os.path.basename(candidate_file)
+        if not (candidate_name.startswith("buy_top20_") and candidate_name.endswith(".csv")):
+            return {
+                "success": False,
+                "message": f"order blocked: only buy_top20_YYYYMMDD.csv is orderable, got {candidate_name}",
+                "errors": [candidate_file],
+                "orders_placed": 0,
+                "allocation_preview": [],
+            }
         if not validate_strategy_id(strategy_id):
             return {"success": False, "message": f"invalid strategy_id: {strategy_id}", "errors": [strategy_id], "orders_placed": 0, "allocation_preview": []}
         if not validate_sell_policy(sell_policy_id):
@@ -207,6 +216,35 @@ def buy_candidates(
         df = _load_candidates(candidate_file, selected_codes)
         if df.empty:
             return {"success": False, "message": "no candidates after filtering", "errors": ["no candidates"], "orders_placed": 0, "allocation_preview": []}
+        if "prob_intraday_2pct" not in df.columns:
+            return {
+                "success": False,
+                "message": "order blocked: buy_top20 must contain prob_intraday_2pct from the intraday AI model",
+                "errors": ["missing prob_intraday_2pct"],
+                "orders_placed": 0,
+                "allocation_preview": [],
+            }
+        if "probability_2pct" in df.columns and "legacy_nextday_probability_2pct" not in df.columns:
+            df = df.rename(columns={"probability_2pct": "legacy_nextday_probability_2pct"})
+        try:
+            from market_safety_filter import validate_orderable_buy_top20_df
+            ok, failed = validate_orderable_buy_top20_df(df, load_config(CONFIG_PATH).get("safe_intraday_filter", {}))
+            if not ok:
+                return {
+                    "success": False,
+                    "message": "order blocked: unsafe candidates included: " + ", ".join(failed),
+                    "errors": failed,
+                    "orders_placed": 0,
+                    "allocation_preview": [],
+                }
+        except Exception as exc:
+            return {
+                "success": False,
+                "message": f"order blocked: safety validation failed: {exc}",
+                "errors": [str(exc)],
+                "orders_placed": 0,
+                "allocation_preview": [],
+            }
 
         if refresh_prices and not preview_only and mode in ("mock", "real"):
             from kis_api import KISApiClient

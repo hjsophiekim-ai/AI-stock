@@ -37,6 +37,7 @@ from trading_service import (
     get_active_buy_candidate_file,
 )
 from prediction_service import get_today_str
+from market_safety_filter import normalize_bool, validate_orderable_buy_top20_df
 from warning_box import no_profit_guarantee_notice, real_order_warning
 from mode_badge import render_mode_badge, render_mode_warning
 
@@ -45,7 +46,6 @@ def _load_candidates(date_str: str):
     """buy_top20만 주문 후보로 반환. top100/enriched fallback 없음. (df, n, file, loaded_date) 반환."""
     predictions_dir = PROJECT_ROOT / "reports" / "predictions"
 
-    # 1순위: 오늘 buy_top20
     buy20_path = predictions_dir / f"buy_top20_{date_str}.csv"
     if buy20_path.exists():
         try:
@@ -54,16 +54,6 @@ def _load_candidates(date_str: str):
                 return df, 20, str(buy20_path), date_str
         except Exception:
             pass
-
-    # 2순위: 가장 최근 buy_top20 (오늘 파일 없을 때)
-    for p in sorted(predictions_dir.glob("buy_top20_????????.csv"), reverse=True):
-        try:
-            df = pd.read_csv(p)
-            if not df.empty:
-                found_date = p.stem.split("_")[2]
-                return df, 20, str(p), found_date
-        except Exception:
-            continue
 
     return None, 0, None, date_str
 
@@ -207,6 +197,23 @@ if _price_stale:
     )
 
 st.success(f"Top{loaded_n} 후보 파일 로드 완료: {len(df_candidates)}개 종목 ({loaded_date})")
+
+_safe_ok, _safe_failed_checks = validate_orderable_buy_top20_df(df_candidates, cfg.get("safe_intraday_filter", {}))
+_min_candidates_to_trade = int(cfg.get("safe_intraday_filter", {}).get("min_candidates_to_trade", 10))
+if len(df_candidates) < _min_candidates_to_trade and not cfg.get("safe_intraday_filter", {}).get("allow_trade_when_candidates_below_min", False):
+    _safe_ok = False
+    if "candidate_count_below_min_candidates_to_trade" not in _safe_failed_checks:
+        _safe_failed_checks.append("candidate_count_below_min_candidates_to_trade")
+
+if _safe_ok:
+    st.success("안전 필터 검증 통과: 주문 가능한 buy_top20 파일입니다.")
+else:
+    st.error(
+        "안전 필터를 통과하지 못한 종목이 포함되어 주문을 중단합니다.\n\n"
+        f"실패 항목: {', '.join(_safe_failed_checks)}"
+    )
+
+_order_blocked_by_safety = not _safe_ok
 
 st.subheader("거래전략 선택")
 try:
@@ -681,6 +688,7 @@ with col_buy:
     _buy_disabled = (
         (order_mode == "REAL" and not real_bulk_ok)
         or (order_mode == "MOCK" and not locals().get("mock_bulk_ok", True))
+        or _order_blocked_by_safety
     )
     if st.button("현재 리스트 전부 매수", type="primary", use_container_width=True, disabled=_buy_disabled):
         if not candidate_file:
@@ -738,7 +746,7 @@ with col_buy:
                     st.json(result)
 
 with col_preview:
-    if st.button("주문 미리보기", use_container_width=True):
+    if st.button("주문 미리보기", use_container_width=True, disabled=_order_blocked_by_safety):
         if not candidate_file:
             st.error("후보 파일이 없습니다.")
         else:

@@ -1,249 +1,257 @@
-"""오늘 당일 매수 후보 Top20 선정.
+"""Select safe intraday buy candidates.
 
-intraday_candidates_YYYYMMDD.csv에서 강한 필터 + 점수 기반으로 Top20 선정.
-출력: reports/predictions/buy_top20_YYYYMMDD.csv
-
-실행:
-    python src/select_today_buy_top20.py
-    python src/select_today_buy_top20.py --date 20260615
+Safe mode creates reports/predictions/buy_top20_safe_YYYYMMDD.csv first.
+Only when validation passes is it copied to buy_top20_YYYYMMDD.csv.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
+from market_safety_filter import (
+    apply_safe_intraday_filter,
+    copy_if_valid,
+    normalize_code,
+    summarize_filter_failures,
+)
 from utils import ensure_dir, load_config, setup_logger
 
 logger = setup_logger(__name__, "logs/select_today_buy_top20.log")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-cfg = load_config(str(PROJECT_ROOT / "config.yaml"))
+CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+cfg = load_config(str(CONFIG_PATH))
 
 
-def _get_intraday_config() -> dict:
-    return cfg.get("intraday_trading_model", {
-        "min_prob_2pct": 0.58,
-        "fallback_min_prob_2pct": 0.52,
-        "max_buy_candidates": 20,
-        "min_trading_value_krw": 30_000_000_000,
-        "fallback_trading_value_krw": 10_000_000_000,
-        "min_change_rate_pct": 1.0,
-        "max_change_rate_pct": 10.0,
-        "min_high_proximity": 0.965,
-        "require_above_vwap": True,
-        "min_recent_return_15m_pct": -0.3,
-        "exclude_gap_and_fade": True,
-    })
+def _safe_cfg() -> dict[str, Any]:
+    return cfg.get("safe_intraday_filter", {})
+
+
+def _candidate_path_for(today: str) -> Path:
+    return PROJECT_ROOT / "reports" / "predictions" / f"intraday_candidates_{today}.csv"
+
+
+def _to_float(data: dict, *keys: str) -> float:
+    for key in keys:
+        val = data.get(key)
+        if val is None or val == "":
+            continue
+        try:
+            return float(str(val).replace(",", ""))
+        except Exception:
+            continue
+    return 0.0
+
+
+def _enrich_with_kis_realtime(df: pd.DataFrame, mode: str, max_fetch: int) -> pd.DataFrame:
+    """Fetch realtime quote fields. Raises if KIS cannot be used."""
+    if mode == "paper":
+        raise RuntimeError("safe-mode requires KIS mock/real data; paper mode is not orderable")
+
+    from kis_api import KISApiClient
+    from safety_gate import SafetyGate
+
+    gate = SafetyGate(str(CONFIG_PATH), runtime_mode=mode)
+    api = KISApiClient(str(CONFIG_PATH), gate=gate)
+    api.auth.get_access_token()
+    meta = api.diagnostic_metadata()
+    key_type = meta.get("key_type_used", "")
+    price_mode = gate.mode.upper()
+    price_source = "KIS_CURRENT_PRICE"
+    request_delay = float(cfg.get("kis", {}).get("request_delay", 0.2) or 0.2)
+
+    code_col = "stock_code" if "stock_code" in df.columns else "ticker"
+    work = df.copy()
+    work[code_col] = work[code_col].apply(normalize_code)
+
+    sort_col = "prob_intraday_2pct" if "prob_intraday_2pct" in work.columns else None
+    if sort_col:
+        work = work.sort_values(sort_col, ascending=False, kind="stable")
+    work = work.head(max_fetch).copy()
+
+    rows = []
+    failures = []
+    now_iso = datetime.now().isoformat()
+    for _, row in work.iterrows():
+        row = row.copy()
+        code = normalize_code(row[code_col])
+        try:
+            q = api.get_current_price(code)
+            if not isinstance(q, dict):
+                raise RuntimeError("KIS current price returned no data")
+            current = _to_float(q, "current_price", "stck_prpr", "price", "close")
+            open_price = _to_float(q, "open_price", "open", "stck_oprc")
+            high = _to_float(q, "high_price", "high", "stck_hgpr")
+            low = _to_float(q, "low_price", "low", "stck_lwpr")
+            volume = _to_float(q, "volume", "acml_vol")
+            trading_value = _to_float(q, "trading_value", "acml_tr_pbmn")
+            change_rate = _to_float(q, "change_rate", "prdy_ctrt")
+            if current <= 0:
+                raise RuntimeError("current_price <= 0")
+            if open_price <= 0:
+                open_price = current
+            if high <= 0:
+                high = current
+            if low <= 0:
+                low = current
+            row["stock_code"] = code
+            row["current_price"] = current
+            row["open_price"] = open_price
+            row["high_price"] = high
+            row["low_price"] = low
+            row["volume_intraday"] = volume
+            row["trading_value_intraday"] = trading_value
+            row["change_rate"] = change_rate
+            row["price_updated_at"] = now_iso
+            row["price_mode"] = price_mode
+            row["price_source"] = price_source
+            row["price_key_type_used"] = key_type
+            row["price_error"] = ""
+            typical = (high + low + current) / 3
+            row["vwap_proxy"] = typical
+            row["above_vwap"] = current >= typical
+            row["recent_return_15m"] = float(row.get("recent_return_15m", 0) or 0)
+            row["recent_return_30m"] = float(row.get("recent_return_30m", 0) or 0)
+            row["sector_strength_score"] = float(row.get("sector_strength_score", 0.5) or 0.5)
+            rows.append(row)
+        except Exception as exc:
+            failures.append(f"{code}:{exc}")
+        time.sleep(request_delay)
+
+    if not rows:
+        raise RuntimeError("실시간 현재가 갱신 실패 — 주문 후보 생성 불가: " + "; ".join(failures[:10]))
+
+    out = pd.DataFrame(rows).reset_index(drop=True)
+    out["trading_value_rank_market"] = (
+        pd.to_numeric(out["trading_value_intraday"], errors="coerce")
+        .rank(method="min", ascending=False)
+        .astype(int)
+    )
+    if failures:
+        logger.warning("KIS quote failures: %s", "; ".join(failures[:20]))
+    return out
 
 
 def select_buy_top20(
-    date_str: str = None,
-    candidates_path: str = None,
-    output_dir: str = None,
+    date_str: str | None = None,
+    candidates_path: str | None = None,
+    output_dir: str | None = None,
+    safe_mode: bool = False,
+    mode: str = "mock",
+    max_fetch: int = 300,
 ) -> dict:
-    """장중 후보에서 Top20 선정."""
     today = date_str or datetime.now().strftime("%Y%m%d")
     output_dir = output_dir or str(PROJECT_ROOT / "reports" / "predictions")
     ensure_dir(output_dir)
 
-    intra_cfg = _get_intraday_config()
-    max_n = int(intra_cfg.get("max_buy_candidates", 20))
-
-    # 입력 파일 탐색
-    if not candidates_path:
-        preds_dir = PROJECT_ROOT / "reports" / "predictions"
-        candidates_path = str(preds_dir / f"intraday_candidates_{today}.csv")
-        if not Path(candidates_path).exists():
-            # fallback: top100
-            top100_path = preds_dir / f"top100_{today}.csv"
-            if top100_path.exists():
-                candidates_path = str(top100_path)
-                logger.info(f"intraday_candidates 없음 — top100 fallback: {candidates_path}")
-            else:
-                found = sorted(preds_dir.glob("intraday_candidates_????????.csv"), reverse=True)
-                if not found:
-                    found = sorted(preds_dir.glob("top100_????????.csv"), reverse=True)
-                if found:
-                    candidates_path = str(found[0])
-                    logger.warning(f"{today} 파일 없음 — 최신 파일 사용: {candidates_path}")
-                else:
-                    return {
-                        "success": False,
-                        "error": "후보 파일 없음 (intraday_candidates 및 top100)",
-                        "output_file": "",
-                        "candidate_count": 0,
-                    }
-
-    df = pd.read_csv(candidates_path)
-    code_col = "stock_code" if "stock_code" in df.columns else "ticker"
-    df[code_col] = df[code_col].astype(str).str.zfill(6)
-    original_count = len(df)
-
-    # ── prob_intraday_2pct 없으면 fallback ────────────────────────────────
-    if "prob_intraday_2pct" not in df.columns:
-        # 기존 probability_2pct를 legacy 이름으로 처리
-        if "probability_2pct" in df.columns:
-            df["prob_intraday_2pct"] = df["probability_2pct"]
-            df.rename(columns={"probability_2pct": "nextday_prob_2pct"}, inplace=True)
-            logger.info("probability_2pct → prob_intraday_2pct (legacy 호환)")
+    input_path = Path(candidates_path) if candidates_path else _candidate_path_for(today)
+    if not input_path.exists():
+        latest = sorted((PROJECT_ROOT / "reports" / "predictions").glob("intraday_candidates_????????.csv"), reverse=True)
+        if latest:
+            input_path = latest[0]
+            logger.warning("%s not found; using latest intraday candidate file %s", today, input_path)
         else:
-            # 점수 기반 대체
-            score_col = next(
-                (c for c in ["final_score", "momentum_score", "volume_score"] if c in df.columns),
-                None,
-            )
-            if score_col:
-                df["prob_intraday_2pct"] = (
-                    df[score_col] - df[score_col].min()
-                ) / (df[score_col].max() - df[score_col].min() + 1e-9) * 0.7 + 0.3
-            else:
-                df["prob_intraday_2pct"] = 0.5
-            logger.warning("prob_intraday_2pct 없음 — 점수 기반 fallback 사용")
+            return {
+                "success": False,
+                "error": f"intraday 후보 파일 없음: {input_path}",
+                "output_file": "",
+                "candidate_count": 0,
+            }
 
-    if "prob_intraday_3pct" not in df.columns:
-        df["prob_intraday_3pct"] = df["prob_intraday_2pct"] * 0.6
-    if "prob_intraday_5pct" not in df.columns:
-        df["prob_intraday_5pct"] = df["prob_intraday_2pct"] * 0.3
-    if "expected_max_return_pct" not in df.columns:
-        df["expected_max_return_pct"] = df["prob_intraday_2pct"] * 2.5
-    if "risk_score" not in df.columns:
-        df["risk_score"] = 1 - df["prob_intraday_2pct"]
+    df = pd.read_csv(input_path)
+    if df.empty:
+        return {"success": False, "error": "intraday 후보 파일이 비어 있습니다.", "output_file": "", "candidate_count": 0}
+    if "prob_intraday_2pct" not in df.columns:
+        return {
+            "success": False,
+            "error": "prob_intraday_2pct 컬럼 없음: intraday AI 예측을 먼저 실행해야 합니다.",
+            "output_file": "",
+            "candidate_count": 0,
+        }
 
-    # ── 필터 초기화 ───────────────────────────────────────────────────────
-    if "filter_pass" not in df.columns:
-        df["filter_pass"] = True
-    if "filter_fail_reason" not in df.columns:
-        df["filter_fail_reason"] = ""
-    df["filter_pass"] = df["filter_pass"].astype(bool)
+    if "probability_2pct" in df.columns:
+        df = df.rename(columns={"probability_2pct": "legacy_nextday_probability_2pct"})
 
-    # 이미 filter_pass=False인 종목 제외 유지
-    # 추가 필터 적용
+    if safe_mode:
+        try:
+            df = _enrich_with_kis_realtime(df, mode=mode.lower(), max_fetch=max_fetch)
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": str(exc),
+                "output_file": "",
+                "candidate_count": 0,
+            }
 
-    # 필터 1: 확률 임계값
-    min_prob = float(intra_cfg.get("min_prob_2pct", 0.58))
-    fallback_prob = float(intra_cfg.get("fallback_min_prob_2pct", 0.52))
+    filtered = apply_safe_intraday_filter(df, _safe_cfg())
+    max_n = int(_safe_cfg().get("max_buy_candidates", 20) or 20)
+    passed = filtered[filtered["market_safety_pass"]].copy()
+    passed = passed.sort_values("final_safe_intraday_score", ascending=False, kind="stable").head(max_n)
+    passed = passed.reset_index(drop=True)
+    passed["final_buy_rank"] = range(1, len(passed) + 1)
+    passed["allocation_version"] = "SAFE_INTRADAY_BUY_TOP20_V1"
 
-    def _apply_filter(mask_fail: pd.Series, reason: str) -> None:
-        fail_mask = mask_fail & df["filter_pass"]
-        df.loc[fail_mask, "filter_pass"] = False
-        df.loc[fail_mask & (df["filter_fail_reason"] == ""), "filter_fail_reason"] = reason
+    safe_path = Path(output_dir) / f"buy_top20_safe_{today}.csv"
+    final_path = Path(output_dir) / f"buy_top20_{today}.csv"
+    passed.to_csv(safe_path, index=False, encoding="utf-8-sig")
 
-    # 확률 필터 (우선 0.58, 부족하면 0.52로 완화)
-    mask_prob_fail = df["prob_intraday_2pct"] < min_prob
-    pass_after_prob = (~mask_prob_fail & df["filter_pass"]).sum()
-    if pass_after_prob < 5:
-        min_prob = fallback_prob
-        mask_prob_fail = df["prob_intraday_2pct"] < fallback_prob
-        logger.info(f"확률 임계값 완화: {min_prob:.2f} (후보 부족)")
-    _apply_filter(mask_prob_fail, f"prob_2pct<{min_prob:.2f}")
+    ok, failed = copy_if_valid(safe_path, final_path, _safe_cfg())
+    summary = summarize_filter_failures(filtered)
+    min_trade = int(_safe_cfg().get("min_candidates_to_trade", 10))
+    candidate_count = len(passed)
+    below_min = candidate_count < min_trade
+    if below_min and not _safe_cfg().get("allow_trade_when_candidates_below_min", False):
+        failed.append("candidate_count_below_min_candidates_to_trade")
+        ok = False
 
-    # 필터 2: 거래대금 (일봉 기준 prev_trading_value 또는 trading_value)
-    tv_col = next(
-        (c for c in ["prev_trading_value", "trading_value_until_entry", "trading_value"] if c in df.columns),
-        None,
-    )
-    min_tv = float(intra_cfg.get("min_trading_value_krw", 30_000_000_000))
-    fallback_tv = float(intra_cfg.get("fallback_trading_value_krw", 10_000_000_000))
-    if tv_col:
-        pass_after_tv = (df[tv_col] >= min_tv).sum()
-        if pass_after_tv < 5:
-            min_tv = fallback_tv
-        _apply_filter(df[tv_col] < min_tv, f"tv<{int(min_tv/1e8)}억")
-
-    # 필터 3: 하락 종목 원칙적 제외 (gap_rate < 0)
-    if "gap_rate" in df.columns:
-        _apply_filter(df["gap_rate"] < 0, "하락갭")
-
-    # 필터 4: 과도한 갭 상승 후 밀림 제외 (gap_rate > 8%)
-    if "gap_rate" in df.columns:
-        _apply_filter(df["gap_rate"] > 0.08, "과도한갭")
-
-    # ── 최종 점수 계산 ────────────────────────────────────────────────────
-    # 거래대금 정규화 점수
-    if tv_col and df[tv_col].max() > 0:
-        tv_score = (df[tv_col] / df[tv_col].max()).clip(0, 1)
-    else:
-        tv_score = pd.Series(0.5, index=df.index)
-
-    # 모멘텀 점수 (gap_rate + prev_return)
-    if "gap_rate" in df.columns:
-        gap_score = df["gap_rate"].clip(-0.05, 0.10) / 0.10
-    else:
-        gap_score = pd.Series(0.5, index=df.index)
-
-    if "prev_return_1d" in df.columns:
-        prev_ret_score = df["prev_return_1d"].clip(-0.05, 0.05) / 0.05 * 0.5 + 0.5
-    else:
-        prev_ret_score = pd.Series(0.5, index=df.index)
-
-    momentum_score = (gap_score * 0.5 + prev_ret_score * 0.5).clip(0, 1)
-
-    df["final_intraday_score"] = (
-        df["prob_intraday_2pct"] * 0.40 +
-        tv_score * 0.20 +
-        momentum_score * 0.25 +
-        (1 - df["risk_score"].clip(0, 1)) * 0.15
-    )
-
-    # ── Top20 선정 ────────────────────────────────────────────────────────
-    df_pass = df[df["filter_pass"]].copy()
-    df_fail = df[~df["filter_pass"]].copy()
-
-    # 통과 후보가 max_n보다 적으면 점수 하위 종목도 추가 (최대 max_n까지)
-    if len(df_pass) < max_n and len(df_fail) > 0:
-        needed = max_n - len(df_pass)
-        extra = df_fail.nlargest(needed, "final_intraday_score")
-        extra = extra.copy()
-        extra["filter_pass"] = True
-        extra["filter_fail_reason"] = extra["filter_fail_reason"] + " (완화)"
-        df_pass = pd.concat([df_pass, extra], ignore_index=True)
-        logger.info(f"후보 부족 — 필터 완화 {needed}개 추가")
-
-    df_top20 = df_pass.nlargest(max_n, "final_intraday_score").reset_index(drop=True)
-    df_top20["final_buy_rank"] = range(1, len(df_top20) + 1)
-
-    # ── 출력 ─────────────────────────────────────────────────────────────
-    output_file = os.path.join(output_dir, f"buy_top20_{today}.csv")
-    df_top20.to_csv(output_file, index=False)
-
-    selected_count = len(df_top20)
-    logger.info(
-        f"Top20 선정 완료: {selected_count}/{original_count}개 | "
-        f"평균 prob_2pct={df_top20['prob_intraday_2pct'].mean():.4f} | "
-        f"{output_file}"
-    )
-
-    return {
-        "success": True,
-        "output_file": output_file,
-        "candidate_count": selected_count,
-        "original_count": original_count,
-        "filter_pass_count": int(df["filter_pass"].sum()),
+    result = {
+        "success": bool(ok),
+        "safe_mode": bool(safe_mode),
+        "input_file": str(input_path),
+        "output_file": str(final_path if ok else safe_path),
+        "safe_output_file": str(safe_path),
+        "candidate_count": int(candidate_count),
+        "original_count": int(len(df)),
+        "filter_pass_count": int(len(passed)),
         "date": today,
-        "mean_prob_2pct": round(float(df_top20["prob_intraday_2pct"].mean()), 4),
+        "failed_checks": failed,
+        **summary,
     }
+    if not ok:
+        result["error"] = "안전 필터 통과 실패 — buy_top20_YYYYMMDD.csv를 업데이트하지 않았습니다."
+    logger.info("safe buy_top20 result: %s", result)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return result
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="오늘 당일 매수 후보 Top20 선정")
+    parser = argparse.ArgumentParser(description="Select safe intraday buy Top20")
     parser.add_argument("--date", default=None)
-    parser.add_argument("--input", default=None, help="intraday_candidates 파일 경로")
+    parser.add_argument("--input", default=None, help="intraday_candidates CSV path")
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--safe-mode", action="store_true", help="Require KIS realtime data and safe filters")
+    parser.add_argument("--mode", default="mock", choices=["mock", "real", "paper"])
+    parser.add_argument("--max-fetch", type=int, default=300)
     args = parser.parse_args()
 
     result = select_buy_top20(
         date_str=args.date,
         candidates_path=args.input,
         output_dir=args.output_dir,
+        safe_mode=args.safe_mode,
+        mode=args.mode,
+        max_fetch=args.max_fetch,
     )
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    if not result["success"]:
+    if not result.get("success"):
         sys.exit(1)
 
 

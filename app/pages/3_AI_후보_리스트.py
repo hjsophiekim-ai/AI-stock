@@ -778,7 +778,8 @@ with _irow1[2]:
     if st.button("장중 Top20 선정 (AI)", use_container_width=True, key="btn_intra_top20"):
         with st.spinner("intraday Top20 선정 중..."):
             _r_i20 = run_script("select_today_buy_top20.py",
-                                args=["--date", today_str], timeout=60)
+                                args=["--date", today_str, "--safe-mode", "--mode", "mock"],
+                                timeout=180)
         _show_script_result(_r_i20, "장중 Top20 선정")
         if _r_i20 and _r_i20.get("success"):
             st.rerun()

@@ -66,10 +66,10 @@ def allocate_until_budget(
     df["_current_price"] = pd.to_numeric(df[price_col], errors="coerce").fillna(0).astype(float)
     if "rank" in df.columns:
         df["_rank_sort"] = pd.to_numeric(df["rank"], errors="coerce").fillna(999999)
+    elif "prob_intraday_2pct" in df.columns:
+        df["_rank_sort"] = -pd.to_numeric(df["prob_intraday_2pct"], errors="coerce").fillna(0)
     elif "prediction_score" in df.columns:
         df["_rank_sort"] = -pd.to_numeric(df["prediction_score"], errors="coerce").fillna(0)
-    elif "probability_2pct" in df.columns:
-        df["_rank_sort"] = -pd.to_numeric(df["probability_2pct"], errors="coerce").fillna(0)
     elif "proba_up" in df.columns:
         df["_rank_sort"] = -pd.to_numeric(df["proba_up"], errors="coerce").fillna(0)
     else:
@@ -213,7 +213,7 @@ class BudgetAllocator:
             "name" if "name" in candidates.columns else None
         )
         price_col = next((c for c in ("close", "current_price") if c in candidates.columns), None)
-        score_col = next((c for c in ("probability_2pct", "prediction_score", "proba_up") if c in candidates.columns), None)
+        score_col = next((c for c in ("prob_intraday_2pct", "prediction_score", "proba_up") if c in candidates.columns), None)
 
         if price_col is None:
             logger.error("가격 컬럼 없음 (close 또는 current_price 필요)")

@@ -332,6 +332,31 @@ intraday_trading_model:
   secondary_profit_pct: [3.0, 5.0]
   stop_loss_pct: -2.0
   force_intraday_model: true
+
+safe_intraday_filter:
+  exclude_negative_change: true
+  min_change_rate_pct: 0.5
+  max_change_rate_pct: 7.0
+  hard_exclude_change_rate_below_pct: -2.0
+  hard_exclude_crash_below_pct: -5.0
+  max_allowed_change_rate_pct: 12.0
+  max_high_drawdown_pct: -4.0
+  preferred_high_drawdown_pct: -3.0
+  min_high_proximity: 0.965
+  min_recent_return_15m_pct: -0.3
+  min_recent_return_30m_pct: -0.8
+  exclude_below_open_when_negative: true
+  exclude_gap_and_fade: true
+  require_above_vwap: true
+  min_trading_value_krw: 30000000000
+  fallback_min_trading_value_krw: 10000000000
+  hard_min_trading_value_krw: 10000000000
+  max_trading_value_rank: 200
+  fallback_max_trading_value_rank: 250
+  min_prob_intraday_2pct: 0.55
+  min_candidates_to_trade: 10
+  allow_trade_when_candidates_below_min: false
+  never_fill_with_failed_candidates: true
   min_prob_2pct: 0.58
   fallback_min_prob_2pct: 0.52
   max_buy_candidates: 20

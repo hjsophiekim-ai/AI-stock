@@ -41,6 +41,26 @@ def get_active_buy_candidate_file(date: Optional[str] = None) -> Optional[Path]:
     return None
 
 
+def _validate_orderable_buy_top20(path: Optional[Path], df: pd.DataFrame) -> Optional[str]:
+    if path is None:
+        return "buy_top20 파일이 없습니다. 주문 불가."
+    name = path.name
+    if not (name.startswith("buy_top20_") and name.endswith(".csv")):
+        return f"주문 후보 파일은 buy_top20_YYYYMMDD.csv만 허용됩니다: {name}"
+    if df is None or df.empty:
+        return "buy_top20 파일이 비어 있습니다. 주문 불가."
+    if "prob_intraday_2pct" not in df.columns:
+        return "buy_top20에 prob_intraday_2pct 컬럼이 없습니다. intraday AI 예측 기반 buy_top20만 주문 가능합니다."
+    try:
+        from market_safety_filter import validate_orderable_buy_top20_df
+        ok, failed = validate_orderable_buy_top20_df(df, load_config().get("safe_intraday_filter", {}))
+        if not ok:
+            return "안전 필터를 통과하지 못한 종목이 포함되어 주문을 중단합니다: " + ", ".join(failed)
+    except Exception as exc:
+        return f"안전 필터 검증 실패: {exc}"
+    return None
+
+
 def get_positions() -> List[Dict]:
     inject_to_os_env()
     try:
@@ -315,17 +335,25 @@ def run_budget_allocation(
 
         # 매수 버튼과 동일한 후보 파일 로드
         df = None
+        candidate_path = None
         if candidate_file:
             _p = Path(candidate_file)
             if _p.exists():
+                candidate_path = _p
                 df = pd.read_csv(_p)
 
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-            from prediction_service import load_top20, get_today_str
+            from prediction_service import get_today_str
             ds = date_str or get_today_str()
-            df = load_top20(ds)
+            candidate_path = PROJECT_ROOT / "reports" / "predictions" / f"buy_top20_{ds}.csv"
+            if candidate_path.exists():
+                df = pd.read_csv(candidate_path)
             if df is None or df.empty:
-                return {"success": False, "message": "후보 파일을 찾을 수 없습니다 (top20 fallback도 없음)", "data": None}
+                return {"success": False, "message": "buy_top20 파일을 찾을 수 없습니다. top100/top50/top20 fallback 주문은 금지됩니다.", "data": None}
+
+        orderable_error = _validate_orderable_buy_top20(candidate_path, df)
+        if orderable_error:
+            return {"success": False, "message": orderable_error, "data": None}
 
         total_candidates = len(df)
 
@@ -462,6 +490,13 @@ def run_buy_candidates(
             except Exception:
                 pass
         from buy_candidate_list import buy_candidates
+        _candidate_path = Path(candidate_file) if candidate_file else None
+        if not _candidate_path or not _candidate_path.exists():
+            return {"success": False, "message": "buy_top20 파일이 없습니다. 주문 불가.", "orders_placed": 0}
+        _df_check = pd.read_csv(_candidate_path)
+        _orderable_error = _validate_orderable_buy_top20(_candidate_path, _df_check)
+        if _orderable_error:
+            return {"success": False, "message": _orderable_error, "orders_placed": 0, "allocation_preview": []}
         result = buy_candidates(
             candidate_file=candidate_file,
             budget=budget,
