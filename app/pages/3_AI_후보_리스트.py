@@ -18,7 +18,7 @@ from prediction_service import (
     run_force_trade_selector, run_no_trade_analysis,
     get_today_str, get_top20_path, get_force_candidates_path,
 )
-from pipeline_service import run_full_pipeline, find_latest_candidate_file
+from pipeline_service import run_full_pipeline, run_fast_candidate_pipeline, find_latest_candidate_file
 from trading_service import run_buy_candidates, list_sell_policies
 from tables import render_candidates_table
 from warning_box import force_trade_disclaimer, no_profit_guarantee_notice
@@ -118,6 +118,20 @@ col2.metric("학습 모델", "있음 ✅" if model_path.exists() else "없음 �
 col3.metric("Top100 파일", "있음 ✅" if top100_path.exists() else "없음 ❌")
 col4.metric("force_trade 후보", "있음 ✅" if force_path.exists() else "없음 ❌")
 
+# 후보 파일 폴더 상태
+_preds_dir_exists = predictions_dir.exists()
+_pred_files = sorted(predictions_dir.glob("top100_????????.csv"), reverse=True) if _preds_dir_exists else []
+_latest_pred = _pred_files[0] if _pred_files else None
+import time as _time
+_latest_info = (
+    f"{_latest_pred.name}  ({_time.strftime('%Y-%m-%d %H:%M', _time.localtime(_latest_pred.stat().st_mtime))})"
+    if _latest_pred else "없음"
+)
+with st.expander(f"후보 파일 폴더 상태 (reports/predictions)", expanded=False):
+    st.write(f"- 폴더 존재: {'✅' if _preds_dir_exists else '❌'}")
+    st.write(f"- top100 파일 수: {len(_pred_files)}개")
+    st.write(f"- 최신 파일: {_latest_info}")
+
 st.divider()
 
 # ── 환경변수 상태 ──────────────────────────────────────────────
@@ -194,22 +208,23 @@ with row2[2]:
 
 with row2[3]:
     if st.button("전체 파이프라인 실행", use_container_width=True, type="primary"):
+        print("[PIPELINE] BUTTON_CLICKED full_pipeline", flush=True)
+        st.write("🔄 전체 파이프라인 실행 시작...")
         with st.spinner("전체 파이프라인 실행 중 (시간이 걸립니다)..."):
             r = run_full_pipeline(mode="mock", top_n=100, refresh_prices=True, years=3)
 
+        st.session_state["last_pipeline_result"] = r
+
         if not isinstance(r, dict):
-            # 절대 발생하면 안 되지만 방어 처리
             st.error("파이프라인 반환값 오류 — dict가 아닌 값 반환됨")
             st.code(str(r)[:2000], language="text")
 
         elif r.get("success"):
             st.success(f"전체 파이프라인 완료 — Top100: {r.get('candidate_count', 0)}개 종목")
-            # 후보 파일을 session_state에 저장 (다른 페이지에서 사용)
             _cf = r.get("candidate_file", "")
             if _cf:
                 st.session_state["latest_candidate_file"] = _cf
                 st.caption(f"후보 파일: {_cf}")
-            # 단계별 결과 표
             _steps = r.get("steps", [])
             if _steps:
                 _sdf = pd.DataFrame([{
@@ -219,6 +234,8 @@ with row2[3]:
                     "returncode": s.get("returncode", 0),
                 } for s in _steps])
                 st.dataframe(_sdf, use_container_width=True, hide_index=True)
+            with st.expander("전체 결과 JSON", expanded=False):
+                st.json(r)
             st.rerun()
 
         else:
@@ -228,7 +245,6 @@ with row2[3]:
             if _errmsg:
                 st.caption(_errmsg)
 
-            # 단계별 결과 표
             _steps = r.get("steps", [])
             if _steps:
                 _sdf = pd.DataFrame([{
@@ -239,7 +255,6 @@ with row2[3]:
                 } for s in _steps])
                 st.dataframe(_sdf, use_container_width=True, hide_index=True)
 
-            # 실패 단계 stderr / stdout
             _stderr = r.get("stderr_raw") or r.get("stderr", "")
             _stdout = r.get("stdout_raw") or r.get("stdout", "")
             if _stderr:
@@ -249,7 +264,6 @@ with row2[3]:
                 with st.expander(f"실행 출력 (stdout) — {_failed}"):
                     st.code(_stdout[-2000:], language="text")
 
-            # errors 목록 (구 형식 호환)
             _errs = r.get("errors", [])
             if _errs and not _stderr:
                 st.text_area("오류 상세", "\n".join(str(e) for e in _errs[:5]), height=120)
@@ -257,6 +271,84 @@ with row2[3]:
             _lp = r.get("log_path", "")
             if _lp:
                 st.caption(f"로그: {_lp}")
+
+            with st.expander("전체 결과 JSON", expanded=False):
+                st.json(r)
+
+# ── 빠른 후보 생성 (Render 권장) ─────────────────────────────────
+row3 = st.columns(2)
+with row3[0]:
+    if st.button("빠른 후보 생성 (Render 권장)", use_container_width=True):
+        print("[PIPELINE] BUTTON_CLICKED fast_pipeline", flush=True)
+        st.write("🔄 빠른 후보 생성 시작 (predict → select_top)...")
+        with st.spinner("빠른 후보 생성 중 (predict_candidates + select_top_candidates)..."):
+            r = run_fast_candidate_pipeline(mode="mock", top_n=100)
+
+        st.session_state["last_pipeline_result"] = r
+
+        if not isinstance(r, dict):
+            st.error("파이프라인 반환값 오류 — dict가 아닌 값 반환됨")
+            st.code(str(r)[:2000], language="text")
+        elif r.get("success"):
+            st.success(f"빠른 후보 생성 완료 — Top100: {r.get('candidate_count', 0)}개 종목")
+            _cf = r.get("candidate_file", "")
+            if _cf:
+                st.session_state["latest_candidate_file"] = _cf
+                st.caption(f"후보 파일: {_cf}")
+            _steps = r.get("steps", [])
+            if _steps:
+                _sdf = pd.DataFrame([{
+                    "단계": s.get("step", ""),
+                    "결과": "✅ 성공" if s.get("success") else "❌ 실패",
+                    "소요(초)": s.get("duration_sec", 0),
+                    "returncode": s.get("returncode", 0),
+                } for s in _steps])
+                st.dataframe(_sdf, use_container_width=True, hide_index=True)
+            with st.expander("전체 결과 JSON", expanded=False):
+                st.json(r)
+            st.rerun()
+        else:
+            _failed = r.get("failed_step", "알 수 없음")
+            st.error(f"빠른 후보 생성 실패 — {_failed}: {r.get('error_message','')}")
+            _stderr = r.get("stderr_raw", "")
+            if _stderr:
+                with st.expander("오류 상세 (stderr)", expanded=True):
+                    st.code(_stderr[-4000:], language="text")
+            with st.expander("전체 결과 JSON", expanded=False):
+                st.json(r)
+
+with row3[1]:
+    if st.button("최신 파이프라인 로그 보기", use_container_width=True):
+        _log_dir = PROJECT_ROOT / "logs"
+        _log_files = sorted(_log_dir.glob("pipeline_*.log"), reverse=True) if _log_dir.exists() else []
+        if _log_files:
+            _lf = _log_files[0]
+            try:
+                _log_content = _lf.read_text(encoding="utf-8", errors="replace")
+                with st.expander(f"로그: {_lf.name}", expanded=True):
+                    st.code(_log_content[-5000:], language="text")
+            except Exception as _ex:
+                st.error(f"로그 읽기 실패: {_ex}")
+        else:
+            st.info("로그 파일이 없습니다 (logs/pipeline_*.log)")
+
+# ── 최근 파이프라인 결과 (session_state 보존) ───────────────────
+if "last_pipeline_result" in st.session_state:
+    _lpr = st.session_state["last_pipeline_result"]
+    _lpr_success = _lpr.get("success") if isinstance(_lpr, dict) else None
+    _lpr_icon = "✅" if _lpr_success else "❌"
+    with st.expander(f"{_lpr_icon} 최근 파이프라인 실행 결과 (session 보존)", expanded=False):
+        if isinstance(_lpr, dict):
+            _lpr_steps = _lpr.get("steps", [])
+            if _lpr_steps:
+                st.dataframe(pd.DataFrame([{
+                    "단계": s.get("step", ""),
+                    "결과": "✅" if s.get("success") else "❌",
+                    "소요(초)": s.get("duration_sec", 0),
+                } for s in _lpr_steps]), use_container_width=True, hide_index=True)
+            st.json(_lpr)
+        else:
+            st.write(_lpr)
 
 st.divider()
 

@@ -55,6 +55,8 @@ def run_pipeline_step(
 
     반환 키: step, success, returncode, stdout, stderr, duration_sec
     """
+    print(f"[PIPELINE] START {step_name}", flush=True)
+
     script_path = PROJECT_ROOT / "src" / script_name
     cmd = [sys.executable, str(script_path)] + (args or [])
 
@@ -68,31 +70,46 @@ def run_pipeline_step(
             timeout=timeout,
         )
         duration = round(time.time() - t0, 1)
+        success = proc.returncode == 0
+        stdout = (proc.stdout or "")[-4000:]
+        stderr = (proc.stderr or "")[-4000:]
+
+        if success:
+            print(f"[PIPELINE] END {step_name} returncode={proc.returncode} duration={duration}s", flush=True)
+        else:
+            print(f"[PIPELINE] FAIL {step_name} returncode={proc.returncode} duration={duration}s", flush=True)
+            if stderr:
+                print(f"[PIPELINE] STDERR {step_name}: {stderr[:500]}", flush=True)
+
         return {
             "step": step_name,
-            "success": proc.returncode == 0,
+            "success": success,
             "returncode": proc.returncode,
-            "stdout": (proc.stdout or "")[-4000:],
-            "stderr": (proc.stderr or "")[-4000:],
+            "stdout": stdout,
+            "stderr": stderr,
             "duration_sec": duration,
         }
     except subprocess.TimeoutExpired:
+        duration = round(time.time() - t0, 1)
+        print(f"[PIPELINE] TIMEOUT {step_name} after {timeout}s", flush=True)
         return {
             "step": step_name,
             "success": False,
             "returncode": -1,
             "stdout": "",
             "stderr": f"TimeoutExpired after {timeout}s",
-            "duration_sec": round(time.time() - t0, 1),
+            "duration_sec": duration,
         }
     except Exception as ex:
+        duration = round(time.time() - t0, 1)
+        print(f"[PIPELINE] ERROR {step_name}: {ex}", flush=True)
         return {
             "step": step_name,
             "success": False,
             "returncode": -1,
             "stdout": "",
             "stderr": str(ex),
-            "duration_sec": round(time.time() - t0, 1),
+            "duration_sec": duration,
         }
 
 
@@ -141,6 +158,7 @@ def run_full_pipeline(
         stderr_raw      — 실패 단계 stderr
         log_path        — 로그 파일 경로
     """
+    print("[PIPELINE] ENTER run_full_pipeline", flush=True)
     ensure_runtime_directories()
 
     today = datetime.now().strftime("%Y%m%d")
@@ -247,6 +265,106 @@ def run_full_pipeline(
         )
         step_results.append(refresh_sr)
 
+    print("[PIPELINE] END run_full_pipeline success=True", flush=True)
+    return {
+        "success": True,
+        "failed_step": "",
+        "steps": step_results,
+        "candidate_file": str(candidate_file_path),
+        "candidate_count": candidate_count,
+        "error_message": "",
+        "stdout_raw": "",
+        "stderr_raw": "",
+        "log_path": log_path,
+    }
+
+
+def run_fast_candidate_pipeline(
+    mode: str = "mock",
+    top_n: int = 100,
+) -> Dict:
+    """빠른 후보 생성 파이프라인 — 데이터 수집/모델 학습 생략.
+
+    기존 데이터와 모델을 그대로 사용하며 predict_candidates →
+    select_top_candidates 만 실행합니다. Render 환경 권장.
+
+    반환 키: run_full_pipeline과 동일 구조.
+    """
+    print("[PIPELINE] ENTER run_fast_candidate_pipeline", flush=True)
+    ensure_runtime_directories()
+
+    today = datetime.now().strftime("%Y%m%d")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = str(PROJECT_ROOT / "logs" / f"pipeline_fast_{ts}.log")
+
+    step_defs = [
+        {
+            "step": "predict_candidates",
+            "script": "predict_candidates.py",
+            "timeout": 300,
+            "args": [],
+        },
+        {
+            "step": "select_top_candidates",
+            "script": "select_top_candidates.py",
+            "timeout": 120,
+            "args": ["--top-n", str(top_n), "--all"],
+        },
+    ]
+
+    step_results: List[Dict] = []
+
+    for s in step_defs:
+        sr = run_pipeline_step(
+            step_name=s["step"],
+            script_name=s["script"],
+            args=s.get("args", []),
+            timeout=s["timeout"],
+        )
+        step_results.append(sr)
+
+        if not sr["success"]:
+            print(f"[PIPELINE] END run_fast_candidate_pipeline success=False at {sr['step']}", flush=True)
+            return {
+                "success": False,
+                "failed_step": sr["step"],
+                "steps": step_results,
+                "candidate_file": "",
+                "candidate_count": 0,
+                "error_message": (
+                    f"[{sr['step']}] 실패 (exit {sr['returncode']})\n"
+                    f"{sr['stderr'][-500:]}"
+                ),
+                "stdout_raw": sr["stdout"],
+                "stderr_raw": sr["stderr"],
+                "log_path": log_path,
+            }
+
+    candidate_file_path = PROJECT_ROOT / "reports" / "predictions" / f"top100_{today}.csv"
+    if not candidate_file_path.exists():
+        last = step_results[-1] if step_results else {}
+        print("[PIPELINE] END run_fast_candidate_pipeline success=False top100 not found", flush=True)
+        return {
+            "success": False,
+            "failed_step": "select_top_candidates",
+            "steps": step_results,
+            "candidate_file": str(candidate_file_path),
+            "candidate_count": 0,
+            "error_message": "Top100 file was not created",
+            "stdout_raw": last.get("stdout", ""),
+            "stderr_raw": last.get("stderr", ""),
+            "log_path": log_path,
+        }
+
+    candidate_count = 0
+    try:
+        import pandas as _pd
+        df_c = _pd.read_csv(candidate_file_path)
+        candidate_count = len(df_c)
+    except Exception:
+        pass
+
+    print(f"[PIPELINE] END run_fast_candidate_pipeline success=True count={candidate_count}", flush=True)
     return {
         "success": True,
         "failed_step": "",
