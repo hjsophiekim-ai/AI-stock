@@ -743,6 +743,109 @@ else:
 
 st.divider()
 
+# ── 장중 AI 모델 파이프라인 (당일 +2% 목표) ──────────────────────
+st.subheader("장중 AI 모델 파이프라인 (당일 오전 10:30~11:30 매수 → +2% 목표)")
+st.caption("intraday_2pct 모델: AUC=0.69 / Precision@top5%=79% / backtest hit_rate=80.9%")
+
+_intra_candidates_path = predictions_dir / f"intraday_candidates_{today_str}.csv"
+_intra_buy20_path = predictions_dir / f"buy_top20_{today_str}.csv"
+_intra_model_path = PROJECT_ROOT / "models" / "intraday_2pct_model.joblib"
+
+_ic1, _ic2, _ic3, _ic4 = st.columns(4)
+_ic1.metric("장중 AI 모델", "있음 ✅" if _intra_model_path.exists() else "없음 ❌")
+_ic2.metric("intraday_candidates", "있음 ✅" if _intra_candidates_path.exists() else "없음 ❌")
+_ic3.metric("buy_top20", "있음 ✅" if _intra_buy20_path.exists() else "없음 ❌")
+_intra_latest_feat = PROJECT_ROOT / "data" / "processed" / "intraday_latest_features.csv"
+_ic4.metric("최신 피처", "있음 ✅" if _intra_latest_feat.exists() else "없음 ❌")
+
+_irow1 = st.columns(4)
+with _irow1[0]:
+    if st.button("장중 피처 생성", use_container_width=True, key="btn_intra_features"):
+        with st.spinner("intraday features 생성 중 (~2분)..."):
+            _r_if = run_script("make_intraday_features.py", timeout=300)
+        _show_script_result(_r_if, "장중 피처 생성")
+
+with _irow1[1]:
+    if st.button("장중 AI 예측", use_container_width=True, key="btn_intra_predict"):
+        with st.spinner("intraday 후보 예측 중..."):
+            _r_ip = run_script("predict_intraday_candidates.py",
+                               args=["--date", today_str], timeout=120)
+        _show_script_result(_r_ip, "장중 AI 예측")
+        if _r_ip and _r_ip.get("success"):
+            st.rerun()
+
+with _irow1[2]:
+    if st.button("장중 Top20 선정 (AI)", use_container_width=True, key="btn_intra_top20"):
+        with st.spinner("intraday Top20 선정 중..."):
+            _r_i20 = run_script("select_today_buy_top20.py",
+                                args=["--date", today_str], timeout=60)
+        _show_script_result(_r_i20, "장중 Top20 선정")
+        if _r_i20 and _r_i20.get("success"):
+            st.rerun()
+
+with _irow1[3]:
+    if st.button("장중 백테스트", use_container_width=True, key="btn_intra_backtest"):
+        with st.spinner("장중 전략 백테스트 실행 중..."):
+            _r_ibt = run_script("backtest_intraday_strategy.py",
+                                args=["--top-n", "20", "--min-prob", "0.58"],
+                                timeout=180)
+        _show_script_result(_r_ibt, "장중 백테스트")
+
+# buy_top20 프리뷰 with prob_intraday_2pct
+_active_buy20 = get_active_buy_candidate_file(date=today_str)
+if _active_buy20 and Path(_active_buy20).exists():
+    try:
+        _df_buy20 = pd.read_csv(_active_buy20)
+        _buy20_has_intra = "prob_intraday_2pct" in _df_buy20.columns
+        _intra_label = "장중 AI prob" if _buy20_has_intra else "legacy score"
+        st.caption(f"현재 buy_top20: {Path(_active_buy20).name} | {len(_df_buy20)}개 종목 | {_intra_label}")
+
+        _show_cols = ["final_buy_rank"]
+        for _c in ["stock_code", "ticker", "stock_name", "name"]:
+            if _c in _df_buy20.columns:
+                _show_cols.append(_c)
+                break
+        for _c in ["prob_intraday_2pct", "prob_intraday_3pct", "prob_intraday_5pct",
+                   "final_intraday_score", "expected_max_return_pct",
+                   "probability_2pct", "nextday_prob_2pct",
+                   "gap_rate", "prev_return_1d", "current_price"]:
+            if _c in _df_buy20.columns:
+                _show_cols.append(_c)
+        _show_cols = [c for c in _show_cols if c in _df_buy20.columns]
+
+        st.dataframe(
+            _df_buy20[_show_cols].head(20),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "prob_intraday_2pct": st.column_config.ProgressColumn(
+                    "prob +2% (당일)", format="%.3f", min_value=0, max_value=1),
+                "prob_intraday_3pct": st.column_config.ProgressColumn(
+                    "prob +3% (당일)", format="%.3f", min_value=0, max_value=1),
+                "prob_intraday_5pct": st.column_config.ProgressColumn(
+                    "prob +5% (당일)", format="%.3f", min_value=0, max_value=1),
+                "final_intraday_score": st.column_config.ProgressColumn(
+                    "종합점수", format="%.3f", min_value=0, max_value=1),
+                "gap_rate": st.column_config.NumberColumn("갭률", format="%.2f%%"),
+                "probability_2pct": st.column_config.ProgressColumn(
+                    "prob (익일)", format="%.3f", min_value=0, max_value=1),
+            },
+        )
+        if not _buy20_has_intra:
+            st.warning(
+                "⚠ 이 buy_top20은 legacy 모델 기반입니다. "
+                "'장중 AI 예측' → '장중 Top20 선정 (AI)' 순으로 실행하면 "
+                "prob_intraday_2pct 기반 파일로 갱신됩니다."
+            )
+    except Exception as _e_b20:
+        st.caption(f"buy_top20 미리보기 오류: {_e_b20}")
+else:
+    st.info(
+        "buy_top20 파일 없음. '장중 AI 예측' 버튼 → '장중 Top20 선정 (AI)' 버튼 순으로 실행하세요."
+    )
+
+st.divider()
+
 # ── force_trade 후보 ────────────────────────────────────────────
 st.subheader("force_trade 후보 (필터 완화 적용)")
 force_trade_disclaimer()

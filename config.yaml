@@ -324,3 +324,25 @@ intraday_filter:
     high_proximity_score: 0.15
     vwap_score: 0.10
     recent_momentum_score: 0.10
+intraday_trading_model:
+  enabled: true
+  entry_window_start: "10:30"
+  entry_window_end: "11:30"
+  target_profit_pct: 2.0
+  secondary_profit_pct: [3.0, 5.0]
+  stop_loss_pct: -2.0
+  force_intraday_model: true
+  min_prob_2pct: 0.58
+  fallback_min_prob_2pct: 0.52
+  max_buy_candidates: 20
+  min_trading_value_krw: 30000000000
+  fallback_trading_value_krw: 10000000000
+  min_change_rate_pct: 1.0
+  max_change_rate_pct: 10.0
+  min_high_proximity: 0.965
+  min_recent_return_15m_pct: -0.3
+  require_above_vwap: true
+  exclude_gap_and_fade: true
+  require_sector_strength: true
+  slippage_pct: 0.15
+  commission_tax_pct: 0.23

@@ -174,11 +174,21 @@ _f_col2.metric("파일 생성시각", _cfile_mtime_str or "알수없음")
 _f_col3.metric("종목 수", f"{len(df_candidates)}개")
 
 if _is_buy_top20:
-    st.info(
-        "**buy_top20 파일 사용 중** (장중 필터 적용 버전) — "
-        "AI 예측 점수 + 장중 거래량/가격 조건으로 선별된 종목입니다. "
-        "AI 후보 리스트 페이지의 top20(AI 예측 순위 기준)과 종목 구성이 다를 수 있습니다."
-    )
+    _has_intra_prob = df_candidates is not None and "prob_intraday_2pct" in df_candidates.columns
+    if _has_intra_prob:
+        _mean_prob = df_candidates["prob_intraday_2pct"].mean()
+        st.info(
+            f"**buy_top20 파일 사용 중** (장중 AI 모델 기반) — "
+            f"당일 +2% 목표 intraday 모델 적용. "
+            f"평균 prob_intraday_2pct: **{_mean_prob:.3f}**"
+        )
+    else:
+        st.info(
+            "**buy_top20 파일 사용 중** (장중 필터 적용 버전) — "
+            "AI 예측 점수 + 장중 거래량/가격 조건으로 선별된 종목입니다. "
+            "AI 후보 리스트 페이지에서 '장중 AI 예측' → '장중 Top20 선정 (AI)'를 실행하면 "
+            "prob_intraday_2pct 기반으로 업그레이드됩니다."
+        )
 elif _is_top20_plain:
     st.info("**top20 파일 사용 중** (AI 예측 점수 순위 기준) — 장중 필터 미적용 버전입니다.")
 
@@ -245,10 +255,28 @@ with st.expander("후보 목록 미리보기", expanded=False):
     name_col = "stock_name" if "stock_name" in df_candidates.columns else "name"
     show_cols = [
         c
-        for c in [code_col, name_col, "current_price", "close", "buy_allowed", "disclosure_summary", "final_score"]
+        for c in [
+            code_col, name_col,
+            "prob_intraday_2pct", "prob_intraday_3pct", "prob_intraday_5pct",
+            "final_intraday_score", "final_buy_rank",
+            "current_price", "close", "gap_rate",
+            "buy_allowed", "disclosure_summary",
+            "probability_2pct", "final_score",
+        ]
         if c in df_candidates.columns
     ]
-    st.dataframe(df_candidates[show_cols].head(30), use_container_width=True)
+    _col_cfg = {}
+    if "prob_intraday_2pct" in df_candidates.columns:
+        _col_cfg["prob_intraday_2pct"] = st.column_config.ProgressColumn(
+            "prob +2% (당일)", format="%.3f", min_value=0, max_value=1)
+    if "prob_intraday_3pct" in df_candidates.columns:
+        _col_cfg["prob_intraday_3pct"] = st.column_config.ProgressColumn(
+            "prob +3% (당일)", format="%.3f", min_value=0, max_value=1)
+    if "probability_2pct" in df_candidates.columns:
+        _col_cfg["probability_2pct"] = st.column_config.ProgressColumn(
+            "prob (익일)", format="%.3f", min_value=0, max_value=1)
+    st.dataframe(df_candidates[show_cols].head(30), use_container_width=True,
+                 column_config=_col_cfg if _col_cfg else None)
 
 st.divider()
 st.subheader("예산배분 계산")
