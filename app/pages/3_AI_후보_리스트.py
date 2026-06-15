@@ -139,6 +139,21 @@ col3.metric("Top100 파일", "있음 ✅" if top100_path.exists() else "없음 �
 col4.metric("장중 Top20 파일", "있음 ✅" if buy_top20_path.exists() else "없음 ❌")
 col5.metric("force_trade 후보", "있음 ✅" if force_path.exists() else "없음 ❌")
 
+# buy_top20 vs top100 동기화 경고
+if top100_path.exists() and buy_top20_path.exists():
+    import time as _time_sync
+    _top100_mtime = top100_path.stat().st_mtime
+    _buy20_mtime = buy_top20_path.stat().st_mtime
+    if _top100_mtime > _buy20_mtime + 60:  # top100이 buy_top20보다 1분 이상 새 것
+        st.warning(
+            f"⚠ top100 파일이 buy_top20 파일보다 최신입니다 "
+            f"(top100: {_time_sync.strftime('%H:%M:%S', _time_sync.localtime(_top100_mtime))}, "
+            f"buy_top20: {_time_sync.strftime('%H:%M:%S', _time_sync.localtime(_buy20_mtime))}). "
+            f"'장중 Top20 필터 실행' 버튼으로 buy_top20을 재생성하면 예산배분/주문 페이지 종목과 일치합니다."
+        )
+elif top100_path.exists() and not buy_top20_path.exists():
+    st.info("장중 Top20 파일이 없습니다. '장중 Top20 필터 실행' 버튼으로 생성하면 예산배분/주문 페이지에서 최적 20개 종목이 표시됩니다.")
+
 # 후보 파일 폴더 상태
 _preds_dir_exists = predictions_dir.exists()
 _pred_files = sorted(predictions_dir.glob("top100_????????.csv"), reverse=True) if _preds_dir_exists else []

@@ -161,6 +161,62 @@ if loaded_date != today_str:
         f"오늘({today_str}) 파일이 없습니다. 가장 최근({loaded_date}) 데이터를 표시합니다. "
         f"장 마감(16:30) 후 파이프라인을 실행하면 오늘 결과가 생성됩니다."
     )
+
+# ── 로드된 파일 정보 및 가격 신선도 경고 ─────────────────────────────────
+_cfile_name = Path(candidate_file).name if candidate_file else "알수없음"
+_is_buy_top20 = "buy_top20" in _cfile_name
+_is_top20_plain = "top20" in _cfile_name and "buy_top20" not in _cfile_name
+_cfile_mtime_str = ""
+if candidate_file and Path(candidate_file).exists():
+    import time as _time
+    _cfile_mtime_str = _time.strftime("%H:%M:%S", _time.localtime(Path(candidate_file).stat().st_mtime))
+
+# 가격 데이터 소스 확인
+_price_stale = False
+_price_source_msg = ""
+if df_candidates is not None and "_data_source" in df_candidates.columns:
+    _sources = df_candidates["_data_source"].dropna().unique().tolist()
+    if any("csv" in str(s).lower() or "paper" in str(s).lower() for s in _sources):
+        _price_stale = True
+        _price_source_msg = f"데이터 소스: {', '.join(str(s) for s in _sources[:3])} — 전날 종가 기준"
+elif df_candidates is not None and "current_price" not in df_candidates.columns:
+    _price_stale = True
+    _price_source_msg = "current_price 컬럼 없음 — 일봉 종가(close) 기준"
+
+# 파일 일치 여부 확인 (top20_plain vs buy_top20)
+_preds_dir_4 = PROJECT_ROOT / "reports" / "predictions"
+_top20_plain_path = _preds_dir_4 / f"top20_{loaded_date}.csv"
+_buy_top20_path = _preds_dir_4 / f"buy_top20_{loaded_date}.csv"
+_file_mismatch_warn = _is_buy_top20 and _top20_plain_path.exists()
+
+_f_col1, _f_col2, _f_col3 = st.columns(3)
+_f_col1.metric("로드된 파일", _cfile_name)
+_f_col2.metric("파일 생성시각", _cfile_mtime_str or "알수없음")
+_f_col3.metric("종목 수", f"{len(df_candidates)}개")
+
+if _is_buy_top20:
+    st.info(
+        "**buy_top20 파일 사용 중** (장중 필터 적용 버전) — "
+        "AI 예측 점수 + 장중 거래량/가격 조건으로 선별된 종목입니다. "
+        "AI 후보 리스트 페이지의 top20(AI 예측 순위 기준)과 종목 구성이 다를 수 있습니다."
+    )
+elif _is_top20_plain:
+    st.info("**top20 파일 사용 중** (AI 예측 점수 순위 기준) — 장중 필터 미적용 버전입니다.")
+
+if _file_mismatch_warn:
+    st.warning(
+        f"⚠ AI 후보 리스트 페이지에서 보이는 top20(예측순위)과 이 페이지에서 사용하는 "
+        f"buy_top20(장중 필터)은 종목이 다를 수 있습니다. "
+        f"두 페이지의 리스트를 일치시키려면 AI 후보 리스트 페이지에서 '장중 Top20 필터 실행'을 다시 실행하세요."
+    )
+
+if _price_stale:
+    st.warning(
+        f"⚠ 가격 정보가 실시간이 아닙니다 ({_price_source_msg}). "
+        f"현재가 반영 주문을 위해 아래 '주문 미리보기' 클릭 전 KIS API로 현재가를 갱신하세요. "
+        f"또는 '현재가 갱신 후 매수' 버튼을 사용하세요."
+    )
+
 st.success(f"Top{loaded_n} 후보 파일 로드 완료: {len(df_candidates)}개 종목 ({loaded_date})")
 
 st.subheader("거래전략 선택")
@@ -217,13 +273,43 @@ with st.expander("후보 목록 미리보기", expanded=False):
 
 st.divider()
 st.subheader("예산배분 계산")
+st.caption(
+    "예산배분 결과는 실제 주문과 동일한 로직을 사용합니다: "
+    "이미 보유 중인 종목(OPEN)은 제외되며, 주문가능금액이 입력 예산보다 작으면 주문가능금액이 적용됩니다."
+)
 if st.button("예산배분 계산", type="primary"):
     _alloc_mode = st.session_state.get("strategy_order_mode", "MOCK").lower()
     with st.spinner("예산배분 계산 중..."):
         result = run_budget_allocation(int(budget), candidate_file=candidate_file, mode=_alloc_mode)
     if result.get("success"):
-        st.success("예산배분 완료")
         summary = result.get("summary", {})
+        _held_count = int(summary.get("held_count", 0))
+        _total_cands = int(summary.get("total_candidates", len(df_candidates)))
+        _avail_cands = int(summary.get("available_candidates", _total_cands))
+        _alloc_count = int(summary.get("allocated_count", 0))
+        _price_stale_alloc = summary.get("price_stale", False)
+        _price_src_alloc = summary.get("price_source", "")
+
+        if _held_count > 0:
+            _held_names = summary.get("held_names", [])
+            _held_list = ", ".join(
+                f"{h.get('name','?')}({h.get('code','?')})" for h in _held_names[:10]
+            )
+            st.warning(
+                f"이미 보유 중인 종목 {_held_count}개가 제외되었습니다 → "
+                f"유효 후보 {_avail_cands}개 중 {_alloc_count}개 배분\n\n"
+                f"제외 종목: {_held_list}"
+                + (" 외..." if len(_held_names) > 10 else "")
+            )
+        else:
+            st.success(f"예산배분 완료 — {_avail_cands}개 후보 중 {_alloc_count}개 종목 배분")
+
+        if _price_stale_alloc:
+            st.warning(
+                f"⚠ 가격 기준: {_price_src_alloc} — "
+                "실시간 가격이 아닙니다. 실제 주문가격과 다를 수 있습니다."
+            )
+
         _render_budget_metrics(
             {
                 "input_budget": int(budget),
@@ -238,7 +324,7 @@ if st.button("예산배분 계산", type="primary"):
         if not alloc_df.empty:
             st.dataframe(alloc_df, use_container_width=True)
             st.session_state["allocation"] = alloc_df
-        if summary:
+        with st.expander("예산배분 상세 요약", expanded=False):
             st.json(summary)
     else:
         st.error(f"예산배분 실패: {result.get('message', '')}")
@@ -495,6 +581,39 @@ else:  # PAPER
     _real_confirm1 = False
     _real_confirm2 = False
 
+# ── 현재 보유 종목 현황 표시 (주문 전 참고용) ────────────────────────────
+try:
+    from position_manager import PositionManager as _PM4
+    _pm4 = _PM4(str(PROJECT_ROOT / "config.yaml"), mode=order_mode.lower())
+    _all4 = _pm4.get_all_positions()
+    _open4 = [p for p in _all4.values() if getattr(p, "status", "OPEN") == "OPEN" and not getattr(p, "is_closed", False)]
+    _cand_codes4 = set()
+    if df_candidates is not None and not df_candidates.empty:
+        _cc4 = "stock_code" if "stock_code" in df_candidates.columns else "ticker"
+        _cand_codes4 = {str(c).zfill(6) for c in df_candidates[_cc4].tolist()}
+    _overlap4 = [p for p in _open4 if str(p.stock_code).zfill(6) in _cand_codes4]
+    if _overlap4:
+        _excl_names4 = ", ".join(
+            f"{p.stock_name}({p.stock_code})" for p in _overlap4[:10]
+        )
+        st.info(
+            f"현재 보유 중인 종목 {len(_overlap4)}개가 후보 리스트와 겹칩니다 → 주문 시 이 종목들은 제외됩니다.\n\n"
+            f"제외 예정: {_excl_names4}" + (" 외..." if len(_overlap4) > 10 else "") + "\n\n"
+            f"남은 주문 대상: 후보 {len(df_candidates)}개 중 {len(df_candidates) - len(_overlap4)}개"
+        )
+except Exception:
+    pass
+
+# 현재가 갱신 옵션 (MOCK/REAL: paper_csv 데이터면 갱신 권장)
+_refresh_prices_opt = False
+if order_mode in ("MOCK", "REAL") and _price_stale:
+    _refresh_prices_opt = st.checkbox(
+        "주문 전 현재가 갱신 (KIS API에서 실시간 가격 조회, 1-2분 소요)",
+        value=False,
+        help="buy_top20 파일이 전날 종가를 사용하는 경우 현재가로 갱신합니다. "
+             "미갱신 시 파일의 가격(전날 종가)으로 주문됩니다.",
+    )
+
 col_buy, col_preview = st.columns(2)
 with col_buy:
     # REAL: real_bulk_ok 조건 / MOCK: mock_bulk_ok 조건 / PAPER: 항상 허용
@@ -517,9 +636,18 @@ with col_buy:
                     strategy_id=strategy_id,
                     max_orders=_safe_max_orders,
                     sell_policy_id=sell_policy_id,
+                    refresh_prices=_refresh_prices_opt,
                 )
             if result.get("success"):
+                _orders_placed = result.get("orders_placed", 0)
+                _total_attempted = result.get("total_attempted", 0)
+                _held_cnt = result.get("held_count", 0) if hasattr(result, "get") else 0
                 st.success(result.get("message", "매수 완료"))
+                if _total_attempted > 0 and _orders_placed < _total_attempted:
+                    st.info(
+                        f"{_total_attempted}개 배분 중 {_orders_placed}개 주문 완료. "
+                        f"나머지 {_total_attempted - _orders_placed}개는 RiskManager 차단 또는 오류."
+                    )
             else:
                 st.error(result.get("message", "매수 실패"))
             if order_mode == "REAL":
@@ -530,7 +658,8 @@ with col_buy:
             if isinstance(result, dict):
                 _render_budget_metrics(result)
                 if result.get("allocation_preview"):
-                    st.dataframe(pd.DataFrame(result["allocation_preview"]), use_container_width=True)
+                    _prev_df = pd.DataFrame(result["allocation_preview"])
+                    st.dataframe(_prev_df, use_container_width=True)
                 orders = result.get("order_results") or result.get("orders") or []
                 if orders:
                     meta_cols = [
@@ -544,7 +673,8 @@ with col_buy:
                     show_cols = [c for c in meta_cols if c in meta_df.columns]
                     if show_cols:
                         st.dataframe(meta_df[show_cols], use_container_width=True)
-                st.json(result)
+                with st.expander("전체 주문 결과 JSON", expanded=False):
+                    st.json(result)
 
 with col_preview:
     if st.button("주문 미리보기", use_container_width=True):
@@ -561,27 +691,33 @@ with col_preview:
                     max_orders=_safe_max_orders,
                     preview_only=True,
                     sell_policy_id=sell_policy_id,
+                    refresh_prices=_refresh_prices_opt,
                 )
             if result.get("allocation_preview"):
-                st.success(f"미리보기 {len(result['allocation_preview'])}건, 실제 주문 없음")
-                st.dataframe(pd.DataFrame(result["allocation_preview"]), use_container_width=True)
+                _prev_list = result["allocation_preview"]
+                _held_in_prev = result.get("held_count", 0)
+                _total_in_prev = result.get("total_candidates", len(df_candidates))
+                st.success(f"미리보기 {len(_prev_list)}건 (후보 {_total_in_prev}개 중), 실제 주문 없음")
+                if _held_in_prev:
+                    st.info(f"이미 보유 중인 종목 {_held_in_prev}개 제외됨 → {_total_in_prev - _held_in_prev}개 후보만 배분")
+                st.dataframe(pd.DataFrame(_prev_list), use_container_width=True)
                 _render_budget_metrics(result)
                 # REAL 모드: order_plan_id를 session_state에 저장
                 if order_mode == "REAL":
                     import uuid, datetime as _dt
                     _plan_id = _dt.datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
-                    _plan_total = sum(int(r.get("order_amount", 0) or 0) for r in result["allocation_preview"])
+                    _plan_total = sum(int(r.get("order_amount", 0) or 0) for r in _prev_list)
                     st.session_state["current_order_plan_id"] = _plan_id
                     st.session_state["current_order_plan_total"] = _plan_total
-                    st.session_state["current_order_plan_preview"] = result["allocation_preview"]
+                    st.session_state["current_order_plan_preview"] = _prev_list
                     st.session_state["order_plan_just_created"] = True
                     st.info(f"주문계획 생성됨: `{_plan_id}` | 예정금액: {_plan_total:,}원")
                     st.rerun()
                 # MOCK 모드: preflight 수량/금액 체크용으로 저장
                 elif order_mode == "MOCK":
-                    st.session_state["mock_allocation_preview"] = result["allocation_preview"]
-                    _mock_qty = sum(int(r.get("quantity", 0) or 0) for r in result["allocation_preview"])
-                    _mock_amt = sum(int(r.get("order_amount", 0) or 0) for r in result["allocation_preview"])
+                    st.session_state["mock_allocation_preview"] = _prev_list
+                    _mock_qty = sum(int(r.get("quantity", 0) or 0) for r in _prev_list)
+                    _mock_amt = sum(int(r.get("order_amount", 0) or 0) for r in _prev_list)
                     st.info(f"MOCK 미리보기 저장됨 — 총 {_mock_qty}주, 예상금액 {_mock_amt:,}원")
                     st.rerun()
             else:

@@ -245,7 +245,7 @@ def run_budget_allocation(
     candidate_file: Optional[str] = None,
     mode: str = "mock",
 ) -> Dict:
-    """예산배분 계산 — 매수 버튼과 동일한 후보파일·orderable_cash를 사용해 수량 불일치 방지."""
+    """예산배분 계산 — 매수 버튼과 동일한 후보파일·orderable_cash·held_codes를 사용해 수량 불일치 방지."""
     inject_to_os_env()
     try:
         import pandas as pd
@@ -265,6 +265,8 @@ def run_budget_allocation(
             if df is None or df.empty:
                 return {"success": False, "message": "후보 파일을 찾을 수 없습니다 (top20 fallback도 없음)", "data": None}
 
+        total_candidates = len(df)
+
         # 매수 버튼의 _get_orderable_cash()와 동일한 로직으로 orderable_cash 결정
         orderable_cash = int(budget)
         if (mode or "mock").lower() not in ("paper",):
@@ -279,10 +281,43 @@ def run_budget_allocation(
             except Exception:
                 pass  # fallback: int(budget)
 
+        # 매수 버튼과 동일한 held_codes 계산 (이미 OPEN 보유 종목 제외)
+        held_codes: set = set()
+        held_names: list = []
+        try:
+            from position_manager import PositionManager
+            _cfg_path = str(PROJECT_ROOT / "config.yaml")
+            _pm = PositionManager(_cfg_path, mode=(mode or "mock").lower())
+            _all_pos = _pm.get_all_positions()
+            held_codes = {
+                code for code, pos in _all_pos.items()
+                if getattr(pos, "status", "OPEN") == "OPEN"
+            }
+            held_names = [
+                {"code": code, "name": getattr(pos, "stock_name", code)}
+                for code, pos in _all_pos.items()
+                if getattr(pos, "status", "OPEN") == "OPEN"
+            ]
+        except Exception:
+            pass
+
         allocator = BudgetAllocator(str(PROJECT_ROOT / "config.yaml"))
         result = allocator.allocate_until_budget(
-            candidates=df, budget=int(budget), orderable_cash=orderable_cash
+            candidates=df, budget=int(budget), orderable_cash=orderable_cash,
+            held_codes=held_codes,
         )
+
+        # 가격 신선도 확인 (_data_source 컬럼으로 판단)
+        price_source = "unknown"
+        price_stale = False
+        if "current_price" in df.columns and "_data_source" in df.columns:
+            sources = df["_data_source"].dropna().unique().tolist()
+            price_source = ", ".join(str(s) for s in sources)
+            price_stale = any("csv" in str(s).lower() or "paper" in str(s).lower() for s in sources)
+        elif "current_price" not in df.columns and "close" in df.columns:
+            price_stale = True
+            price_source = "close (일봉 종가)"
+
         summary = {
             "allocated_count": len(result.allocations),
             "total_order_amount": result.total_order_amount,
@@ -290,6 +325,12 @@ def run_budget_allocation(
             "input_budget": budget,
             "orderable_cash": orderable_cash,
             "effective_budget": result.effective_budget,
+            "total_candidates": total_candidates,
+            "held_count": len(held_codes),
+            "held_names": held_names,
+            "available_candidates": total_candidates - len(held_codes),
+            "price_source": price_source,
+            "price_stale": price_stale,
         }
         return {"success": True, "data": result, "summary": summary}
     except Exception as e:

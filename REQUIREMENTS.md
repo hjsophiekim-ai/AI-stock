@@ -863,3 +863,64 @@ python -c "import sys; sys.path.insert(0,'src'); from buy_candidate_list import 
 | P0 | buy_top20 파이프라인 통합 | 전체/빠른 파이프라인 마지막 단계 |
 | P1 | 진단 CLI | `diagnose_intraday_selection.py`, `diagnose_budget_allocation.py` |
 | P1 | 앱 UI 통합 | 장중 Top20 필터 실행 버튼 |
+
+---
+
+### V. 예산배분·주문 일치 요구사항 (2026-06-15 추가)
+
+#### 원인 분석 (확인된 버그 3종)
+
+**V-1. 예산배분 vs 실제 주문 종목 불일치**
+- `run_budget_allocation()`이 held_codes 필터를 적용하지 않아 "예산배분 계산" 결과(20개)와 실제 주문(4개)이 달랐음
+- 이미 OPEN 상태로 보유 중인 16개 종목이 실제 주문에서는 제외되었으나 예산배분 계산에서는 포함됨
+- `run_buy_candidates()` → `buy_candidates()` → `held_codes` 필터 ↔ `run_budget_allocation()` 불일치
+
+**V-2. buy_top20 vs top20(예측 순위) 파일 불일치**
+- 4페이지 "예산배분 및 주문"은 `buy_top20_{date}.csv` (장중 필터 적용 버전)를 우선 로드
+- 3페이지 "AI 후보 리스트"는 `top20_{date}.csv` (AI 예측 점수 순위 1-20위)를 표시
+- `buy_top20`은 AI 예측 점수 + 장중 거래량/가격 조건으로 재선별 → 종목 구성이 다름
+- `top100`이 재생성된 뒤 `buy_top20`이 갱신되지 않으면 구버전 종목이 주문에 포함됨
+
+**V-3. 가격 신선도 (전날 종가)**
+- `select_intraday_buy_candidates.py --mode paper`로 생성된 `buy_top20`의 `_data_source=paper_csv`
+- paper 모드에서는 KIS API를 호출하지 않으므로 `current_price = close` = 전날 종가
+- 장중 주문 시 현재가와 다른 가격으로 주문됨
+
+#### 수정 사항
+
+- [x] `run_budget_allocation()`: `held_codes` 필터 추가 (보유 중인 OPEN 종목 제외)
+- [x] `run_budget_allocation()` 반환값에 `held_count`, `held_names`, `available_candidates`, `price_stale`, `price_source` 추가
+- [x] 4페이지 파일 정보 표시: 로드된 파일명, 생성 시각, buy_top20 vs top20 설명
+- [x] 4페이지 파일 불일치 경고: buy_top20 사용 중 + top20 파일도 존재할 때 경고
+- [x] 4페이지 가격 신선도 경고: `_data_source=paper_csv`인 경우 경고 + `현재가 갱신` 체크박스
+- [x] 4페이지 예산배분 결과에 held_count 표시 및 제외 종목 목록 표시
+- [x] 4페이지 주문 전 "현재 보유 종목 중 후보와 겹치는 항목" 표시
+- [x] 3페이지 buy_top20 vs top100 동기화 경고: top100이 더 새 것이면 재생성 안내
+
+#### 올바른 사용 흐름
+
+1. **파이프라인 실행** (AI 후보 리스트 페이지 → 전체 파이프라인): top100 + buy_top20 동시 갱신
+2. **장중 필터 실행** (AI 후보 리스트 페이지 → 장중 Top20 필터): top100 → buy_top20 재생성
+3. **예산배분 및 주문** 페이지:
+   - "예산배분 계산" 버튼: 실제 주문 로직과 동일한 held_codes 필터 적용
+   - "주문 미리보기" 버튼: 실제 주문 예정 목록 확인 (held 제외 후 남은 종목)
+   - "현재 리스트 전부 매수" 버튼: 미리보기와 동일한 목록으로 주문
+
+#### max_orders 파라미터 설명
+
+`max_orders`는 배분 알고리즘에서 **총 주식 구매 횟수**를 의미합니다 (종목 수가 아님):
+- 알고리즘: 각 종목에 1주씩 순서대로 구매를 반복 (`rank_one_share_then_repeat`)
+- `max_orders=20`, 후보 4개 → 각 5주 구매 (4×5=20회)
+- `max_orders=20`, 후보 20개 → 각 1주 구매 (20×1=20회)
+- UI에서 "최대 주문 건수"라 표시되며 기본값은 min(후보수, 20)
+
+---
+
+## 요구사항 우선순위 업데이트 (2026-06-15 V2)
+
+| 순위 | 기능 | 설명 |
+|------|------|------|
+| P0 | 예산배분 held_codes 일치 | `run_budget_allocation()`에 held_codes 필터 추가 |
+| P0 | 가격 신선도 경고 | buy_top20 paper_csv → 전날 종가 경고 + 갱신 옵션 |
+| P0 | 파일 불일치 경고 | top100 갱신 후 buy_top20 미갱신 시 경고 |
+| P1 | buy_top20 자동 갱신 | top100 변경 시 buy_top20 자동 재생성 |
