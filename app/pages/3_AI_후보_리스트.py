@@ -526,18 +526,50 @@ if df_top100 is not None and not df_top100.empty:
         show_n = st.selectbox("표시 개수", [20, 50, 100], index=2)
         df_display = df_top100.head(show_n)
     with col_c:
-        refresh_mode = st.selectbox("갱신 모드", ["MOCK", "PAPER"], key="refresh_mode_select",
-                                    help="MOCK: KIS 모의투자 API 사용 / PAPER: API 호출 없음")
+        refresh_mode = st.selectbox(
+            "갱신 모드", ["PAPER", "MOCK"], key="refresh_mode_select",
+            help="PAPER: API 호출 없음 (빠름, 권장) / MOCK: KIS 모의투자 API (KIS 서버 응답 없을 시 5분 이상 소요)",
+        )
         if st.button("현재가 갱신", use_container_width=True):
-            with st.spinner(f"현재가 갱신 중 (mode={refresh_mode})..."):
+            _rm = refresh_mode.lower()
+            _effective_rm = _rm
+
+            # top100 갱신
+            with st.spinner(f"top100 현재가 갱신 중 (mode={refresh_mode})..."):
                 r = run_script("refresh_candidate_prices.py",
                                args=["--date", today_str, "--top", "100",
-                                     "--mode", refresh_mode.lower()], timeout=300)
+                                     "--mode", _effective_rm], timeout=300)
+
+            # MOCK 실패(타임아웃 포함) 시 PAPER 자동 재시도
+            if (not r or not r.get("success")) and _effective_rm == "mock":
+                st.warning("MOCK 갱신 실패 — PAPER 모드로 자동 재시도합니다.")
+                _effective_rm = "paper"
+                with st.spinner("top100 현재가 갱신 중 (mode=PAPER fallback)..."):
+                    r = run_script("refresh_candidate_prices.py",
+                                   args=["--date", today_str, "--top", "100",
+                                         "--mode", "paper"], timeout=120)
+
             if r and r.get("success"):
-                st.success("현재가 갱신 완료")
+                st.success(f"top100 현재가 갱신 완료 (mode={_effective_rm.upper()})")
+                # buy_top20 파일도 함께 갱신
+                _buy20_path = predictions_dir / f"buy_top20_{today_str}.csv"
+                if _buy20_path.exists():
+                    with st.spinner(f"buy_top20 현재가 갱신 중 (mode={_effective_rm.upper()})..."):
+                        r2 = run_script("refresh_candidate_prices.py",
+                                        args=["--input", str(_buy20_path),
+                                              "--mode", _effective_rm], timeout=300)
+                    if r2 and r2.get("success"):
+                        st.success("buy_top20 현재가 갱신 완료")
+                    else:
+                        st.warning(f"buy_top20 갱신 실패: {(r2 or {}).get('message', '오류')}")
                 st.rerun()
             else:
-                st.error((r or {}).get("message", "갱신 실패"))
+                _msg = (r or {}).get("message", "갱신 실패")
+                _stderr = (r or {}).get("stderr", "")
+                if "Timeout" in _msg or "timeout" in _msg.lower() or "KIS" in _stderr:
+                    st.error(f"KIS API 응답 없음 — PAPER 모드로 재시도하거나 나중에 다시 시도하세요.\n{_msg}")
+                else:
+                    st.error(_msg)
 
     st.caption("⚠ 이 목록은 모델 기반 후보군입니다. 투자 추천이 아니며 수익을 보장하지 않습니다.")
 

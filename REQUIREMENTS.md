@@ -916,6 +916,46 @@ python -c "import sys; sys.path.insert(0,'src'); from buy_candidate_list import 
 
 ---
 
+### VI. KIS API 타임아웃 버그 (2026-06-15 추가)
+
+#### 원인 분석
+
+**VI-1. KIS MOCK 서버 무응답 → 현재가 갱신 실패**
+- `openapivts.koreainvestment.com:29443` 가 완전히 응답 없음 (Read timed out)
+- `refresh_candidate_prices.py --mode mock`으로 100 종목 갱신 시: 종목당 3×10s = 30s, 100종목 = 3000초(50분) → 300s subprocess 타임아웃으로 강제 종료
+- "현재가 갱신" 버튼이 KIS MOCK 모드로 고정되어 있어 갱신이 항상 실패했음
+
+**VI-2. "주문 미리보기" / "전부 매수" → 주문가능금액 0 표시**
+- `buy_candidates()` → `_get_orderable_cash()` → `KISApiClient.get_orderable_cash()` 호출
+- KIS MOCK 서버 무응답: 3 retry × 10s = 30초 blocking
+- Streamlit WebSocket이 30초 hang 동안 연결 유지를 못 하면 스피너가 멈추거나 세션 재시작
+- 실제로 fallback `int(budget)` 이 반환되지만 UI가 이미 사라진 상태
+
+**VI-3. `run_script()` env 미전달**
+- `prediction_service.run_script()`가 `subprocess.run()`에 `env=os.environ.copy()`를 전달하지 않음
+- Streamlit 세션 환경변수(KIS_MOCK_APP_KEY 등)가 subprocess에 전파되지 않아 스크립트 실행 실패 가능
+
+#### 수정 사항
+
+- [x] `src/buy_candidate_list.py` `_get_orderable_cash()`: `concurrent.futures.ThreadPoolExecutor` + 8초 timeout
+  - 8초 초과 시 에러 메시지 기록 후 `int(budget)` 즉시 반환 (30초 hang 해소)
+- [x] `app/services/trading_service.py` `run_budget_allocation()`: 동일한 8초 threading timeout 적용
+- [x] `app/services/prediction_service.py` `run_script()` + `run_full_pipeline()`: `env=os.environ.copy()` 추가
+- [x] `app/pages/3_AI_후보_리스트.py` "현재가 갱신" 버튼:
+  - 기본 모드를 MOCK → **PAPER** 로 변경 (API 호출 없음, 빠름)
+  - MOCK 갱신 실패 시 PAPER 모드로 **자동 재시도**
+  - top100 갱신 성공 후 **`buy_top20_{date}.csv`도 함께 갱신** (`--input` 파라미터 사용)
+  - KIS 타임아웃 감지 시 명확한 안내 메시지 표시
+
+#### 올바른 사용 흐름 (수정 후)
+
+1. **현재가 갱신**: PAPER 모드 선택(기본값) → 빠르게 top100 + buy_top20 가격 갱신
+   - MOCK 모드 선택 시 KIS 서버 응답 없으면 자동으로 PAPER fallback
+2. **주문 미리보기 / 전부 매수**: `_get_orderable_cash()` 8초 내 응답 없으면 입력 예산으로 대체
+   - "KIS 서버 응답 없음 (8초 초과) — 입력 예산으로 주문가능금액 대체" 메시지 표시
+
+---
+
 ## 요구사항 우선순위 업데이트 (2026-06-15 V2)
 
 | 순위 | 기능 | 설명 |
@@ -924,3 +964,6 @@ python -c "import sys; sys.path.insert(0,'src'); from buy_candidate_list import 
 | P0 | 가격 신선도 경고 | buy_top20 paper_csv → 전날 종가 경고 + 갱신 옵션 |
 | P0 | 파일 불일치 경고 | top100 갱신 후 buy_top20 미갱신 시 경고 |
 | P1 | buy_top20 자동 갱신 | top100 변경 시 buy_top20 자동 재생성 |
+| P0 | KIS 타임아웃 30초 hang | threading 8초 timeout으로 즉시 fallback |
+| P0 | run_script env 미전달 | subprocess에 os.environ.copy() 전달 |
+| P0 | 현재가 갱신 buy_top20 누락 | top100 갱신 후 buy_top20도 함께 갱신 |

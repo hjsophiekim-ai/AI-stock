@@ -105,15 +105,27 @@ def _save_budget_usage(result: dict, allocations: list, today: str) -> None:
 def _get_orderable_cash(mode: str, budget: int, errors: list) -> int:
     if mode == "paper":
         return int(budget)
-    try:
-        from kis_api import KISApiClient
-        from safety_gate import SafetyGate
-        gate = SafetyGate(CONFIG_PATH, runtime_mode=mode)
-        cash = int(KISApiClient(CONFIG_PATH, gate=gate).get_orderable_cash() or 0)
-        return cash if cash > 0 else int(budget)
-    except Exception as ex:
-        errors.append(f"orderable cash lookup failed; using input budget: {ex}")
-        return int(budget)
+    import concurrent.futures
+    _result = [0]
+
+    def _fetch():
+        try:
+            from kis_api import KISApiClient
+            from safety_gate import SafetyGate
+            gate = SafetyGate(CONFIG_PATH, runtime_mode=mode)
+            cash = int(KISApiClient(CONFIG_PATH, gate=gate).get_orderable_cash() or 0)
+            _result[0] = cash
+        except Exception as ex:
+            errors.append(f"orderable cash lookup failed; using input budget: {ex}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_fetch)
+        try:
+            future.result(timeout=8)
+        except concurrent.futures.TimeoutError:
+            errors.append("KIS 서버 응답 없음 (8초 초과) — 입력 예산으로 주문가능금액 대체")
+
+    return _result[0] if _result[0] > 0 else int(budget)
 
 
 def _execute_order(

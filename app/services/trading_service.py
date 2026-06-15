@@ -268,18 +268,31 @@ def run_budget_allocation(
         total_candidates = len(df)
 
         # 매수 버튼의 _get_orderable_cash()와 동일한 로직으로 orderable_cash 결정
+        # 8초 초과 시 KIS 서버 무응답으로 판단 — 입력 예산으로 대체 (30초 hang 방지)
         orderable_cash = int(budget)
         if (mode or "mock").lower() not in ("paper",):
-            try:
-                from kis_api import KISApiClient
-                from safety_gate import SafetyGate
-                _cfg = str(PROJECT_ROOT / "config.yaml")
-                _gate = SafetyGate(_cfg, runtime_mode=(mode or "mock").lower())
-                _cash = int(KISApiClient(_cfg, gate=_gate).get_orderable_cash() or 0)
-                if _cash > 0:
-                    orderable_cash = _cash
-            except Exception:
-                pass  # fallback: int(budget)
+            import concurrent.futures as _cf
+            _cfg = str(PROJECT_ROOT / "config.yaml")
+            _mode_lower = (mode or "mock").lower()
+            _cash_val = [0]
+
+            def _fetch_cash():
+                try:
+                    from kis_api import KISApiClient
+                    from safety_gate import SafetyGate
+                    _gate = SafetyGate(_cfg, runtime_mode=_mode_lower)
+                    _cash_val[0] = int(KISApiClient(_cfg, gate=_gate).get_orderable_cash() or 0)
+                except Exception:
+                    pass
+
+            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                _fut = _ex.submit(_fetch_cash)
+                try:
+                    _fut.result(timeout=8)
+                except _cf.TimeoutError:
+                    pass  # KIS 서버 무응답 — int(budget) 유지
+            if _cash_val[0] > 0:
+                orderable_cash = _cash_val[0]
 
         # 매수 버튼과 동일한 held_codes 계산 (이미 OPEN 보유 종목 제외)
         held_codes: set = set()

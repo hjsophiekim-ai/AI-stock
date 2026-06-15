@@ -71,6 +71,7 @@ def run_script(script_name: str, timeout: int = 120, args: Optional[List] = None
             cmd,
             capture_output=True, text=True, timeout=timeout,
             cwd=str(PROJECT_ROOT),
+            env=os.environ.copy(),
         )
         stdout = (result.stdout or "")[-4000:]
         stderr = (result.stderr or "")[-4000:]
@@ -186,6 +187,7 @@ def run_full_pipeline(
                 text=True,
                 timeout=s["timeout"],
                 cwd=str(PROJECT_ROOT),
+                env=os.environ.copy(),
             )
             success = proc.returncode == 0
             stdout = (proc.stdout or "")[-4000:]
