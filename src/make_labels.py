@@ -93,6 +93,13 @@ def make_all_labels(
         logger.error("먼저 실행: python src/make_features.py")
         sys.exit(1)
 
+    # 증분 스킵: 출력 파일이 입력보다 최신이면 재계산 불필요
+    if os.path.exists(output_path) and os.path.exists(latest_path):
+        if os.path.getmtime(output_path) > os.path.getmtime(features_path):
+            logger.info(f"라벨 파일이 피처 파일보다 최신 — 재계산 생략: {output_path}")
+            print("[SKIP] make_labels: 출력이 입력보다 최신, 건너뜀", flush=True)
+            return
+
     df = pd.read_csv(features_path, parse_dates=["date"])
 
     # 컬럼 감지 (stock_code 또는 ticker)

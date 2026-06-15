@@ -371,6 +371,22 @@ def main() -> None:
     output_path = cfg["data"]["raw_daily_path"]
     error_log_path = cfg["data"].get("error_log_path", "logs/data_collect_errors.log")
 
+    # ── 조기 스킵: pykrx/FDR API 호출 전에 빠르게 판단 ─────────────
+    # 파일 수정 시간만 확인 (CSV 읽기 없음) — 빠른 종료
+    if not args.force_refresh and os.path.exists(output_path):
+        import time as _t
+        _age_hours = (_t.time() - os.path.getmtime(output_path)) / 3600
+        _now = datetime.now()
+        _market_closed = (_now.hour > 16) or (_now.hour == 16 and _now.minute >= 30)
+        if _age_hours < 12 and not _market_closed:
+            logger.info(
+                f"[조기 종료] 데이터 파일이 {_age_hours:.1f}시간 전 수집됨 & 장 마감 전 "
+                f"— 종목 리스트 조회 없이 수집 생략."
+            )
+            print(f"[SKIP] collect_daily_data: {_age_hours:.1f}h ago, 장 마감 전 건너뜀", flush=True)
+            return
+    # ────────────────────────────────────────────────────────────────
+
     # 강제 새로고침
     if args.force_refresh and os.path.exists(output_path):
         os.remove(output_path)

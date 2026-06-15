@@ -209,71 +209,94 @@ with row2[2]:
 with row2[3]:
     if st.button("전체 파이프라인 실행", use_container_width=True, type="primary"):
         print("[PIPELINE] BUTTON_CLICKED full_pipeline", flush=True)
-        st.write("🔄 전체 파이프라인 실행 시작...")
-        with st.spinner("전체 파이프라인 실행 중 (시간이 걸립니다)..."):
-            r = run_full_pipeline(mode="mock", top_n=100, refresh_prices=True, years=3)
+        from pipeline_service import run_pipeline_step, ensure_runtime_directories
+        from datetime import datetime as _dt
 
-        st.session_state["last_pipeline_result"] = r
+        ensure_runtime_directories()
+        _today = _dt.now().strftime("%Y%m%d")
+        _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+        _log_path = str(PROJECT_ROOT / "logs" / f"pipeline_{_ts}.log")
 
-        if not isinstance(r, dict):
-            st.error("파이프라인 반환값 오류 — dict가 아닌 값 반환됨")
-            st.code(str(r)[:2000], language="text")
+        _full_step_defs = [
+            {"step": "collect_daily_data", "label": "1. 데이터 수집", "script": "collect_daily_data.py",
+             "timeout": 3600, "args": ["--years", "3"]},
+            {"step": "make_features", "label": "2. 피처 생성", "script": "make_features.py",
+             "timeout": 900, "args": []},
+            {"step": "make_labels", "label": "3. 라벨 생성", "script": "make_labels.py",
+             "timeout": 600, "args": []},
+            {"step": "train_model", "label": "4. 모델 학습", "script": "train_model.py",
+             "timeout": 1800, "args": []},
+            {"step": "predict_candidates", "label": "5. 예측 생성", "script": "predict_candidates.py",
+             "timeout": 300, "args": []},
+            {"step": "select_top_candidates", "label": "6. Top100 선정", "script": "select_top_candidates.py",
+             "timeout": 120, "args": ["--top-n", "100", "--all"]},
+        ]
 
-        elif r.get("success"):
-            st.success(f"전체 파이프라인 완료 — Top100: {r.get('candidate_count', 0)}개 종목")
-            _cf = r.get("candidate_file", "")
-            if _cf:
-                st.session_state["latest_candidate_file"] = _cf
-                st.caption(f"후보 파일: {_cf}")
-            _steps = r.get("steps", [])
-            if _steps:
-                _sdf = pd.DataFrame([{
-                    "단계": s.get("step", ""),
-                    "결과": "✅ 성공" if s.get("success") else "❌ 실패",
+        _step_results = []
+        _pipeline_failed = False
+        _failed_step = ""
+
+        with st.status("전체 파이프라인 실행 중...", expanded=True) as _status:
+            for _s in _full_step_defs:
+                st.write(f"⏳ {_s['label']} 실행 중...")
+                _sr = run_pipeline_step(_s["step"], _s["script"], _s.get("args", []), _s["timeout"])
+                _step_results.append(_sr)
+                if _sr["success"]:
+                    st.write(f"✅ {_s['label']} 완료 — {_sr['duration_sec']}초")
+                else:
+                    st.write(f"❌ {_s['label']} 실패 (exit {_sr['returncode']}) — {_sr['duration_sec']}초")
+                    if _sr.get("stderr"):
+                        st.code(_sr["stderr"][-2000:], language="text")
+                    _pipeline_failed = True
+                    _failed_step = _s["step"]
+                    _status.update(label=f"파이프라인 실패: {_s['label']}", state="error")
+                    break
+
+            if not _pipeline_failed:
+                _cand_path = PROJECT_ROOT / "reports" / "predictions" / f"top100_{_today}.csv"
+                if _cand_path.exists():
+                    _status.update(label="전체 파이프라인 완료!", state="complete")
+                else:
+                    _pipeline_failed = True
+                    _failed_step = "select_top_candidates"
+                    _status.update(label="Top100 파일 미생성 — 실패", state="error")
+
+        _r = {
+            "success": not _pipeline_failed,
+            "failed_step": _failed_step,
+            "steps": _step_results,
+            "candidate_file": str(PROJECT_ROOT / "reports" / "predictions" / f"top100_{_today}.csv"),
+            "candidate_count": 0,
+            "error_message": f"{_failed_step} 실패" if _pipeline_failed else "",
+            "stdout_raw": "",
+            "stderr_raw": (_step_results[-1].get("stderr", "") if _step_results else ""),
+            "log_path": _log_path,
+        }
+        if not _pipeline_failed:
+            try:
+                _r["candidate_count"] = len(pd.read_csv(str(PROJECT_ROOT / "reports" / "predictions" / f"top100_{_today}.csv")))
+            except Exception:
+                pass
+            st.session_state["latest_candidate_file"] = _r["candidate_file"]
+
+        st.session_state["last_pipeline_result"] = _r
+
+        if not _pipeline_failed:
+            st.success(f"전체 파이프라인 완료 — Top100: {_r['candidate_count']}개 종목")
+            with st.expander("단계별 결과", expanded=False):
+                st.dataframe(pd.DataFrame([{
+                    "단계": s.get("step", ""), "결과": "✅" if s.get("success") else "❌",
                     "소요(초)": s.get("duration_sec", 0),
-                    "returncode": s.get("returncode", 0),
-                } for s in _steps])
-                st.dataframe(_sdf, use_container_width=True, hide_index=True)
-            with st.expander("전체 결과 JSON", expanded=False):
-                st.json(r)
+                } for s in _step_results]), use_container_width=True, hide_index=True)
             st.rerun()
-
         else:
-            _failed = r.get("failed_step") or r.get("stage", "알 수 없음")
-            _errmsg = r.get("error_message") or r.get("message", "")
-            st.error(f"전체 파이프라인 실패 — 실패 단계: {_failed}")
-            if _errmsg:
-                st.caption(_errmsg)
-
-            _steps = r.get("steps", [])
-            if _steps:
-                _sdf = pd.DataFrame([{
-                    "단계": s.get("step", ""),
-                    "결과": "✅ 성공" if s.get("success") else "❌ 실패",
-                    "소요(초)": s.get("duration_sec", 0),
-                    "returncode": s.get("returncode", 0),
-                } for s in _steps])
-                st.dataframe(_sdf, use_container_width=True, hide_index=True)
-
-            _stderr = r.get("stderr_raw") or r.get("stderr", "")
-            _stdout = r.get("stdout_raw") or r.get("stdout", "")
-            if _stderr:
-                with st.expander(f"오류 상세 (stderr) — {_failed}", expanded=True):
-                    st.code(_stderr[-4000:], language="text")
-            if _stdout:
-                with st.expander(f"실행 출력 (stdout) — {_failed}"):
-                    st.code(_stdout[-2000:], language="text")
-
-            _errs = r.get("errors", [])
-            if _errs and not _stderr:
-                st.text_area("오류 상세", "\n".join(str(e) for e in _errs[:5]), height=120)
-
-            _lp = r.get("log_path", "")
-            if _lp:
-                st.caption(f"로그: {_lp}")
-
+            _last_sr = _step_results[-1] if _step_results else {}
+            st.error(f"파이프라인 실패 — 단계: {_failed_step}")
+            if _last_sr.get("stderr"):
+                with st.expander("오류 상세 (stderr)", expanded=True):
+                    st.code(_last_sr["stderr"][-4000:], language="text")
             with st.expander("전체 결과 JSON", expanded=False):
-                st.json(r)
+                st.json(_r)
 
 # ── 빠른 후보 생성 (Render 권장) ─────────────────────────────────
 row3 = st.columns(2)

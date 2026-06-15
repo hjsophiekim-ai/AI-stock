@@ -46,26 +46,17 @@ MIN_TRADING_DAYS = 120
 
 
 def _consecutive_direction(series: pd.Series, direction: str, window: int = 5) -> pd.Series:
-    """최근 window일 내 연속 상승/하락 일수 계산."""
+    """최근 window일 내 연속 상승/하락 일수 계산 (벡터화)."""
     if direction == "up":
         mask = (series > 0).astype(int)
     else:
         mask = (series < 0).astype(int)
 
-    result = []
-    mask_vals = mask.values
-    for i in range(len(mask_vals)):
-        if i < window:
-            result.append(0)
-            continue
-        count = 0
-        for j in range(i, max(i - window - 1, -1), -1):
-            if mask_vals[j] == 1:
-                count += 1
-            else:
-                break
-        result.append(count)
-    return pd.Series(result, index=series.index)
+    cumsum = mask.cumsum()
+    last_zero_cumsum = cumsum.where(mask == 0).ffill().fillna(0).astype(int)
+    result = (cumsum - last_zero_cumsum).clip(0, window)
+    result.iloc[:window] = 0
+    return result
 
 
 def make_daily_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -189,6 +180,13 @@ def make_all_features(
         logger.error(f"일봉 데이터 없음: {daily_path}")
         logger.error("먼저 실행: python src/collect_daily_data.py --years 3 --limit 100")
         sys.exit(1)
+
+    # 증분 스킵: 출력 파일이 입력보다 최신이면 재계산 불필요
+    if os.path.exists(output_path):
+        if os.path.getmtime(output_path) > os.path.getmtime(daily_path):
+            logger.info(f"피처 파일이 일봉 데이터보다 최신 — 재계산 생략: {output_path}")
+            print("[SKIP] make_features: 출력이 입력보다 최신, 건너뜀", flush=True)
+            return
 
     # stock_code 컬럼 지원 (신규) + ticker 컬럼 (구버전 호환)
     daily_df = pd.read_csv(daily_path, parse_dates=["date"])
