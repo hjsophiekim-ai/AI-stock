@@ -393,11 +393,23 @@ with tab_mock:
             st.rerun()
     with _mock_top[3]:
         if st.button("MOCK 계좌 동기화 (누락 CLOSED처리)", use_container_width=True, key="mock_sync"):
-            result = sync_broker_to_local(mode="mock", apply=True, close_missing=True)
+            with st.spinner("KIS MOCK 계좌 동기화 중..."):
+                result = sync_broker_to_local(mode="mock", apply=True, close_missing=True)
             if result.get("success"):
-                st.success(f"MOCK 동기화 완료: 브로커 {result.get('broker_count', 0)}개 → 로컬 OPEN {result.get('open_count', 0)}개")
+                _b_cnt = result.get("broker_count", 0)
+                _before = result.get("local_open_count_before", result.get("open_count", 0))
+                _after = result.get("local_open_count_after", result.get("open_count", 0))
+                _closed = result.get("closed_count", 0)
+                st.success(
+                    f"MOCK 동기화 완료 — KIS {_b_cnt}개 / OPEN {_before}→{_after}개 / CLOSED {_closed}개"
+                )
+                st.session_state["mock_broker_pos"] = []
             else:
-                st.error(result.get("message", "MOCK 동기화 실패"))
+                _err = result.get("error", result.get("message", "MOCK 동기화 실패"))
+                if "KIS 계좌조회 실패" in str(_err):
+                    st.error(f"KIS 계좌조회 실패, 캐시 표시 중\n세부: {_err}")
+                else:
+                    st.error(f"MOCK 동기화 실패: {_err}")
             st.rerun()
     with _mock_top[4]:
         if st.button("시장강도 계산", use_container_width=True, key="mock_market_strength"):

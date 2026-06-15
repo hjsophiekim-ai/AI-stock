@@ -32,6 +32,9 @@ from trading_service import (
     run_real_single_order_test,
     get_kis_token_status,
     check_kis_account,
+    check_orderable_cash,
+    run_full_trading_diagnosis,
+    get_active_buy_candidate_file,
 )
 from prediction_service import get_today_str
 from warning_box import no_profit_guarantee_notice, real_order_warning
@@ -290,6 +293,13 @@ if st.button("예산배분 계산", type="primary"):
         _price_stale_alloc = summary.get("price_stale", False)
         _price_src_alloc = summary.get("price_source", "")
 
+        # orderable_cash 조회 실패 경고 (0원과 구분)
+        if not summary.get("orderable_cash_success", True):
+            st.warning(
+                f"⚠ 주문가능금액 조회 실패: {summary.get('orderable_cash_error', 'KIS API 오류')}\n"
+                "입력 예산을 기준으로 예산배분을 계산했습니다. 실제 매수 시 주문가능금액을 다시 확인하세요."
+            )
+
         if _held_count > 0:
             _held_names = summary.get("held_names", [])
             _held_list = ", ".join(
@@ -310,10 +320,11 @@ if st.button("예산배분 계산", type="primary"):
                 "실시간 가격이 아닙니다. 실제 주문가격과 다를 수 있습니다."
             )
 
+        _orderable_cash_display = summary.get("orderable_cash", int(budget))
         _render_budget_metrics(
             {
                 "input_budget": int(budget),
-                "orderable_cash": summary.get("orderable_cash", int(budget)),
+                "orderable_cash": _orderable_cash_display if _orderable_cash_display is not None else int(budget),
                 "effective_budget": summary.get("effective_budget", int(budget)),
                 "expected_order_amount": summary.get("total_order_amount", 0),
                 "remaining_budget": int(summary.get("effective_budget", int(budget))) - int(summary.get("total_order_amount", 0) or 0),
@@ -328,6 +339,51 @@ if st.button("예산배분 계산", type="primary"):
             st.json(summary)
     else:
         st.error(f"예산배분 실패: {result.get('message', '')}")
+
+st.divider()
+
+# ── MOCK 전체 진단 ────────────────────────────────────────────────────────────
+st.subheader("MOCK 전체 진단")
+st.caption("현재가·계좌·매수가능금액·후보파일·주문 가능 여부를 한 번에 점검합니다.")
+_diag_cols = st.columns([1, 2])
+with _diag_cols[0]:
+    _diag_mode = st.selectbox("진단 모드", ["mock", "paper"], key="diag_mode_select")
+with _diag_cols[1]:
+    if st.button("MOCK 전체 진단 실행", use_container_width=True, type="secondary"):
+        with st.spinner(f"진단 중 (mode={_diag_mode.upper()})..."):
+            from env_service import inject_to_os_env as _inj_diag
+            _inj_diag()
+            _diag_result = run_full_trading_diagnosis(mode=_diag_mode, budget=int(budget))
+        _dc = st.columns(4)
+        _dc[0].metric("후보 파일", "✅ 있음" if _diag_result.get("candidate_file") else "❌ 없음")
+        _dc[1].metric("현재가 갱신", "✅ 최신" if _diag_result.get("current_price_updated") else "❌ 미갱신")
+        _dc[2].metric("KIS 보유 종목",
+                      str(_diag_result.get("broker_position_count", -1)) + "개"
+                      if _diag_result.get("broker_position_count", -1) >= 0
+                      else "조회 실패")
+        _dc[3].metric("로컬 OPEN",
+                      str(_diag_result.get("local_open_position_count", -1)) + "개"
+                      if _diag_result.get("local_open_position_count", -1) >= 0
+                      else "조회 실패")
+
+        _dc2 = st.columns(3)
+        _ord_cash = _diag_result.get("orderable_cash")
+        _ord_ok = _diag_result.get("orderable_cash_success", False)
+        _dc2[0].metric(
+            "주문가능금액",
+            f"{_ord_cash:,}원" if (_ord_ok and _ord_cash is not None) else "조회 실패"
+        )
+        _dc2[1].metric("전부 매수 가능", "✅ 가능" if _diag_result.get("buy_preflight_ok") else "❌ 불가")
+        _dc2[2].metric("Render 파이프라인", "✅ 준비" if _diag_result.get("render_pipeline_ready") else "❌ 미준비")
+
+        if _diag_result.get("buy_block_reason"):
+            st.error(f"매수 차단 사유: {_diag_result['buy_block_reason']}")
+        if _diag_result.get("failed_checks"):
+            st.warning("실패 항목:\n" + "\n".join(f"- {c}" for c in _diag_result["failed_checks"]))
+        if _diag_result.get("latest_buy_orders_file"):
+            st.caption(f"최신 매수 주문: {Path(_diag_result['latest_buy_orders_file']).name}")
+        with st.expander("진단 결과 전체 JSON", expanded=False):
+            st.json(_diag_result)
 
 st.divider()
 st.subheader("전략 매수 실행")

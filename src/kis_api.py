@@ -990,12 +990,34 @@ class KISApiClient:
         enriched.update(self.diagnostic_metadata())
         return enriched
 
-    def get_orderable_cash(self) -> float:
+    def get_orderable_cash(self) -> Optional[float]:
         """주문 가능 현금 조회.
 
         공식 문서 기준 재확인 필요:
           GET /uapi/domestic-stock/v1/trading/inquire-psbl-order
           TR_ID: TTTC8908R (실전) / VTTC8908R (모의)
+
+        Returns:
+            조회 성공 시 float (0.0 포함), 실패 시 None.
+            API 실패와 진짜 0원 잔고를 구분하기 위해 실패 시 반드시 None 반환.
+        """
+        result = self.get_orderable_cash_result()
+        if result["success"]:
+            return result["orderable_cash"]
+        return None
+
+    def get_orderable_cash_result(self) -> Dict:
+        """주문 가능 현금 조회 — 구조화된 결과 반환.
+
+        Returns:
+            {
+                "success": bool,
+                "orderable_cash": float or None,  # 실패 시 None (0원 잔고와 구분)
+                "raw_fields": dict,
+                "rt_cd": str,
+                "msg": str,
+                "error_message": str,
+            }
         """
         tr_id = "VTTC8908R" if self._use_mock else "TTTC8908R"
         params = {
@@ -1013,11 +1035,62 @@ class KISApiClient:
                 tr_id,
                 params,
             )
-            output = data.get("output", {})
-            return float(output.get("ord_psbl_cash", 0) or 0)
+            rt_cd = str(data.get("rt_cd", ""))
+            msg = str(data.get("msg1", data.get("msg", "")))
+
+            # output 구조 유연하게 파싱 (output / output2 / output[0] / output2[0])
+            raw_fields: Dict = {}
+            cash_val: Optional[float] = None
+
+            for key in ("output", "output2"):
+                raw = data.get(key)
+                if isinstance(raw, dict):
+                    raw_fields.update(raw)
+                elif isinstance(raw, list) and raw and isinstance(raw[0], dict):
+                    raw_fields.update(raw[0])
+
+            # 가능 필드를 넓게 탐색
+            for field in (
+                "ord_psbl_cash", "ord_psbl_amt", "dnca_tot_amt",
+                "nca_buy_amt", "cash_balance",
+            ):
+                val = raw_fields.get(field)
+                if val is not None:
+                    try:
+                        cash_val = float(str(val).replace(",", "") or 0)
+                        break
+                    except (ValueError, TypeError):
+                        continue
+
+            if cash_val is None:
+                return {
+                    "success": False,
+                    "orderable_cash": None,
+                    "raw_fields": raw_fields,
+                    "rt_cd": rt_cd,
+                    "msg": msg,
+                    "error_message": f"ord_psbl_cash 필드 없음 (rt_cd={rt_cd}, msg={msg})",
+                }
+
+            return {
+                "success": True,
+                "orderable_cash": cash_val,
+                "raw_fields": raw_fields,
+                "rt_cd": rt_cd,
+                "msg": msg,
+                "error_message": "",
+            }
         except Exception as e:
-            logger.warning("주문가능금액 조회 실패: %s", str(e))
-            return 0.0
+            err = str(e)
+            logger.warning("주문가능금액 조회 실패: %s", err)
+            return {
+                "success": False,
+                "orderable_cash": None,
+                "raw_fields": {},
+                "rt_cd": "",
+                "msg": "",
+                "error_message": err,
+            }
 
     def build_cash_order_request(
         self,

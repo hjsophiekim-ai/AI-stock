@@ -19,7 +19,10 @@ from prediction_service import (
     get_today_str, get_top20_path, get_force_candidates_path,
 )
 from pipeline_service import run_full_pipeline, run_fast_candidate_pipeline, find_latest_candidate_file
-from trading_service import run_buy_candidates, list_sell_policies
+from trading_service import (
+    run_buy_candidates, list_sell_policies,
+    refresh_candidate_prices_service, get_active_buy_candidate_file,
+)
 from tables import render_candidates_table
 from warning_box import force_trade_disclaimer, no_profit_guarantee_notice
 from mode_badge import render_mode_badge, render_mode_warning
@@ -528,48 +531,62 @@ if df_top100 is not None and not df_top100.empty:
     with col_c:
         refresh_mode = st.selectbox(
             "갱신 모드", ["PAPER", "MOCK"], key="refresh_mode_select",
-            help="PAPER: API 호출 없음 (빠름, 권장) / MOCK: KIS 모의투자 API (KIS 서버 응답 없을 시 5분 이상 소요)",
+            help="PAPER: API 호출 없음 (빠름, 권장) / MOCK: KIS 모의투자 API",
         )
-        if st.button("현재가 갱신", use_container_width=True):
+        if st.button("현재가 갱신하기", use_container_width=True):
             _rm = refresh_mode.lower()
-            _effective_rm = _rm
 
-            # top100 갱신
-            with st.spinner(f"top100 현재가 갱신 중 (mode={refresh_mode})..."):
-                r = run_script("refresh_candidate_prices.py",
-                               args=["--date", today_str, "--top", "100",
-                                     "--mode", _effective_rm], timeout=300)
-
-            # MOCK 실패(타임아웃 포함) 시 PAPER 자동 재시도
-            if (not r or not r.get("success")) and _effective_rm == "mock":
-                st.warning("MOCK 갱신 실패 — PAPER 모드로 자동 재시도합니다.")
-                _effective_rm = "paper"
-                with st.spinner("top100 현재가 갱신 중 (mode=PAPER fallback)..."):
-                    r = run_script("refresh_candidate_prices.py",
-                                   args=["--date", today_str, "--top", "100",
-                                         "--mode", "paper"], timeout=120)
-
-            if r and r.get("success"):
-                st.success(f"top100 현재가 갱신 완료 (mode={_effective_rm.upper()})")
-                # buy_top20 파일도 함께 갱신
-                _buy20_path = predictions_dir / f"buy_top20_{today_str}.csv"
-                if _buy20_path.exists():
-                    with st.spinner(f"buy_top20 현재가 갱신 중 (mode={_effective_rm.upper()})..."):
-                        r2 = run_script("refresh_candidate_prices.py",
-                                        args=["--input", str(_buy20_path),
-                                              "--mode", _effective_rm], timeout=300)
-                    if r2 and r2.get("success"):
-                        st.success("buy_top20 현재가 갱신 완료")
-                    else:
-                        st.warning(f"buy_top20 갱신 실패: {(r2 or {}).get('message', '오류')}")
-                st.rerun()
+            # 단일 진실 공급원: buy_top20 파일만 갱신
+            _active_file = get_active_buy_candidate_file(date=today_str)
+            if not _active_file:
+                st.error(
+                    f"buy_top20_{today_str}.csv 파일이 없습니다.\n"
+                    "'장중 매수 Top20 필터 실행' 버튼을 먼저 실행하세요."
+                )
             else:
-                _msg = (r or {}).get("message", "갱신 실패")
-                _stderr = (r or {}).get("stderr", "")
-                if "Timeout" in _msg or "timeout" in _msg.lower() or "KIS" in _stderr:
-                    st.error(f"KIS API 응답 없음 — PAPER 모드로 재시도하거나 나중에 다시 시도하세요.\n{_msg}")
+                # 1. buy_top20 갱신 (필수)
+                with st.spinner(f"buy_top20 현재가 갱신 중 (mode={refresh_mode})..."):
+                    r_buy20 = refresh_candidate_prices_service(
+                        date_str=today_str,
+                        mode=_rm,
+                        candidate_file=str(_active_file),
+                    )
+
+                # MOCK 실패 시 PAPER 자동 재시도
+                if not r_buy20.get("success") and _rm == "mock":
+                    st.warning("MOCK 갱신 실패 — PAPER 모드로 자동 재시도합니다.")
+                    r_buy20 = refresh_candidate_prices_service(
+                        date_str=today_str,
+                        mode="paper",
+                        candidate_file=str(_active_file),
+                    )
+
+                if r_buy20.get("success"):
+                    _updated = r_buy20.get("updated", 0)
+                    _failed = r_buy20.get("errors", 0)
+                    _used_mode = r_buy20.get("price_mode", refresh_mode.upper())
+                    st.success(
+                        f"✅ buy_top20 현재가 갱신 완료 (mode={_used_mode})\n"
+                        f"갱신: {_updated}개 / 실패: {_failed}개\n"
+                        f"파일: {Path(r_buy20.get('file', '')).name}"
+                    )
+                    if _failed > 0:
+                        st.warning(
+                            f"⚠ {_failed}개 종목 조회 실패: {r_buy20.get('price_error', '')[:200]}"
+                        )
+                    # 2. top100도 함께 갱신 (참고용 — 실패해도 무시)
+                    _top100_path = predictions_dir / f"top100_{today_str}.csv"
+                    if _top100_path.exists():
+                        run_script("refresh_candidate_prices.py",
+                                   args=["--input", str(_top100_path), "--mode", _rm],
+                                   timeout=120)
+                    st.cache_data.clear()
+                    st.rerun()
                 else:
-                    st.error(_msg)
+                    _msg = r_buy20.get("message", "갱신 실패")
+                    st.error(f"❌ 현재가 갱신 실패: {_msg}")
+                    if r_buy20.get("price_error"):
+                        st.caption(f"실패 종목: {r_buy20['price_error'][:300]}")
 
     st.caption("⚠ 이 목록은 모델 기반 후보군입니다. 투자 추천이 아니며 수익을 보장하지 않습니다.")
 

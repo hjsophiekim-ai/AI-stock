@@ -45,7 +45,31 @@ def sync_broker_positions(
     """
     gate = SafetyGate(config_path, runtime_mode=mode)
     api = KISApiClient(config_path, gate=gate)
-    broker_df = api.get_positions()
+
+    # KIS 계좌조회 — 실패 시 명확히 반환 (빈 DataFrame을 성공처럼 처리 금지)
+    broker_api_success = False
+    broker_api_error = ""
+    broker_df = None
+    try:
+        broker_df = api.get_positions()
+        broker_api_success = True
+    except Exception as _e:
+        broker_api_error = str(_e)
+
+    if not broker_api_success:
+        return {
+            "success": False,
+            "mode": mode,
+            "resolved_mode": getattr(gate, "mode", mode.upper()),
+            "broker_api_success": False,
+            "broker_api_error": broker_api_error,
+            "broker_count": -1,
+            "open_count": -1,
+            "closed_count": 0,
+            "error": f"KIS 계좌조회 실패: {broker_api_error}",
+            "message": "KIS 계좌조회 실패, 캐시 표시 중",
+        }
+
     pm = PositionManager(config_path, mode=mode)
     local_open_before = pm.get_open_positions()
     strategy_cfg = get_strategy(strategy)
@@ -171,13 +195,23 @@ def sync_broker_positions(
     pd.DataFrame(diff_rows).to_csv(diff_path, index=False, encoding="utf-8-sig")
 
     open_count = pm.open_position_count()
+    local_open_count_after = sum(
+        1 for pos in pm.get_all_positions().values()
+        if getattr(pos, "status", "OPEN") == "OPEN"
+        and not getattr(pos, "is_closed", False)
+        and int(getattr(pos, "quantity", 0)) > 0
+    )
     result = {
         "success": True,
         "mode": mode,
         "resolved_mode": gate.mode,
+        "broker_api_success": True,
         "position_path": str(pm._positions_file),
+        "cache_path": str(_broker_pos_file),
         "broker_count": int(len(broker_df)),
         "local_count": int(len(pm.get_all_positions())),
+        "local_open_count_before": len(local_open_before),
+        "local_open_count_after": local_open_count_after,
         "open_count": open_count,
         "closed_count": closed_count,
         "purged_count": purged_count,
@@ -185,6 +219,7 @@ def sync_broker_positions(
         "backup_path": str(backup_path) if backup_path else "",
         "apply": apply,
         "close_missing": close_missing,
+        "sync_time": now_str,
     }
 
     report_path = PROJECT_ROOT / "reports" / f"sync_report_{today}.json"

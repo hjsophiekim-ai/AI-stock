@@ -617,7 +617,8 @@ def run_fast_candidate_pipeline(
     """빠른 후보 생성 파이프라인 - 데이터 수집/모델 학습 생략.
 
     기존 데이터와 모델을 그대로 사용하며 predict_candidates ->
-    select_top_candidates 만 실행합니다. Render 환경 권장.
+    select_top_candidates -> refresh_prices -> select_intraday_buy 실행.
+    Render 환경 권장.
 
     반환 키: run_full_pipeline과 동일 구조.
     """
@@ -627,6 +628,57 @@ def run_fast_candidate_pipeline(
     today = datetime.now().strftime("%Y%m%d")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = str(PROJECT_ROOT / "logs" / f"pipeline_fast_{ts}.json")
+    artifacts = inspect_runtime_artifacts()
+
+    # 빠른 파이프라인 사전 검증 — 모델/features 없으면 명확히 실패
+    models_dir = PROJECT_ROOT / "models"
+    data_models_dir = PROJECT_ROOT / "data" / "models"
+    features_file = PROJECT_ROOT / "data" / "processed" / "features.csv"
+    has_model = (
+        any(models_dir.glob("*.joblib")) if models_dir.exists() else False
+    ) or (
+        any(data_models_dir.glob("*.joblib")) if data_models_dir.exists() else False
+    )
+    if not has_model:
+        msg = (
+            "Render 서버에 학습된 모델 파일이 없습니다 (models/*.joblib). "
+            "'전체 파이프라인 실행'으로 모델을 먼저 학습하거나, "
+            "prebuilt model/data를 배포해야 합니다."
+        )
+        print(f"[PIPELINE] FAIL predict_candidates_precheck: {msg}", flush=True)
+        return {
+            "success": False,
+            "failed_step": "predict_candidates_precheck",
+            "steps": [],
+            "candidate_file": "",
+            "buy_top20_file": "",
+            "candidate_count": 0,
+            "error_message": msg,
+            "stdout_raw": "",
+            "stderr_raw": msg,
+            "log_path": log_path,
+            "artifacts_final": artifacts,
+        }
+
+    if not features_file.exists():
+        msg = (
+            "features.csv 파일이 없습니다 (data/processed/features.csv). "
+            "'전체 파이프라인 실행'으로 데이터를 먼저 수집/처리하세요."
+        )
+        print(f"[PIPELINE] FAIL predict_candidates_precheck: {msg}", flush=True)
+        return {
+            "success": False,
+            "failed_step": "predict_candidates_precheck",
+            "steps": [],
+            "candidate_file": "",
+            "buy_top20_file": "",
+            "candidate_count": 0,
+            "error_message": msg,
+            "stdout_raw": "",
+            "stderr_raw": msg,
+            "log_path": log_path,
+            "artifacts_final": artifacts,
+        }
 
     step_defs = [
         {

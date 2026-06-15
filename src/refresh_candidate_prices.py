@@ -90,10 +90,25 @@ def _make_backup(path: Path) -> Optional[Path]:
 # ── 파일 탐색 ─────────────────────────────────────────────────────────────────
 
 def find_candidate_file(date_str: str, top_n: int) -> Optional[Path]:
+    """후보 파일 탐색.
+
+    탐색 순서:
+      1. buy_top20_{date_str}.csv (단일 진실 공급원)
+      2. top{top_n}_{date_str}.csv
+      3. 더 큰 top-N fallback (--limit으로 행 수 제한)
+    """
+    # 1순위: buy_top20 (공식 매수 후보)
+    buy20 = PREDICTIONS_DIR / f"buy_top20_{date_str}.csv"
+    if buy20.exists():
+        logger.info("buy_top20_%s.csv 발견 → 현재가 갱신 대상으로 사용", date_str)
+        return buy20
+
+    # 2순위: top{top_n}
     path = PREDICTIONS_DIR / f"top{top_n}_{date_str}.csv"
     if path.exists():
         return path
-    # 정확한 파일이 없으면 더 큰 top-N 파일로 fallback (--limit 으로 행 수 제한)
+
+    # 3순위: top-N fallback
     for n in (100, 50, 20, 10):
         if n != top_n:
             fb = PREDICTIONS_DIR / f"top{n}_{date_str}.csv"
@@ -103,6 +118,18 @@ def find_candidate_file(date_str: str, top_n: int) -> Optional[Path]:
                     top_n, date_str, fb.name, top_n,
                 )
                 return fb
+    return None
+
+
+def find_active_buy_candidate_file(date_str: Optional[str] = None) -> Optional[Path]:
+    """buy_top20 파일만 탐색 (단일 진실 공급원). top100 fallback 금지."""
+    today = date_str or datetime.now().strftime("%Y%m%d")
+    today_file = PREDICTIONS_DIR / f"buy_top20_{today}.csv"
+    if today_file.exists():
+        return today_file
+    found = sorted(PREDICTIONS_DIR.glob("buy_top20_????????.csv"), reverse=True)
+    if found:
+        return found[0]
     return None
 
 
@@ -406,29 +433,54 @@ def main() -> None:
                         help="top N (기본: 100)")
     parser.add_argument("--mode", default="mock", choices=["paper", "mock", "real"],
                         help="거래 모드 (기본: mock)")
-    parser.add_argument("--input", default=None, help="직접 지정 입력 CSV 경로")
-    parser.add_argument("--output", default=None, help="출력 CSV 경로 (기본: 입력 파일 덮어쓰기)")
+    parser.add_argument("--input", default=None,
+                        help="직접 지정 입력 CSV 경로")
+    parser.add_argument("--candidate-file", default=None,
+                        help="buy_top20 파일 직접 지정 (--input의 별칭, 단일 진실 공급원)")
+    parser.add_argument("--output", default=None,
+                        help="출력 CSV 경로 (기본: 입력 파일 덮어쓰기)")
     parser.add_argument("--limit", type=int, default=None, help="갱신할 최대 종목 수")
     parser.add_argument("--sleep", type=float, default=0.2, help="종목 간 대기 시간(초, 기본: 0.2)")
     parser.add_argument("--strict", action="store_true", help="한 종목 실패 시 전체 중단")
-    parser.add_argument("--dry-run", action="store_true", help="API 호출 없음 (--mode paper 와 동일)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="API 호출 없음 (--mode paper 와 동일)")
+    parser.add_argument("--save", action="store_true",
+                        help="갱신 후 파일 저장 (기본 동작과 동일, 명시적 플래그)")
     args = parser.parse_args()
+
+    # --candidate-file 이 --input 보다 우선
+    input_path = args.candidate_file or args.input
+    # --candidate-file만 있고 --input이 없으면 buy_top20 파일 자동 탐색
+    if not input_path:
+        active = find_active_buy_candidate_file(args.date)
+        if active:
+            print(f"[INFO] buy_top20 파일 자동 탐색: {active}")
+            input_path = str(active)
 
     result = refresh_prices(
         date_str=args.date,
         top_n=args.top,
         mode=args.mode,
         dry_run=args.dry_run,
-        input_path=args.input,
+        input_path=input_path,
         output_path=args.output,
         limit=args.limit,
         sleep_sec=args.sleep,
         strict=args.strict,
     )
-    print(f"\n결과:")
-    for k, v in result.items():
-        if k not in ("run_at",):
-            print(f"  {k}: {v}")
+
+    # JSON 구조화 결과 출력
+    import json as _json
+    print("\n결과 (JSON):")
+    print(_json.dumps({
+        "success": result.get("success"),
+        "candidate_file": result.get("file", ""),
+        "updated_count": result.get("updated", 0),
+        "failed_count": result.get("errors", 0),
+        "failed_symbols": [e.split(":")[0] for e in (result.get("price_error") or "").split(";") if e.strip()],
+        "price_mode": result.get("price_mode", ""),
+        "message": result.get("message", ""),
+    }, ensure_ascii=False, indent=2))
 
     if not result.get("success"):
         sys.exit(1)

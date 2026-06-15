@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
-from datetime import date as _date
+from datetime import date as _date, datetime as _datetime
 
 import pandas as pd
 
@@ -12,6 +12,33 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from env_service import inject_to_os_env
 from config_service import load_config, get_trade_mode
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 단일 진실 공급원: 후보 파일 탐색
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_active_buy_candidate_file(date: Optional[str] = None) -> Optional[Path]:
+    """공식 매수 후보 파일(buy_top20)을 탐색해 Path 반환. 없으면 None.
+
+    탐색 순서:
+      1. reports/predictions/buy_top20_오늘.csv
+      2. reports/predictions/buy_top20_*.csv 중 가장 최신
+      없으면 None — top100 fallback은 하지 않는다.
+    """
+    preds_dir = PROJECT_ROOT / "reports" / "predictions"
+    if not preds_dir.exists():
+        return None
+
+    today = date or _datetime.now().strftime("%Y%m%d")
+    today_file = preds_dir / f"buy_top20_{today}.csv"
+    if today_file.exists():
+        return today_file
+
+    found = sorted(preds_dir.glob("buy_top20_????????.csv"), reverse=True)
+    if found:
+        return found[0]
+    return None
 
 
 def get_positions() -> List[Dict]:
@@ -223,20 +250,55 @@ def refresh_candidate_prices_service(
     top_n: int = 100,
     mode: str = "mock",
     limit: int = None,
+    candidate_file: Optional[str] = None,
 ) -> Dict:
-    """앱에서 현재가 갱신 버튼 클릭 시 호출."""
+    """앱에서 현재가 갱신 버튼 클릭 시 호출.
+
+    반드시 buy_top20 파일을 대상으로 한다.
+    candidate_file이 명시되지 않으면 get_active_buy_candidate_file()로 탐색.
+    top100만 갱신하고 buy_top20을 그대로 두는 버그를 방지한다.
+    """
     inject_to_os_env()
     try:
         sys.path.insert(0, str(PROJECT_ROOT / "src"))
         from refresh_candidate_prices import refresh_prices
-        return refresh_prices(
+
+        # buy_top20 파일 우선 탐색
+        target_file: Optional[str] = candidate_file
+        if not target_file:
+            active = get_active_buy_candidate_file(date=date_str)
+            if active:
+                target_file = str(active)
+
+        if not target_file:
+            return {
+                "success": False,
+                "message": (
+                    f"buy_top20_{date_str}.csv 파일이 없습니다. "
+                    "AI 후보 리스트 → '장중 Top20 필터 실행' 버튼을 먼저 실행하세요."
+                ),
+                "updated": 0,
+                "price_mode": (mode or "mock").upper(),
+                "candidate_file": "",
+            }
+
+        result = refresh_prices(
             date_str=date_str,
             top_n=top_n,
             mode=(mode or "mock").lower(),
             limit=limit,
+            input_path=target_file,
         )
+        result["candidate_file"] = target_file
+        return result
     except Exception as e:
-        return {"success": False, "message": str(e), "updated": 0, "price_mode": (mode or "mock").upper()}
+        return {
+            "success": False,
+            "message": str(e),
+            "updated": 0,
+            "price_mode": (mode or "mock").upper(),
+            "candidate_file": candidate_file or "",
+        }
 
 
 def run_budget_allocation(
@@ -269,30 +331,39 @@ def run_budget_allocation(
 
         # 매수 버튼의 _get_orderable_cash()와 동일한 로직으로 orderable_cash 결정
         # 8초 초과 시 KIS 서버 무응답으로 판단 — 입력 예산으로 대체 (30초 hang 방지)
+        # API 실패와 진짜 0원 잔고를 구분: 실패 시 input budget 유지 (0원 처리 금지)
         orderable_cash = int(budget)
+        orderable_cash_success = True
+        orderable_cash_error = ""
         if (mode or "mock").lower() not in ("paper",):
             import concurrent.futures as _cf
             _cfg = str(PROJECT_ROOT / "config.yaml")
             _mode_lower = (mode or "mock").lower()
-            _cash_val = [0]
+            _cash_result: Dict = {"success": False, "orderable_cash": None, "error_message": "timeout"}
 
             def _fetch_cash():
                 try:
                     from kis_api import KISApiClient
                     from safety_gate import SafetyGate
                     _gate = SafetyGate(_cfg, runtime_mode=_mode_lower)
-                    _cash_val[0] = int(KISApiClient(_cfg, gate=_gate).get_orderable_cash() or 0)
-                except Exception:
-                    pass
+                    _cash_result.update(KISApiClient(_cfg, gate=_gate).get_orderable_cash_result())
+                except Exception as _ex:
+                    _cash_result["error_message"] = str(_ex)
 
             with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
                 _fut = _ex.submit(_fetch_cash)
                 try:
                     _fut.result(timeout=8)
                 except _cf.TimeoutError:
-                    pass  # KIS 서버 무응답 — int(budget) 유지
-            if _cash_val[0] > 0:
-                orderable_cash = _cash_val[0]
+                    pass  # KIS 서버 무응답 — input budget 유지
+
+            if _cash_result.get("success") and _cash_result.get("orderable_cash") is not None:
+                orderable_cash = int(_cash_result["orderable_cash"])
+                orderable_cash_success = True
+            else:
+                orderable_cash_success = False
+                orderable_cash_error = _cash_result.get("error_message", "조회 실패")
+                # API 실패 시 input budget 유지 (0원으로 처리 금지)
 
         # 매수 버튼과 동일한 held_codes 계산 (이미 OPEN 보유 종목 제외)
         held_codes: set = set()
@@ -337,6 +408,8 @@ def run_budget_allocation(
             "remaining_budget": result.remaining_budget,
             "input_budget": budget,
             "orderable_cash": orderable_cash,
+            "orderable_cash_success": orderable_cash_success,
+            "orderable_cash_error": orderable_cash_error,
             "effective_budget": result.effective_budget,
             "total_candidates": total_candidates,
             "held_count": len(held_codes),
@@ -706,16 +779,36 @@ def check_kis_account(mode: str = "mock") -> Dict:
 
 
 def check_orderable_cash(mode: str = "mock") -> Dict:
-    """주문가능금액 조회."""
+    """주문가능금액 조회.
+
+    API 실패와 진짜 0원 잔고를 구분한다.
+    실패 시 orderable_cash_amount=None 반환 — 0원으로 오해하지 않도록.
+    """
     inject_to_os_env()
     try:
         from api_service import _get_api_client
         api = _get_api_client(runtime_mode=mode)
-        cash = api.get_orderable_cash()
-        ok = cash >= 0
-        return {"success": ok, "mode": (mode or "mock").upper(), "orderable_cash_ok": ok, "orderable_cash_amount": int(cash)}
+        result = api.get_orderable_cash_result()
+        success = result.get("success", False)
+        cash_val = result.get("orderable_cash")  # None on failure
+        return {
+            "success": success,
+            "mode": (mode or "mock").upper(),
+            "orderable_cash_ok": success,
+            "orderable_cash_amount": int(cash_val) if (success and cash_val is not None) else None,
+            "raw_fields": result.get("raw_fields", {}),
+            "rt_cd": result.get("rt_cd", ""),
+            "api_msg": result.get("msg", ""),
+            "error": result.get("error_message", "") if not success else "",
+        }
     except Exception as exc:
-        return {"success": False, "mode": (mode or "mock").upper(), "orderable_cash_ok": False, "orderable_cash_amount": 0, "error": str(exc)}
+        return {
+            "success": False,
+            "mode": (mode or "mock").upper(),
+            "orderable_cash_ok": False,
+            "orderable_cash_amount": None,
+            "error": str(exc),
+        }
 
 
 def run_kis_readiness(mode: str = "mock") -> Dict:
@@ -771,7 +864,10 @@ def run_kis_readiness(mode: str = "mock") -> Dict:
                     result["http_status_code"] = str(acc.get("http_status_code", ""))
                 cash = check_orderable_cash(mode_u)
                 result["orderable_cash_ok"] = cash.get("orderable_cash_ok", False)
-                result["orderable_cash_amount"] = cash.get("orderable_cash_amount", 0)
+                # orderable_cash_amount=None means API failure (not 0 balance)
+                result["orderable_cash_amount"] = cash.get("orderable_cash_amount")
+                if not cash.get("orderable_cash_ok"):
+                    result["error_message"] = cash.get("error", "주문가능금액 조회 실패")
             else:
                 result["error_message"] = conn.get("error", "연결 실패")
             result["success"] = result["connection_ok"] and result["account_ok"]
@@ -848,3 +944,156 @@ def get_real_bulk_buy_readiness(
         "max_real_bulk_order_amount": max_amount,
         "readiness_details": readiness,
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 통합 진단 — 현재가·계좌·매수가능금액·후보파일·주문가능 여부를 한 번에 점검
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_full_trading_diagnosis(mode: str = "mock", budget: int = 10_000_000) -> Dict:
+    """매매 파이프라인 전체 진단.
+
+    Returns:
+        {
+            "success": bool,
+            "candidate_file": str,
+            "candidate_count": int,
+            "current_price_updated": bool,
+            "broker_position_count": int,
+            "local_open_position_count": int,
+            "orderable_cash_success": bool,
+            "orderable_cash": int or None,
+            "buy_preflight_ok": bool,
+            "buy_block_reason": str,
+            "latest_buy_orders_file": str,
+            "latest_sell_orders_file": str,
+            "render_pipeline_ready": bool,
+            "failed_checks": list,
+        }
+    """
+    inject_to_os_env()
+    import time as _time
+    failed_checks = []
+    result: Dict = {
+        "success": False,
+        "mode": (mode or "mock").upper(),
+        "candidate_file": "",
+        "candidate_count": 0,
+        "current_price_updated": False,
+        "broker_position_count": -1,
+        "local_open_position_count": -1,
+        "orderable_cash_success": False,
+        "orderable_cash": None,
+        "buy_preflight_ok": False,
+        "buy_block_reason": "",
+        "latest_buy_orders_file": "",
+        "latest_sell_orders_file": "",
+        "render_pipeline_ready": False,
+        "failed_checks": [],
+        "checked_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    # 1. buy_top20 후보 파일
+    active_file = get_active_buy_candidate_file()
+    if active_file:
+        result["candidate_file"] = str(active_file)
+        try:
+            df = pd.read_csv(active_file)
+            result["candidate_count"] = len(df)
+            # 현재가 갱신 여부 확인
+            if "price_updated_at" in df.columns:
+                from datetime import datetime as dt
+                try:
+                    latest_ts = pd.to_datetime(df["price_updated_at"].dropna()).max()
+                    age_min = (dt.now() - latest_ts.to_pydatetime().replace(tzinfo=None)).total_seconds() / 60
+                    result["current_price_updated"] = age_min < 30
+                except Exception:
+                    result["current_price_updated"] = False
+        except Exception as e:
+            failed_checks.append(f"후보파일 읽기 실패: {e}")
+    else:
+        failed_checks.append("buy_top20 파일 없음 — 장중 Top20 필터를 먼저 실행하세요")
+
+    # 2. KIS 계좌조회 (broker positions)
+    try:
+        broker_result = get_broker_positions_result(mode=mode)
+        if broker_result.get("success"):
+            result["broker_position_count"] = len(broker_result.get("positions", []))
+        else:
+            result["broker_position_count"] = -1
+            failed_checks.append(f"KIS 계좌조회 실패: {broker_result.get('message', '')}")
+    except Exception as e:
+        result["broker_position_count"] = -1
+        failed_checks.append(f"KIS 계좌조회 예외: {e}")
+
+    # 3. 로컬 OPEN 포지션 수
+    try:
+        from position_manager import PositionManager
+        pm = PositionManager(str(PROJECT_ROOT / "config.yaml"), mode=mode)
+        open_pos = pm.get_open_positions()
+        result["local_open_position_count"] = sum(
+            1 for pos in open_pos.values()
+            if getattr(pos, "status", "OPEN") == "OPEN"
+            and int(getattr(pos, "quantity", 0)) > 0
+        )
+    except Exception as e:
+        result["local_open_position_count"] = -1
+        failed_checks.append(f"로컬 포지션 읽기 실패: {e}")
+
+    # 4. 주문가능금액
+    if (mode or "mock").lower() != "paper":
+        cash_check = check_orderable_cash(mode)
+        result["orderable_cash_success"] = cash_check.get("orderable_cash_ok", False)
+        result["orderable_cash"] = cash_check.get("orderable_cash_amount")
+        if not result["orderable_cash_success"]:
+            failed_checks.append(f"주문가능금액 조회 실패: {cash_check.get('error', '')}")
+    else:
+        result["orderable_cash_success"] = True
+        result["orderable_cash"] = budget
+
+    # 5. 매수 preflight
+    open_cnt = result["broker_position_count"] if result["broker_position_count"] >= 0 else result["local_open_position_count"]
+    try:
+        from utils import load_config as _lc
+        cfg_ = _lc(str(PROJECT_ROOT / "config.yaml"))
+        max_pos = cfg_.get("risk", {}).get("max_positions", 20)
+    except Exception:
+        max_pos = 20
+
+    if open_cnt >= max_pos:
+        result["buy_block_reason"] = f"최대 보유 종목 수 초과: {open_cnt}/{max_pos}"
+    elif not result["candidate_file"]:
+        result["buy_block_reason"] = "buy_top20 파일 없음"
+    elif not result["orderable_cash_success"]:
+        result["buy_block_reason"] = f"주문가능금액 조회 실패 — {failed_checks[-1] if failed_checks else ''}"
+    elif result["orderable_cash"] is not None and result["orderable_cash"] < 10000:
+        result["buy_block_reason"] = f"주문가능금액 부족: {result['orderable_cash']:,}원"
+    else:
+        result["buy_preflight_ok"] = True
+
+    # 6. 최신 주문 파일 탐색
+    orders_dir = PROJECT_ROOT / "reports" / "orders" / "mock"
+    if orders_dir.exists():
+        buy_files = sorted(orders_dir.glob("buy_orders_*.csv"), reverse=True)
+        sell_files = sorted(orders_dir.glob("sell_orders_*.csv"), reverse=True)
+        result["latest_buy_orders_file"] = str(buy_files[0]) if buy_files else ""
+        result["latest_sell_orders_file"] = str(sell_files[0]) if sell_files else ""
+
+    # 7. Render 파이프라인 준비 여부
+    models_dir = PROJECT_ROOT / "models"
+    data_models_dir = PROJECT_ROOT / "data" / "models"
+    features_file = PROJECT_ROOT / "data" / "processed" / "features.csv"
+    has_model = (
+        any(models_dir.glob("*.joblib")) if models_dir.exists() else False
+    ) or (
+        any(data_models_dir.glob("*.joblib")) if data_models_dir.exists() else False
+    )
+    result["render_pipeline_ready"] = has_model and features_file.exists()
+    if not has_model:
+        failed_checks.append("모델 파일 없음 (models/*.joblib)")
+    if not features_file.exists():
+        failed_checks.append("features.csv 없음 (data/processed/features.csv)")
+
+    result["failed_checks"] = failed_checks
+    result["success"] = len(failed_checks) == 0 and result["buy_preflight_ok"]
+    return result
