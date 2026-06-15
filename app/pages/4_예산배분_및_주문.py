@@ -435,6 +435,44 @@ elif order_mode == "MOCK":
             st.error(f"MOCK 계좌조회 실패: {_acc_err}")
         st.rerun()
 
+    # ── 포지션 상태 상세 표시 ──────────────────────────────────
+    with st.expander("포지션 상태 상세 (매수 차단 원인 확인)", expanded=False):
+        try:
+            import sys as _sys_pf
+            _src_pf = str(PROJECT_ROOT / "src")
+            if _src_pf not in _sys_pf.path:
+                _sys_pf.path.insert(0, _src_pf)
+            from position_manager import PositionManager as _PM_pf
+            from utils import load_config as _lc_pf
+            _cfg_pf = _lc_pf(str(PROJECT_ROOT / "config.yaml"))
+            _max_pos_pf = _cfg_pf.get("risk", {}).get("max_positions", 20)
+            _pm_pf = _PM_pf(str(PROJECT_ROOT / "config.yaml"), mode="mock")
+            _all_pf = _pm_pf.get_all_positions()
+            _open_pf = [p for p in _all_pf.values() if not p.is_closed and p.status == "OPEN" and int(p.quantity) > 0]
+            _pending_pf = [p for p in _all_pf.values() if p.status == "OPEN_WITH_PENDING_SELL"]
+            _closed_pf = [p for p in _all_pf.values() if p.is_closed or p.status == "CLOSED"]
+            _broker_count_pf = _acc_r.get("broker_count", "미확인") if _mock_acc_result else "미확인"
+            _pf_detail_cols = st.columns(5)
+            _pf_detail_cols[0].metric("KIS 실제 보유", f"{_broker_count_pf}개")
+            _pf_detail_cols[1].metric("로컬 OPEN", f"{len(_open_pf)}개")
+            _pf_detail_cols[2].metric("미체결 매도", f"{len(_pending_pf)}개")
+            _pf_detail_cols[3].metric("CLOSED", f"{len(_closed_pf)}개")
+            _pf_detail_cols[4].metric("max_positions", f"{_max_pos_pf}개")
+            _buy_ok_pf = len(_open_pf) < _max_pos_pf
+            if _buy_ok_pf:
+                st.success(f"✅ 매수 가능 — OPEN {len(_open_pf)}/{_max_pos_pf}")
+            else:
+                st.error(f"❌ 최대 보유 종목 수 초과: OPEN {len(_open_pf)}/{_max_pos_pf}")
+            if _pending_pf:
+                st.warning(
+                    f"미체결 매도 주문 {len(_pending_pf)}건: "
+                    + ", ".join(p.stock_code for p in _pending_pf[:10])
+                    + "\n\n보유종목 페이지에서 계좌 동기화 후 재시도하세요."
+                )
+            st.caption(f"포지션 파일: {_pm_pf._positions_file}")
+        except Exception as _pf_ex:
+            st.caption(f"포지션 상태 조회 실패: {_pf_ex}")
+
     # 실패 사유 표시
     _fail_reasons = [_lbl.replace("\n", " ") for _lbl, _val in _pf_items if _val is False]
     if _fail_reasons:

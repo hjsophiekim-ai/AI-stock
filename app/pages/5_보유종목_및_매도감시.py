@@ -262,6 +262,30 @@ def _render_sell_tabs(mode_str: str, local_pos: list, broker_pos: list, real_rea
                     )
                 _show_bulk_result(bulk_result)
 
+                # ── 매도 성공 시 자동 계좌 동기화 ──────────────────────
+                _sell_success_n = bulk_result.get("success_count", 0)
+                if _sell_success_n > 0:
+                    st.info(f"매도 주문 {_sell_success_n}건 접수 완료. KIS 계좌와 로컬 포지션 자동 동기화 중...")
+                    with st.spinner("계좌 동기화 중 (close-missing 적용)..."):
+                        _sync_r = sync_broker_to_local(
+                            mode=mode_str.lower(),
+                            apply=True,
+                            close_missing=True,
+                        )
+                    if _sync_r.get("success"):
+                        _s_broker = _sync_r.get("broker_count", 0)
+                        _s_open = _sync_r.get("open_count", 0)
+                        _s_closed = _sync_r.get("closed_count", 0)
+                        _s_path = _sync_r.get("position_path", "")
+                        st.success(
+                            f"✅ 동기화 완료 — 브로커 보유 {_s_broker}개 | 로컬 OPEN {_s_open}개 | CLOSED 처리 {_s_closed}개\n\n"
+                            f"파일: {_s_path}"
+                        )
+                        if _s_open == 0:
+                            st.info("보유종목 0개 확인. 예산배분 및 주문 페이지에서 전부 매수를 실행하세요.")
+                    else:
+                        st.warning(f"동기화 실패 (수동 동기화 버튼 사용): {_sync_r.get('message', '')}")
+
         with _bcols[1]:
             if st.button(
                 f"🔍 {mode_str} DRY-RUN (주문없음)",

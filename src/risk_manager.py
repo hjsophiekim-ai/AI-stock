@@ -173,16 +173,33 @@ class RiskManager:
                 mode,
             )
 
-        # 7. 보유 종목 수 체크
+        # 7. 보유 종목 수 체크 — OPEN 상태(status="OPEN", quantity>0)만 집계
         max_positions = self.risk.get("max_positions", 20)
-        current_count = len(current_positions or {})
-        if current_count >= max_positions:
-            return OrderApproval(
-                False, f"최대 보유 종목 수 초과: {current_count}/{max_positions}", mode
-            )
+        _all_pos = current_positions or {}
+        _open_count = sum(
+            1 for pos in _all_pos.values()
+            if getattr(pos, "status", "OPEN") == "OPEN" and int(getattr(pos, "quantity", 1)) > 0
+        )
+        _pending_sell_count = sum(
+            1 for pos in _all_pos.values()
+            if getattr(pos, "status", "") == "OPEN_WITH_PENDING_SELL"
+        )
+        if _open_count >= max_positions:
+            _msg = f"최대 보유 종목 수 초과: {_open_count}/{max_positions} (OPEN)"
+            if _pending_sell_count:
+                _msg += f" — 미체결 매도 {_pending_sell_count}건: 계좌 동기화 후 재시도"
+            return OrderApproval(False, _msg, mode)
 
         # 8. 중복 매수 방지
         if current_positions and stock_code in current_positions:
+            _pos = current_positions[stock_code]
+            _st = getattr(_pos, "status", "OPEN")
+            if _st == "OPEN_WITH_PENDING_SELL":
+                return OrderApproval(
+                    False,
+                    f"미체결 매도 주문 존재 ({stock_code}) — 체결 또는 취소 후 매수 가능",
+                    mode,
+                )
             return OrderApproval(False, f"이미 보유 중인 종목: {stock_code}", mode)
 
         # 9. 종목당 최대 비중 체크
@@ -263,10 +280,19 @@ class RiskManager:
             pass
         # relax_trading_value, relax_volatility, score_only 단계에서는 soft filter 완화
 
-        # 최대 보유 종목 수 (force_trade에서도 유지)
+        # 최대 보유 종목 수 (force_trade에서도 유지) — OPEN만 집계
         max_pos = self.risk.get("max_positions", 20)
-        if len(current_positions or {}) >= max_pos:
-            return OrderApproval(False, f"최대 보유 종목 수 초과: {max_pos}개", mode)
+        _ft_pos = current_positions or {}
+        _ft_open = sum(
+            1 for pos in _ft_pos.values()
+            if getattr(pos, "status", "OPEN") == "OPEN" and int(getattr(pos, "quantity", 1)) > 0
+        )
+        if _ft_open >= max_pos:
+            _ft_pending = sum(1 for pos in _ft_pos.values() if getattr(pos, "status", "") == "OPEN_WITH_PENDING_SELL")
+            _ft_msg = f"최대 보유 종목 수 초과: {_ft_open}/{max_pos} (OPEN)"
+            if _ft_pending:
+                _ft_msg += f" — 미체결 매도 {_ft_pending}건: 계좌 동기화 후 재시도"
+            return OrderApproval(False, _ft_msg, mode)
 
         return OrderApproval(True, f"force_trade 승인 (step={relaxation_step})", mode)
 
@@ -363,10 +389,22 @@ class RiskManager:
             return OrderApproval(False, f"일일 손실 한도 초과: {daily_pnl_rate:.2%}", mode)
 
         max_positions = self.risk.get("max_positions", 20)
-        if len(current_positions or {}) >= max_positions:
-            return OrderApproval(False, f"최대 보유 종목 수 초과: {len(current_positions or {})}/{max_positions}", mode)
+        _co_pos = current_positions or {}
+        _co_open = sum(
+            1 for pos in _co_pos.values()
+            if getattr(pos, "status", "OPEN") == "OPEN" and int(getattr(pos, "quantity", 1)) > 0
+        )
+        if _co_open >= max_positions:
+            _co_pending = sum(1 for pos in _co_pos.values() if getattr(pos, "status", "") == "OPEN_WITH_PENDING_SELL")
+            _co_msg = f"최대 보유 종목 수 초과: {_co_open}/{max_positions} (OPEN)"
+            if _co_pending:
+                _co_msg += f" — 미체결 매도 {_co_pending}건: 계좌 동기화 후 재시도"
+            return OrderApproval(False, _co_msg, mode)
 
         if current_positions and ticker in current_positions:
+            _co_st = getattr(current_positions[ticker], "status", "OPEN")
+            if _co_st == "OPEN_WITH_PENDING_SELL":
+                return OrderApproval(False, f"미체결 매도 주문 존재 ({ticker}) — 체결 또는 취소 후 매수 가능", mode)
             return OrderApproval(False, f"이미 보유 중인 종목: {ticker}", mode)
 
         capital = getattr(self, "_total_capital", 0)

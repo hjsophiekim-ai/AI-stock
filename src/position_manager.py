@@ -328,11 +328,29 @@ class PositionManager:
         return [code for code in self._positions if self.should_force_exit(code, now)]
 
     def get_open_positions(self) -> Dict[str, "PositionRecord"]:
-        """Returns only OPEN (not closed) positions."""
+        """Returns only OPEN (not closed) positions — includes OPEN_WITH_PENDING_SELL."""
         return {code: pos for code, pos in self._positions.items() if not pos.is_closed}
 
+    def get_strictly_open_positions(self) -> Dict[str, "PositionRecord"]:
+        """Returns only truly OPEN positions (status=="OPEN", not closed, quantity>0).
+
+        OPEN_WITH_PENDING_SELL 포지션은 제외합니다.
+        RiskManager max_positions 카운트 및 매수 차단 판단에 사용합니다.
+        """
+        return {
+            code: pos for code, pos in self._positions.items()
+            if not pos.is_closed and pos.status == "OPEN" and int(pos.quantity) > 0
+        }
+
+    def strictly_open_position_count(self) -> int:
+        """Count of strictly OPEN positions (status=="OPEN", not closed, quantity>0)."""
+        return sum(
+            1 for pos in self._positions.values()
+            if not pos.is_closed and pos.status == "OPEN" and int(pos.quantity) > 0
+        )
+
     def open_position_count(self) -> int:
-        """Count of OPEN (not closed) positions."""
+        """Count of OPEN (not closed) positions — includes OPEN_WITH_PENDING_SELL."""
         return sum(1 for pos in self._positions.values() if not pos.is_closed)
 
     def remove_position(self, stock_code: str) -> bool:

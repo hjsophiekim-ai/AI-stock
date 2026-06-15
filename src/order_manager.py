@@ -155,8 +155,10 @@ class OrderManager:
         else:
             order_price = raw_price
 
-        # RiskManager 승인 — OPEN 포지션만 카운트 (CLOSED 종목으로 인한 오차 방지)
-        _open_pos = (self.pos_mgr.get_open_positions()
+        # RiskManager 승인 — strictly OPEN만 카운트 (OPEN_WITH_PENDING_SELL 포함하지 않음)
+        _open_pos = (self.pos_mgr.get_strictly_open_positions()
+                     if hasattr(self.pos_mgr, "get_strictly_open_positions")
+                     else self.pos_mgr.get_open_positions()
                      if hasattr(self.pos_mgr, "get_open_positions")
                      else self.pos_mgr.get_all_positions())
         approval = self.risk.approve_buy_order(
@@ -1060,12 +1062,17 @@ class OrderManager:
 
         # PAPER 모드: 검증 후 가상 체결
         if mode == TRADE_MODE_PAPER:
+            _paper_pos = {} if allow_additional_buy else (
+                self.pos_mgr.get_strictly_open_positions()
+                if hasattr(self.pos_mgr, "get_strictly_open_positions")
+                else self.pos_mgr.get_open_positions()
+            )
             approval = self.risk.approve_buy_order(
                 stock_code=stock_code,
                 stock_name=stock_name,
                 price=float(current_price),
                 quantity=quantity,
-                current_positions={} if allow_additional_buy else self.pos_mgr.get_open_positions(),
+                current_positions=_paper_pos,
             )
             if not approval.approved:
                 order_record["rejected_reason"] = f"RiskManager: {approval.reason}"
@@ -1095,13 +1102,18 @@ class OrderManager:
         if self._api is not None:
             order_record["token_source"] = getattr(self._api.auth, "token_source", "")
 
-        # RiskManager 승인
+        # RiskManager 승인 — strictly OPEN만 카운트
+        _mock_real_pos = {} if allow_additional_buy else (
+            self.pos_mgr.get_strictly_open_positions()
+            if hasattr(self.pos_mgr, "get_strictly_open_positions")
+            else self.pos_mgr.get_open_positions()
+        )
         approval = self.risk.approve_buy_order(
             stock_code=stock_code,
             stock_name=stock_name,
             price=float(current_price),
             quantity=quantity,
-            current_positions={} if allow_additional_buy else self.pos_mgr.get_open_positions(),
+            current_positions=_mock_real_pos,
         )
         if not approval.approved:
             order_record["rejected_reason"] = f"RiskManager: {approval.reason}"
