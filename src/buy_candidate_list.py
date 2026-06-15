@@ -116,7 +116,15 @@ def _get_orderable_cash(mode: str, budget: int, errors: list) -> int:
         return int(budget)
 
 
-def _execute_order(stock_code: str, stock_name: str, quantity: int, order_price: int, mode: str, allow_additional_buy: bool = False) -> dict:
+def _execute_order(
+    stock_code: str,
+    stock_name: str,
+    quantity: int,
+    order_price: int,
+    mode: str,
+    allow_additional_buy: bool = False,
+    allow_outside_window: bool = False,
+) -> dict:
     from order_manager import OrderManager
     from safety_gate import SafetyGate
 
@@ -131,6 +139,7 @@ def _execute_order(stock_code: str, stock_name: str, quantity: int, order_price:
         current_price=int(order_price),
         side="buy",
         allow_additional_buy=allow_additional_buy,
+        allow_outside_window=allow_outside_window,
     )
     result.setdefault("requested_mode", normalized_mode)
     result.setdefault("resolved_mode", gate.mode)
@@ -184,7 +193,14 @@ def buy_candidates(
         held_codes = set()
         try:
             from position_manager import PositionManager
-            held_codes = set(PositionManager(CONFIG_PATH, mode=mode).get_all_positions().keys())
+            _pm = PositionManager(CONFIG_PATH, mode=mode)
+            _all_pos = _pm.get_all_positions()
+            # OPEN_WITH_PENDING_SELL은 매도 주문 접수 완료 상태 → 재매수 허용
+            # 진짜 OPEN(매도 미접수) 상태만 재매수 차단
+            held_codes = {
+                code for code, pos in _all_pos.items()
+                if getattr(pos, "status", "OPEN") == "OPEN"
+            }
         except Exception:
             pass
 
@@ -260,7 +276,11 @@ def buy_candidates(
             name = a["stock_name"]
             qty = int(a["quantity"])
             price = int(a["order_price"])
-            order_r = _execute_order(code, name, qty, price, mode, allow_additional_buy=allow_additional_buy)
+            order_r = _execute_order(
+                code, name, qty, price, mode,
+                allow_additional_buy=allow_additional_buy,
+                allow_outside_window=allow_outside_window,
+            )
             order_r.update({
                 "strategy_id": a["strategy_id"],
                 "strategy_name": a["strategy_name"],

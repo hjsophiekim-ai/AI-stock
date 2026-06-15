@@ -934,6 +934,7 @@ class OrderManager:
         current_price: int,
         side: str = "buy",
         allow_additional_buy: bool = False,
+        allow_outside_window: bool = False,
     ) -> Dict:
         """주문 전 검증을 포함한 주문 실행.
 
@@ -1025,20 +1026,32 @@ class OrderManager:
                 order_record["mode_consistency_valid"] = True
 
         # MOCK/REAL 모드에서 세션 허용 여부 확인
+        # REAL: 항상 세션 체크 적용
+        # MOCK: allow_outside_window=True이면 동시호가(KIS 미지원)만 차단
         if mode != TRADE_MODE_PAPER:
-            if not self.calendar.is_session_allowed(order_session, after_hours_cfg):
-                reason = (
-                    f"현재 세션({order_session}) 주문 불가 — "
-                    f"config.yaml: after_hours.allow_* 설정 확인"
-                )
-                if order_session == SESSION_CLOSED:
-                    reason = f"장 마감({order_session}) — 주문 불가"
-                elif order_session == SESSION_CLOSING_AUCTION:
-                    reason = f"동시호가({order_session}) — 주문 미지원"
-                order_record["rejected_reason"] = reason
-                logger.warning("[세션 거부] %s", reason)
-                self.record_order_log(order_record)
-                return order_record
+            _session_blocked = not self.calendar.is_session_allowed(order_session, after_hours_cfg)
+            if _session_blocked:
+                # MOCK + allow_outside_window: 동시호가만 차단 (나머지 허용)
+                if allow_outside_window and mode == TRADE_MODE_MOCK:
+                    if order_session == SESSION_CLOSING_AUCTION:
+                        order_record["rejected_reason"] = f"동시호가({order_session}) — MOCK 미지원"
+                        logger.warning("[세션 거부] %s", order_record["rejected_reason"])
+                        self.record_order_log(order_record)
+                        return order_record
+                    # 그 외(CLOSED, AFTER_HOURS 등)는 MOCK에서 통과
+                else:
+                    reason = (
+                        f"현재 세션({order_session}) 주문 불가 — "
+                        f"config.yaml: after_hours.allow_* 설정 확인"
+                    )
+                    if order_session == SESSION_CLOSED:
+                        reason = f"장 마감({order_session}) — 주문 불가"
+                    elif order_session == SESSION_CLOSING_AUCTION:
+                        reason = f"동시호가({order_session}) — 주문 미지원"
+                    order_record["rejected_reason"] = reason
+                    logger.warning("[세션 거부] %s", reason)
+                    self.record_order_log(order_record)
+                    return order_record
 
         if stock_code in self._failed_tickers:
             order_record["rejected_reason"] = "이번 루프 실패 종목"
