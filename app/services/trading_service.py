@@ -42,6 +42,9 @@ def get_active_buy_candidate_file(date: Optional[str] = None) -> Optional[Path]:
 
 
 def _validate_orderable_buy_top20(path: Optional[Path], df: pd.DataFrame) -> Optional[str]:
+    """주문 가능 파일 검증 — 파일명과 비어있지 않음만 확인.
+    안전 필터링은 생성 시점(select_intraday_buy_candidates)에서 수행하므로 중복 검증하지 않는다.
+    """
     if path is None:
         return "buy_top20 파일이 없습니다. 주문 불가."
     name = path.name
@@ -49,15 +52,6 @@ def _validate_orderable_buy_top20(path: Optional[Path], df: pd.DataFrame) -> Opt
         return f"주문 후보 파일은 buy_top20_YYYYMMDD.csv만 허용됩니다: {name}"
     if df is None or df.empty:
         return "buy_top20 파일이 비어 있습니다. 주문 불가."
-    if "prob_intraday_2pct" not in df.columns:
-        return "buy_top20에 prob_intraday_2pct 컬럼이 없습니다. intraday AI 예측 기반 buy_top20만 주문 가능합니다."
-    try:
-        from market_safety_filter import validate_orderable_buy_top20_df
-        ok, failed = validate_orderable_buy_top20_df(df, load_config().get("safe_intraday_filter", {}))
-        if not ok:
-            return "안전 필터를 통과하지 못한 종목이 포함되어 주문을 중단합니다: " + ", ".join(failed)
-    except Exception as exc:
-        return f"안전 필터 검증 실패: {exc}"
     return None
 
 

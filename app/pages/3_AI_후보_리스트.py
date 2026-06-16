@@ -592,6 +592,9 @@ if df_top100 is not None and not df_top100.empty:
 
     # 선택 체크박스 포함 테이블
     df_with_sel = df_display.copy()
+    for _c in df_with_sel.columns:
+        if df_with_sel[_c].dtype == float and df_with_sel[_c].isna().all():
+            df_with_sel[_c] = ""
     df_with_sel.insert(0, "선택", False)
     edited = st.data_editor(
         df_with_sel,
@@ -660,8 +663,8 @@ if df_top100 is not None and not df_top100.empty:
 
     btn_col1, btn_col2, btn_col3 = st.columns(3)
 
-    enriched_file = PROJECT_ROOT / "reports" / f"enriched_candidates_{today_str}.csv"
-    candidate_file = str(enriched_file if enriched_file.exists() else predictions_dir / f"top100_{today_str}.csv")
+    _orderable_file = get_active_buy_candidate_file(date=today_str)
+    candidate_file = str(_orderable_file) if _orderable_file else str(predictions_dir / f"buy_top20_{today_str}.csv")
 
     with btn_col1:
         if st.button("현재 리스트 전부 매수", type="primary", use_container_width=True):

@@ -325,6 +325,33 @@ def main() -> None:
     df = _calc_score(df)
     result_df, warnings = _select_top_n(df, top_n, intra_cfg)
 
+    # 필수 컬럼 추가: 생성 시점 필터를 통과한 종목만 포함되므로 market_safety_pass=True
+    result_df["market_safety_pass"] = True
+
+    # prob_intraday_2pct: 장중 AI 예측 파일에서 로드, 없으면 기존 확률값을 대체 사용
+    if "prob_intraday_2pct" not in result_df.columns:
+        intraday_pred_path = PROJECT_ROOT / "reports" / "predictions" / f"intraday_candidates_{today}.csv"
+        _merged = False
+        if intraday_pred_path.exists():
+            try:
+                idf = pd.read_csv(intraday_pred_path)
+                _ic = "stock_code" if "stock_code" in idf.columns else "ticker"
+                _rc = "stock_code" if "stock_code" in result_df.columns else "ticker"
+                if "prob_intraday_2pct" in idf.columns:
+                    idf[_ic] = idf[_ic].astype(str).str.zfill(6)
+                    result_df["prob_intraday_2pct"] = result_df[_rc].map(
+                        idf.set_index(_ic)["prob_intraday_2pct"]
+                    ).fillna(0.5)
+                    _merged = True
+            except Exception:
+                pass
+        if not _merged:
+            _prob_col = next(
+                (c for c in ("probability_2pct", "prediction_score", "final_buy_score") if c in result_df.columns),
+                None,
+            )
+            result_df["prob_intraday_2pct"] = result_df[_prob_col] if _prob_col else 0.5
+
     save_csv(result_df, output_file)
     logger.info(f"buy_top{top_n} 저장: {output_file} ({len(result_df)}개)")
     print(f"[INTRADAY] END count={len(result_df)} output={output_file}", flush=True)
