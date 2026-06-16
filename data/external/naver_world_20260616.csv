@@ -1,0 +1,7 @@
+﻿symbol,name,raw_name,category,theme,close,prev_close,change_rate,volume,trading_value_proxy,after_hours_change_rate,premarket_change_rate,data_source,source_url,fetched_at,error
+^DJT,Dow Jones Transportation Average,다우 운송,index,industrial,22351.31,,-1.09,85989152.0,,,,naver_finance_world_americaData,https://finance.naver.com/world/,2026-06-16T01:01:17.561858+00:00,
+QQQ,NASDAQ 100,나스닥 100,index,technology,30543.92,,3.06,134385399.0,,,,naver_finance_world_americaData,https://finance.naver.com/world/,2026-06-16T01:01:17.561879+00:00,
+^IXIC,NASDAQ Composite,나스닥 종합,index,technology,26683.94,,3.07,1108738280.0,,,,naver_finance_world_americaData,https://finance.naver.com/world/,2026-06-16T01:01:17.561890+00:00,
+^DJI,Dow Jones Industrial Average,다우 산업,index,industrial,51671.03,,0.92,509663893.0,,,,naver_finance_world_americaData,https://finance.naver.com/world/,2026-06-16T01:01:17.561897+00:00,
+^GSPC,S&P 500,S&P 500,index,risk_on,7554.29,,1.65,339321506.0,,,,naver_finance_world_americaData,https://finance.naver.com/world/,2026-06-16T01:01:17.561910+00:00,
+^SOX,Philadelphia Semiconductor Index,필라델피아 반도체,index,semiconductor,14099.62,,5.45,0.0,,,,naver_finance_world_americaData,https://finance.naver.com/world/,2026-06-16T01:01:17.561918+00:00,
