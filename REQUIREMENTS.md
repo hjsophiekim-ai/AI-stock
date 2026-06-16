@@ -9,14 +9,15 @@
 - [ ] 종목별 데이터 수집 실패 시 프로그램 전체가 중단되지 않고 로그에 기록해야 한다.
 
 ### 데이터 필터링
-- [ ] 관리종목 제외
-- [ ] 거래정지 종목 제외
+- [x] 관리종목 제외
+- [x] 거래정지 종목 제외
 - [ ] 투자경고·주의환기 종목 제외
-- [ ] 우선주 제외 (종목코드 끝자리 기준)
-- [ ] 스팩(SPAC) 제외
-- [ ] ETF/ETN 제외
-- [ ] 최소 거래대금 미달 종목 제외 (config에서 설정)
+- [x] 우선주 제외 (종목코드 끝자리 기준)
+- [x] 스팩(SPAC) 제외
+- [x] ETF/ETN 제외
+- [x] 최소 거래대금 미달 종목 제외 (config에서 설정)
 - [ ] 현재가 1,000원 미만 종목 제외
+- [ ] 기관·외국인 순매수 종목 우대 (미구현)
 
 ### 피처 생성
 - [ ] 일봉 기반 기술적 피처 30개 이상 생성
@@ -967,3 +968,168 @@ python -c "import sys; sys.path.insert(0,'src'); from buy_candidate_list import 
 | P0 | KIS 타임아웃 30초 hang | threading 8초 timeout으로 즉시 fallback |
 | P0 | run_script env 미전달 | subprocess에 os.environ.copy() 전달 |
 | P0 | 현재가 갱신 buy_top20 누락 | top100 갱신 후 buy_top20도 함께 갱신 |
+
+---
+
+## 거래정지·위험종목 안전 필터 구현 요구사항 (2026-06-16 추가)
+
+### 배경 및 문제
+
+- 파이프라인 실행 후 후보 리스트와 Top20에 거래정지 종목이 등장하는 현상 발생
+- 원인: `stock_master.csv`의 `is_halted`, `is_management` 컬럼이 항상 `False`로 하드코딩됨
+- `select_top_candidates.py`의 `apply_hard_exclusions()`가 이 컬럼을 확인하지만, 컬럼 자체가 predictions CSV에 포함되지 않아 필터가 동작하지 않음 (dead code)
+- `stock_master.csv`는 생성되지만 downstream 파이프라인 어디에도 병합되지 않았음
+
+### W. Hard Exclusion vs Soft Filter 분류
+
+#### Hard Exclusion (절대 완화 불가 — 후보 리스트에서 완전 제거)
+
+| 필터 | 탐지 방법 | 적용 시점 |
+|------|-----------|-----------|
+| 거래정지 종목 | 최근 7일(≈5거래일) 내 OHLCV 데이터 없음 | `predict_candidates.py` + `select_top_candidates.py` |
+| 관리종목 | `stock_master.csv.is_management=True` | 동일 |
+| 우선주 | 종목코드 끝자리 5·7·9, 종목명 "우" 포함 | `collect_daily_data.py:filter_tickers()` |
+| 스팩(SPAC) | 종목명 "스팩", "기업인수목적" 포함 | 동일 |
+| ETF/ETN | 종목명 "ETF", "ETN", "인버스", "레버리지" 포함 | 동일 |
+| 리츠 | 종목명 "리츠" 포함 | `select_today_buy_top20.py` paper mode |
+
+#### Soft Filter (조건 완화 가능 — 필터 통과 종목 부족 시 완화)
+
+| 필터 | config 키 | 기본값 |
+|------|-----------|--------|
+| 최소 거래대금 (20일 평균) | `risk.min_avg_20d_trading_value` | 5,000,000,000원 |
+| 최소 현재가 | `risk.min_price` | 1,000원 |
+| 최소 거래대금 (장중) | `safe_intraday_filter.hard_min_trading_value` | — |
+| VWAP 위 (safe mode) | `safe_intraday_filter.require_above_vwap` | true |
+
+---
+
+### X. 거래정지 종목 탐지 구현 요구사항
+
+#### X-1. `src/collect_daily_data.py` 수정
+
+- [x] `make_stock_master()` 이후 `collect_all_daily_data()` 완료 시 `_update_stock_master_halted()` 호출
+- [x] `_update_stock_master_halted(master_path, output_path, tickers_df)` 함수 구현:
+  - 수집된 OHLCV에서 최근 7일(≈5 거래일) 내 데이터가 없는 종목 탐지
+  - 해당 종목에 `is_halted=True` 설정 후 `stock_master.csv` 덮어쓰기
+  - 실패 시 warning만 기록하고 계속 진행 (파이프라인 중단 금지)
+
+```python
+def _update_stock_master_halted(master_path, output_path, tickers_df):
+    """OHLCV 기반 거래정지 탐지: 과거 수집 이력 있으나 최근 7일 내 거래 없는 종목 → is_halted=True
+    
+    주의: tickers_df 전체 기준 비교 금지 — 거래대금 미달로 수집 생략된 종목을 거래정지로
+          오인하는 false positive 방지를 위해 실제 OHLCV 수집 이력이 있는 종목만 대상으로 함.
+    """
+    ohlcv = pd.read_csv(output_path, parse_dates=["date"], dtype={"stock_code": str})
+    latest = ohlcv["date"].max()
+    recent_cutoff = latest - pd.Timedelta(days=7)
+    ever_collected = set(ohlcv["stock_code"].astype(str).str.zfill(6).unique())
+    recent_codes = set(ohlcv[ohlcv["date"] >= recent_cutoff]["stock_code"].str.zfill(6))
+    halted_codes = ever_collected - recent_codes  # 과거엔 있었지만 최근 없음 = 거래정지 추정
+    master = pd.read_csv(master_path, dtype={"stock_code": str})
+    master["stock_code"] = master["stock_code"].str.zfill(6)
+    master["is_halted"] = master["stock_code"].isin(halted_codes)
+    save_csv(master, master_path)
+```
+
+#### X-2. `src/predict_candidates.py` 수정
+
+- [x] `predict_all()` 실행 후 `stock_master.csv` 병합:
+  - `is_halted=True` 또는 `is_management=True`인 종목을 예측 결과에서 제거
+  - 제거된 종목명과 수량 로그 기록
+  - `stock_master.csv` 없을 시 warning만 기록하고 필터 생략 (이전 동작 유지)
+  - 출력 predictions CSV에는 안전 컬럼(`is_halted`, `is_management`) 포함하지 않음
+
+```python
+# predict_candidates.py main() 내 predict_all() 호출 직후
+master_path = cfg["data"]["raw_daily_path"].replace("daily_prices.csv", "stock_master.csv")
+if os.path.exists(master_path):
+    master = pd.read_csv(master_path, dtype={"stock_code": str})
+    result = result.merge(master[["stock_code","is_halted","is_management"]], on="stock_code", how="left")
+    for col in ("is_halted", "is_management"):
+        result[col] = result[col].fillna(False).astype(bool)
+    excluded = result["is_halted"] | result["is_management"]
+    result = result[~excluded].drop(columns=["is_halted","is_management"])
+```
+
+#### X-3. `src/select_top_candidates.py` (기존 코드 유지)
+
+- `apply_hard_exclusions()`는 현재 `is_halted`/`is_management` 컬럼이 있을 때만 필터 적용
+- `predict_candidates.py` 수정 이후에는 이미 제거된 상태로 도달하므로 이중 방어 역할
+- 컬럼이 없어도 에러 없이 동작함 (기존 `if "is_halted" in df.columns:` 조건 유지)
+
+---
+
+### Y. 기관·외국인 매수 필터 요구사항 (미구현)
+
+- [ ] pykrx `stock.get_market_trading_value_by_date()` 또는 네이버 증권 기관/외국인 순매수 데이터 활용
+- [ ] `collect_daily_data.py`에서 기관/외국인 순매수 컬럼 추가 (`inst_net_buy`, `foreign_net_buy`)
+- [ ] `make_features.py`에서 최근 5일 기관/외국인 순매수 합계 피처 추가
+- [ ] `select_top_candidates.py`에서 기관/외국인 동반 순매수 종목 가중치 부여
+- [ ] config.yaml에 `risk.require_institutional_net_buy: false` 설정 (기본값 false — Soft filter)
+
+---
+
+### Z. 안전 필터 파이프라인 데이터 흐름
+
+```
+collect_daily_data.py
+  ↓ OHLCV 수집 완료 후
+  → _update_stock_master_halted()
+  → data/raw/stock_master.csv (is_halted, is_management 정확히 설정)
+
+predict_candidates.py
+  ↓ predict_all() 호출 후
+  → stock_master.csv 병합
+  → is_halted=True / is_management=True 종목 제거
+  → reports/predictions/predictions_YYYYMMDD.csv (위험종목 없음)
+
+select_top_candidates.py
+  ↓ predictions CSV 읽기
+  → apply_hard_exclusions() (이중 방어 — is_halted 컬럼 없어도 안전)
+  → 이름 기반 Hard exclusion (우선주, 스팩, ETF)
+  → reports/predictions/top100_YYYYMMDD.csv (위험종목 없음)
+
+select_intraday_buy_candidates.py (paper mode)
+  ↓ top100 읽기
+  → 이름·코드 기반 Hard exclusion (리츠, 우선주 재확인)
+  → reports/predictions/intraday_candidates_YYYYMMDD.csv
+
+select_today_buy_top20.py (paper mode)
+  ↓ intraday_candidates 읽기
+  → 이름·코드 기반 Hard exclusion (최후 방어선)
+  → reports/predictions/buy_top20_YYYYMMDD.csv (주문 가능 최종 목록)
+```
+
+**핵심 원칙**: 위험종목 필터는 생성 시점에 제거. 주문 시점에 재검증 금지 (중복 검증 금지).
+
+---
+
+### 안전 필터 구현 현황
+
+| 필터 | 구현 파일 | 상태 |
+|------|-----------|------|
+| 우선주 제외 | `collect_daily_data.py:filter_tickers()` | ✅ 구현됨 |
+| 스팩 제외 | 동일 | ✅ 구현됨 |
+| ETF/ETN 제외 | 동일 | ✅ 구현됨 |
+| 최소 거래대금 | 동일 + `make_features.py` | ✅ 구현됨 |
+| 거래정지 탐지 | `collect_daily_data.py:_update_stock_master_halted()` | ✅ 2026-06-16 구현 |
+| 관리종목 제외 | `stock_master.csv` 기반 (탐지 방법 미완성) | ⚠️ 부분 구현 |
+| 거래정지→예측 필터링 | `predict_candidates.py` stock_master 병합 | ✅ 2026-06-16 구현 |
+| 투자경고 제외 | 미구현 | ❌ |
+| 현재가 1,000원 미만 | 미구현 | ❌ |
+| 기관·외국인 매수 | 미구현 | ❌ |
+
+---
+
+## 요구사항 우선순위 업데이트 (2026-06-16)
+
+| 순위 | 기능 | 설명 |
+|------|------|------|
+| P0 | 거래정지 탐지 구현 | `_update_stock_master_halted()` — OHLCV 기반 자동 탐지 |
+| P0 | 예측 단계 거래정지 필터 | `predict_candidates.py` stock_master 병합 후 제거 |
+| P1 | 관리종목 탐지 | pykrx 또는 KRX 데이터 연동 |
+| P1 | 투자경고 종목 제외 | KRX 투자주의 데이터 연동 |
+| P2 | 기관·외국인 필터 | 순매수 피처 추가 |
+| P2 | 현재가 1,000원 미만 제외 | predict_candidates.py 또는 select_top_candidates.py |

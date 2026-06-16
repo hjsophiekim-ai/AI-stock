@@ -260,11 +260,52 @@ def make_stock_master(tickers_df: pd.DataFrame) -> pd.DataFrame:
     master["is_preferred"] = master["stock_code"].apply(is_preferred_stock)
     master["is_spac"] = master["stock_name"].apply(is_spac)
     master["is_etf_etn"] = master["stock_name"].apply(is_etf_etn)
-    master["is_halted"] = False
+    master["is_halted"] = False   # collect_all_daily_data 완료 후 _update_stock_master_halted로 갱신
     master["is_management"] = False
     return master[["stock_code", "stock_name", "market",
                    "is_preferred", "is_spac", "is_etf_etn",
                    "is_halted", "is_management"]]
+
+
+def _update_stock_master_halted(
+    master_path: str, output_path: str, tickers_df: pd.DataFrame
+) -> None:
+    """수집된 OHLCV에서 거래정지 종목을 탐지해 stock_master.csv 업데이트.
+
+    탐지 방법: OHLCV에 과거 데이터가 있었으나 최근 3거래일(≈7일) 내 데이터가 없는 종목.
+    - 거래대금 미달로 수집 자체가 생략된 종목과 구별하기 위해 과거 수집 이력 기준 사용.
+    - tickers_df 전체 기준이 아닌, 실제 OHLCV에 있던 종목만 대상으로 비교.
+    """
+    if not os.path.exists(output_path) or not os.path.exists(master_path):
+        return
+    try:
+        ohlcv = pd.read_csv(output_path, parse_dates=["date"], dtype={"stock_code": str})
+        master = pd.read_csv(master_path, dtype={"stock_code": str})
+        if ohlcv.empty:
+            return
+
+        latest = ohlcv["date"].max()
+        recent_cutoff = latest - pd.Timedelta(days=7)
+
+        # 과거 데이터가 있던 종목(수집 이력 있음) 중 최근 7일 내 미등장 → 거래정지 추정
+        ever_collected = set(ohlcv["stock_code"].astype(str).str.zfill(6).unique())
+        recent_codes = set(
+            ohlcv[ohlcv["date"] >= recent_cutoff]["stock_code"].astype(str).str.zfill(6).unique()
+        )
+        halted_codes = ever_collected - recent_codes  # 과거엔 있었지만 최근 없음
+
+        master["stock_code"] = master["stock_code"].astype(str).str.zfill(6)
+        master["is_halted"] = master["stock_code"].isin(halted_codes)
+        save_csv(master, master_path)
+        logger.info(
+            f"stock_master 거래정지 업데이트: {len(halted_codes)}개 탐지 "
+            f"(기준일 {latest.strftime('%Y-%m-%d')}, 과거 수집 이력 있으나 최근 7일 내 거래 없음)"
+        )
+        if halted_codes:
+            halted_names = master.loc[master["is_halted"], "stock_name"].tolist()[:10]
+            logger.info(f"거래정지 추정 종목(최대 10개): {halted_names}")
+    except Exception as exc:
+        logger.warning(f"stock_master 거래정지 업데이트 실패 (무시): {exc}")
 
 
 def collect_all_daily_data(
@@ -464,6 +505,8 @@ def main() -> None:
     collect_all_daily_data(
         tickers_df, start_date, end_date, output_path, error_log_path, limit
     )
+    # 수집 완료 후 OHLCV 기반으로 거래정지 종목 탐지 및 stock_master 갱신
+    _update_stock_master_halted(master_path, output_path, tickers_df)
     logger.info("=== 일봉 데이터 수집 완료 ===")
 
 

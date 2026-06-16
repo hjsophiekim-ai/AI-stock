@@ -141,6 +141,34 @@ def main() -> None:
     logger.info("=== 예측 시작 ===")
     result = predict_all(use_path, model_path)
 
+    # stock_master.csv에서 거래정지/관리종목 필터 적용
+    raw_daily_path = cfg["data"].get("raw_daily_path", "data/raw/daily_prices.csv")
+    master_path = os.path.join(os.path.dirname(raw_daily_path), "stock_master.csv")
+    if os.path.exists(master_path):
+        try:
+            master = pd.read_csv(master_path, dtype={"stock_code": str})
+            master["stock_code"] = master["stock_code"].astype(str).str.zfill(6)
+            safety_cols = [c for c in ("is_halted", "is_management") if c in master.columns]
+            if safety_cols:
+                result = result.merge(master[["stock_code"] + safety_cols], on="stock_code", how="left")
+                for col in safety_cols:
+                    result[col] = result[col].fillna(False).astype(bool)
+                excluded_mask = pd.Series(False, index=result.index)
+                if "is_halted" in result.columns:
+                    excluded_mask |= result["is_halted"]
+                if "is_management" in result.columns:
+                    excluded_mask |= result["is_management"]
+                if excluded_mask.any():
+                    excl_names = result.loc[excluded_mask, "stock_name"].tolist()[:20]
+                    logger.info(f"거래정지/관리종목 제외 ({excluded_mask.sum()}개): {excl_names}")
+                before_count = len(result)
+                result = result[~excluded_mask].drop(columns=safety_cols, errors="ignore").reset_index(drop=True)
+                logger.info(f"안전 필터 후: {before_count}개 → {len(result)}개 종목")
+        except Exception as exc:
+            logger.warning(f"stock_master 병합 실패 (무시): {exc}")
+    else:
+        logger.warning(f"stock_master.csv 없음 — 거래정지 필터 생략: {master_path}")
+
     output_path = os.path.join(predictions_dir, f"predictions_{today}.csv")
     ensure_dir(predictions_dir)
     save_csv(result, output_path)
