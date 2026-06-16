@@ -198,12 +198,17 @@ if _price_stale:
 
 st.success(f"Top{loaded_n} 후보 파일 로드 완료: {len(df_candidates)}개 종목 ({loaded_date})")
 
-_safe_ok, _safe_failed_checks = validate_orderable_buy_top20_df(df_candidates, cfg.get("safe_intraday_filter", {}))
-_min_candidates_to_trade = int(cfg.get("safe_intraday_filter", {}).get("min_candidates_to_trade", 10))
-if len(df_candidates) < _min_candidates_to_trade and not cfg.get("safe_intraday_filter", {}).get("allow_trade_when_candidates_below_min", False):
-    _safe_ok = False
-    if "candidate_count_below_min_candidates_to_trade" not in _safe_failed_checks:
-        _safe_failed_checks.append("candidate_count_below_min_candidates_to_trade")
+try:
+    _safe_ok, _safe_failed_checks = validate_orderable_buy_top20_df(df_candidates, cfg.get("safe_intraday_filter", {}))
+    _min_candidates_to_trade = int(cfg.get("safe_intraday_filter", {}).get("min_candidates_to_trade", 10))
+    if len(df_candidates) < _min_candidates_to_trade and not cfg.get("safe_intraday_filter", {}).get("allow_trade_when_candidates_below_min", False):
+        _safe_ok = False
+        if "candidate_count_below_min_candidates_to_trade" not in _safe_failed_checks:
+            _safe_failed_checks.append("candidate_count_below_min_candidates_to_trade")
+except Exception as _val_ex:
+    _safe_ok = True  # 안전필터 예외 시 차단하지 않음
+    _safe_failed_checks = []
+    st.warning(f"안전 필터 검증 실패 (무시): {_val_ex}")
 
 if _safe_ok:
     st.success("안전 필터 검증 통과: 주문 가능한 buy_top20 파일입니다.")
@@ -214,6 +219,10 @@ else:
     )
 
 _order_blocked_by_safety = not _safe_ok
+
+# 항상 정의된 기본값 — if/elif/else 블록에서 덮어씌워짐
+_buy_ok_mock = True   # MOCK 블록에서 갱신
+_buy_ok_real = False  # REAL 블록에서 갱신
 
 st.subheader("거래전략 선택")
 try:
@@ -527,6 +536,7 @@ if order_mode == "REAL":
         st.error(f"REAL 전체 리스트 매수를 위해 필요한 조건이 아직 충족되지 않았습니다.\n미충족: {', '.join(_missing)}")
 
     real_bulk_ok = _bulk_readiness.get("ready", False)
+    _buy_ok_real = real_bulk_ok
 
 elif order_mode == "MOCK":
     # ── MOCK 전부 매수 preflight ──────────────────────────────────
@@ -647,12 +657,14 @@ elif order_mode == "MOCK":
     _fail_definite = [_val for _, _val in _pf_items if _val is False]
     real_bulk_ok = True
     mock_bulk_ok = len(_fail_definite) == 0
+    _buy_ok_mock = mock_bulk_ok  # 모듈 수준 변수 갱신
     _real_confirm1 = False
     _real_confirm2 = False
 
 else:  # PAPER
     real_bulk_ok = True
     mock_bulk_ok = True
+    _buy_ok_mock = True
     _real_confirm1 = False
     _real_confirm2 = False
 
@@ -749,10 +761,10 @@ if order_mode in ("MOCK", "REAL") and _price_stale:
 col_buy, col_preview = st.columns(2)
 with col_buy:
     # REAL: real_bulk_ok + 안전필터 / MOCK: env 변수만(안전필터 경고만) / PAPER: 항상 허용
+    # _buy_ok_mock / _buy_ok_real: 항상 정의된 변수 (locals() 패턴 제거)
     _buy_disabled = (
-        (order_mode == "REAL" and (not real_bulk_ok or _order_blocked_by_safety))
-        or (order_mode == "MOCK" and not locals().get("mock_bulk_ok", True))
-        # MOCK은 _order_blocked_by_safety 적용 안 함 — 가상 주문이므로 안전필터는 경고만
+        (order_mode == "REAL" and (not _buy_ok_real or _order_blocked_by_safety))
+        or (order_mode == "MOCK" and not _buy_ok_mock)
     )
     if st.button("현재 리스트 전부 매수", type="primary", use_container_width=True, disabled=_buy_disabled):
         if not candidate_file:
