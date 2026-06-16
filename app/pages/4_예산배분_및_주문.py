@@ -560,15 +560,15 @@ elif order_mode == "MOCK":
     _mock_total_qty = sum(int(r.get("quantity", 0) or 0) for r in _mock_alloc_preview)
     _mock_total_amt = sum(int(r.get("order_amount", 0) or 0) for r in _mock_alloc_preview)
 
-    # preflight 아이템 (None = 미확인, True = OK, False = FAIL)
+    # preflight 아이템 (None = 미확인/선택사항, True = OK, False = FAIL/차단)
+    # "주문계획 존재"는 REAL 모드 전용 안전 게이트 — MOCK은 주문 시 즉시 배분 계산하므로 선택사항
     _pf_items = [
         ("MOCK 환경변수\n(KEY/SECRET/ACCOUNT)", _mock_env_all_ok),
         ("MOCK 토큰 유효\n(캐시 상태)", _mock_token_valid if _mock_cache else (None if _mock_env_all_ok else False)),
         ("MOCK 계좌조회", _mock_acc_result),
-        ("주문계획 존재\n(미리보기 필요)", _mock_alloc_exists),
-        ("주문계획 해시\n(MOCK: 자동 OK)", True),
-        ("주문수량 > 0", (_mock_total_qty > 0) if _mock_alloc_exists else None),
-        ("예상주문금액 > 0", (_mock_total_amt > 0) if _mock_alloc_exists else None),
+        ("미리보기 완료\n(선택사항)", _mock_alloc_exists or None),  # 없으면 미확인(⬜), 차단 아님
+        ("주문수량\n(미리보기 시 확인)", (_mock_total_qty > 0) if _mock_alloc_exists else None),
+        ("예상금액\n(미리보기 시 확인)", (_mock_total_amt > 0) if _mock_alloc_exists else None),
     ]
 
     # 테이블 표시
