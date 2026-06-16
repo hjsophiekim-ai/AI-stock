@@ -561,12 +561,12 @@ elif order_mode == "MOCK":
     _mock_total_amt = sum(int(r.get("order_amount", 0) or 0) for r in _mock_alloc_preview)
 
     # preflight 아이템 (None = 미확인/선택사항, True = OK, False = FAIL/차단)
-    # "주문계획 존재"는 REAL 모드 전용 안전 게이트 — MOCK은 주문 시 즉시 배분 계산하므로 선택사항
+    # MOCK은 가상 주문이므로 env 변수 누락 외에는 모두 선택사항(⬜) — 절대 차단 금지
     _pf_items = [
-        ("MOCK 환경변수\n(KEY/SECRET/ACCOUNT)", _mock_env_all_ok),
-        ("MOCK 토큰 유효\n(캐시 상태)", _mock_token_valid if _mock_cache else (None if _mock_env_all_ok else False)),
-        ("MOCK 계좌조회", _mock_acc_result),
-        ("미리보기 완료\n(선택사항)", _mock_alloc_exists or None),  # 없으면 미확인(⬜), 차단 아님
+        ("MOCK 환경변수\n(KEY/SECRET/ACCOUNT)", _mock_env_all_ok),  # 유일한 차단 조건
+        ("MOCK 토큰 유효\n(캐시 상태)", True if _mock_token_valid else None),  # 정보용만
+        ("MOCK 계좌조회", True if _mock_acc_result else None),       # 정보용만(False→None)
+        ("미리보기 완료\n(선택사항)", _mock_alloc_exists or None),
         ("주문수량\n(미리보기 시 확인)", (_mock_total_qty > 0) if _mock_alloc_exists else None),
         ("예상금액\n(미리보기 시 확인)", (_mock_total_amt > 0) if _mock_alloc_exists else None),
     ]
@@ -587,9 +587,11 @@ elif order_mode == "MOCK":
             _acc_r = check_kis_account("mock")
         if _acc_r.get("account_ok"):
             st.session_state["mock_preflight_account_ok"] = True
+            st.session_state["mock_preflight_broker_count"] = _acc_r.get("broker_count", 0)
             st.success(f"MOCK 계좌조회 OK — {_acc_r.get('broker_count', 0)}개 종목")
         else:
             st.session_state["mock_preflight_account_ok"] = False
+            st.session_state["mock_preflight_broker_count"] = "미확인"
             _acc_err = (_acc_r.get("response_text") or _acc_r.get("error") or "")[:200]
             st.error(f"MOCK 계좌조회 실패: {_acc_err}")
         st.rerun()
@@ -610,7 +612,7 @@ elif order_mode == "MOCK":
             _open_pf = [p for p in _all_pf.values() if not p.is_closed and p.status == "OPEN" and int(p.quantity) > 0]
             _pending_pf = [p for p in _all_pf.values() if p.status == "OPEN_WITH_PENDING_SELL"]
             _closed_pf = [p for p in _all_pf.values() if p.is_closed or p.status == "CLOSED"]
-            _broker_count_pf = _acc_r.get("broker_count", "미확인") if _mock_acc_result else "미확인"
+            _broker_count_pf = st.session_state.get("mock_preflight_broker_count", "미확인")
             _pf_detail_cols = st.columns(5)
             _pf_detail_cols[0].metric("KIS 실제 보유", f"{_broker_count_pf}개")
             _pf_detail_cols[1].metric("로컬 OPEN", f"{len(_open_pf)}개")
@@ -746,11 +748,11 @@ if order_mode in ("MOCK", "REAL") and _price_stale:
 
 col_buy, col_preview = st.columns(2)
 with col_buy:
-    # REAL: real_bulk_ok 조건 / MOCK: mock_bulk_ok 조건 / PAPER: 항상 허용
+    # REAL: real_bulk_ok + 안전필터 / MOCK: env 변수만(안전필터 경고만) / PAPER: 항상 허용
     _buy_disabled = (
-        (order_mode == "REAL" and not real_bulk_ok)
+        (order_mode == "REAL" and (not real_bulk_ok or _order_blocked_by_safety))
         or (order_mode == "MOCK" and not locals().get("mock_bulk_ok", True))
-        or _order_blocked_by_safety
+        # MOCK은 _order_blocked_by_safety 적용 안 함 — 가상 주문이므로 안전필터는 경고만
     )
     if st.button("현재 리스트 전부 매수", type="primary", use_container_width=True, disabled=_buy_disabled):
         if not candidate_file:
