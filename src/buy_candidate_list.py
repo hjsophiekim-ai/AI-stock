@@ -141,6 +141,42 @@ def _get_orderable_cash(mode: str, budget: int, errors: list) -> int:
     return int(budget)
 
 
+def _get_broker_held_codes(mode: str, timeout_sec: int = 8) -> Optional[set]:
+    """KIS 브로커에서 실제 보유 종목코드 목록 조회 (타임아웃 적용).
+
+    로컬 positions.json이 stale해도 KIS 실계좌 기준으로 held_codes를 결정한다.
+    - paper 모드: None 반환 (로컬 positions fallback 사용)
+    - mock/real 모드: KIS API로 보유종목 조회; 실패 시 None 반환 (로컬 fallback)
+    """
+    if mode.lower() == "paper":
+        return None
+    import concurrent.futures
+    result: list = [None]
+
+    def _fetch():
+        try:
+            from kis_api import KISApiClient
+            from safety_gate import SafetyGate
+            gate = SafetyGate(CONFIG_PATH, runtime_mode=mode)
+            api = KISApiClient(CONFIG_PATH, gate=gate)
+            api.auth.get_access_token()
+            df = api.get_positions()
+            if df is not None and not df.empty and "stock_code" in df.columns:
+                result[0] = set(df["stock_code"].astype(str).str.zfill(6).tolist())
+            else:
+                result[0] = set()  # 보유종목 없음 (정상)
+        except Exception as ex:
+            logger.warning(f"KIS 브로커 보유종목 조회 실패 (로컬 fallback): {ex}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        fut = executor.submit(_fetch)
+        try:
+            fut.result(timeout=timeout_sec)
+        except concurrent.futures.TimeoutError:
+            logger.warning(f"KIS 브로커 보유종목 조회 타임아웃 {timeout_sec}s — 로컬 positions fallback")
+    return result[0]
+
+
 def _execute_order(
     stock_code: str,
     stock_name: str,
@@ -226,19 +262,28 @@ def buy_candidates(
             df = _refresh_prices(df, KISApiClient(CONFIG_PATH, gate=gate))
 
         orderable_cash = _get_orderable_cash(mode, int(budget), errors)
+        # KIS 브로커 실제 보유종목 기준으로 held_codes 결정
+        # 로컬 positions.json이 오래되어도 KIS 실계좌가 실제 보유 종목 기준
         held_codes = set()
-        try:
-            from position_manager import PositionManager
-            _pm = PositionManager(CONFIG_PATH, mode=mode)
-            _all_pos = _pm.get_all_positions()
-            # OPEN_WITH_PENDING_SELL은 매도 주문 접수 완료 상태 → 재매수 허용
-            # 진짜 OPEN(매도 미접수) 상태만 재매수 차단
-            held_codes = {
-                code for code, pos in _all_pos.items()
-                if getattr(pos, "status", "OPEN") == "OPEN"
-            }
-        except Exception:
-            pass
+        broker_held = _get_broker_held_codes(mode, timeout_sec=8)
+        if broker_held is not None:
+            # KIS 조회 성공 → 브로커에 실제 보유 중인 종목만 재매수 차단
+            held_codes = broker_held
+            logger.info(f"held_codes: KIS 브로커 기준 {len(held_codes)}개 종목")
+        else:
+            # KIS 조회 실패 or paper 모드 → 로컬 positions 기준 (fallback)
+            try:
+                from position_manager import PositionManager
+                _pm = PositionManager(CONFIG_PATH, mode=mode)
+                _all_pos = _pm.get_all_positions()
+                # OPEN_WITH_PENDING_SELL 상태는 매도 접수 완료 → 재매수 허용
+                held_codes = {
+                    code for code, pos in _all_pos.items()
+                    if getattr(pos, "status", "OPEN") == "OPEN"
+                }
+                logger.info(f"held_codes: 로컬 positions 기준 {len(held_codes)}개 종목 (KIS 조회 실패/paper)")
+            except Exception:
+                pass
 
         allocator = BudgetAllocator(CONFIG_PATH)
         alloc_result = allocator.allocate_until_budget(

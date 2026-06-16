@@ -387,25 +387,65 @@ def run_budget_allocation(
                 orderable_cash_error = _cash_result.get("error_message", "조회 실패")
                 # API 실패 시 input budget 유지 (0원으로 처리 금지)
 
-        # 매수 버튼과 동일한 held_codes 계산 (이미 OPEN 보유 종목 제외)
+        # KIS 브로커 실제 보유종목 기준으로 held_codes 결정 (로컬 stale 방지)
+        # 매수 버튼(buy_candidates)과 동일한 로직 사용하여 예산배분-주문 일치
         held_codes: set = set()
         held_names: list = []
-        try:
-            from position_manager import PositionManager
-            _cfg_path = str(PROJECT_ROOT / "config.yaml")
-            _pm = PositionManager(_cfg_path, mode=(mode or "mock").lower())
-            _all_pos = _pm.get_all_positions()
-            held_codes = {
-                code for code, pos in _all_pos.items()
-                if getattr(pos, "status", "OPEN") == "OPEN"
-            }
-            held_names = [
-                {"code": code, "name": getattr(pos, "stock_name", code)}
-                for code, pos in _all_pos.items()
-                if getattr(pos, "status", "OPEN") == "OPEN"
-            ]
-        except Exception:
-            pass
+        held_source: str = "local"
+        _eff_mode = (mode or "mock").lower()
+        if _eff_mode != "paper":
+            import concurrent.futures as _cf2
+            _broker_result: list = [None]
+
+            def _fetch_broker_pos():
+                try:
+                    from kis_api import KISApiClient
+                    from safety_gate import SafetyGate
+                    _gate2 = SafetyGate(str(PROJECT_ROOT / "config.yaml"), runtime_mode=_eff_mode)
+                    _api2 = KISApiClient(str(PROJECT_ROOT / "config.yaml"), gate=_gate2)
+                    _api2.auth.get_access_token()
+                    _df2 = _api2.get_positions()
+                    if _df2 is not None and not _df2.empty and "stock_code" in _df2.columns:
+                        codes = set(_df2["stock_code"].astype(str).str.zfill(6).tolist())
+                        names = [
+                            {"code": r["stock_code"].zfill(6), "name": r.get("stock_name", r["stock_code"])}
+                            for _, r in _df2.iterrows()
+                        ]
+                        _broker_result[0] = (codes, names)
+                    else:
+                        _broker_result[0] = (set(), [])
+                except Exception:
+                    pass
+
+            with _cf2.ThreadPoolExecutor(max_workers=1) as _ex2:
+                _fut2 = _ex2.submit(_fetch_broker_pos)
+                try:
+                    _fut2.result(timeout=8)
+                except _cf2.TimeoutError:
+                    pass
+
+            if _broker_result[0] is not None:
+                held_codes, held_names = _broker_result[0]
+                held_source = "kis_broker"
+
+        if held_source == "local":
+            # paper 모드 또는 KIS 조회 실패 → 로컬 positions fallback
+            try:
+                from position_manager import PositionManager
+                _cfg_path = str(PROJECT_ROOT / "config.yaml")
+                _pm = PositionManager(_cfg_path, mode=_eff_mode)
+                _all_pos = _pm.get_all_positions()
+                held_codes = {
+                    code for code, pos in _all_pos.items()
+                    if getattr(pos, "status", "OPEN") == "OPEN"
+                }
+                held_names = [
+                    {"code": code, "name": getattr(pos, "stock_name", code)}
+                    for code, pos in _all_pos.items()
+                    if getattr(pos, "status", "OPEN") == "OPEN"
+                ]
+            except Exception:
+                pass
 
         allocator = BudgetAllocator(str(PROJECT_ROOT / "config.yaml"))
         result = allocator.allocate_until_budget(
@@ -436,6 +476,7 @@ def run_budget_allocation(
             "total_candidates": total_candidates,
             "held_count": len(held_codes),
             "held_names": held_names,
+            "held_source": held_source,  # "kis_broker" or "local"
             "available_candidates": total_candidates - len(held_codes),
             "price_source": price_source,
             "price_stale": price_stale,

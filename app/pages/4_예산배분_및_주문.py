@@ -311,19 +311,24 @@ if st.button("예산배분 계산", type="primary"):
                 "입력 예산을 기준으로 예산배분을 계산했습니다. 실제 매수 시 주문가능금액을 다시 확인하세요."
             )
 
+        _held_source = summary.get("held_source", "local")
+        _held_source_label = "KIS 브로커 실계좌" if _held_source == "kis_broker" else "로컬 positions.json"
         if _held_count > 0:
             _held_names = summary.get("held_names", [])
             _held_list = ", ".join(
                 f"{h.get('name','?')}({h.get('code','?')})" for h in _held_names[:10]
             )
             st.warning(
-                f"이미 보유 중인 종목 {_held_count}개가 제외되었습니다 → "
+                f"KIS 계좌에서 보유 중인 종목 {_held_count}개 제외 ({_held_source_label} 기준) → "
                 f"유효 후보 {_avail_cands}개 중 {_alloc_count}개 배분\n\n"
                 f"제외 종목: {_held_list}"
                 + (" 외..." if len(_held_names) > 10 else "")
             )
         else:
-            st.success(f"예산배분 완료 — {_avail_cands}개 후보 중 {_alloc_count}개 종목 배분")
+            st.success(
+                f"예산배분 완료 — {_avail_cands}개 후보 중 {_alloc_count}개 종목 배분 "
+                f"(보유종목 조회: {_held_source_label})"
+            )
 
         if _price_stale_alloc:
             st.warning(
@@ -649,25 +654,82 @@ else:  # PAPER
     _real_confirm1 = False
     _real_confirm2 = False
 
-# ── 현재 보유 종목 현황 표시 (주문 전 참고용) ────────────────────────────
+# ── 현재 보유 종목 현황 표시 (KIS 브로커 실계좌 기준, 주문 전 참고용) ────────────────
 try:
-    from position_manager import PositionManager as _PM4
-    _pm4 = _PM4(str(PROJECT_ROOT / "config.yaml"), mode=order_mode.lower())
-    _all4 = _pm4.get_all_positions()
-    _open4 = [p for p in _all4.values() if getattr(p, "status", "OPEN") == "OPEN" and not getattr(p, "is_closed", False)]
     _cand_codes4 = set()
     if df_candidates is not None and not df_candidates.empty:
         _cc4 = "stock_code" if "stock_code" in df_candidates.columns else "ticker"
         _cand_codes4 = {str(c).zfill(6) for c in df_candidates[_cc4].tolist()}
-    _overlap4 = [p for p in _open4 if str(p.stock_code).zfill(6) in _cand_codes4]
-    if _overlap4:
+
+    _broker_overlap4 = []
+    _overlap_source4 = "로컬 positions.json"
+
+    if order_mode.lower() != "paper":
+        # KIS 브로커 실계좌에서 보유종목 조회 (8초 타임아웃)
+        import concurrent.futures as _cf4
+        _broker_pos4: list = [None]
+
+        def _fetch_pos4():
+            try:
+                from kis_api import KISApiClient
+                from safety_gate import SafetyGate
+                _g4 = SafetyGate(str(PROJECT_ROOT / "config.yaml"), runtime_mode=order_mode.lower())
+                _a4 = KISApiClient(str(PROJECT_ROOT / "config.yaml"), gate=_g4)
+                _a4.auth.get_access_token()
+                _df4 = _a4.get_positions()
+                _broker_pos4[0] = _df4
+            except Exception:
+                pass
+
+        with _cf4.ThreadPoolExecutor(max_workers=1) as _ex4:
+            _fut4 = _ex4.submit(_fetch_pos4)
+            try:
+                _fut4.result(timeout=8)
+            except _cf4.TimeoutError:
+                pass
+
+        if _broker_pos4[0] is not None and not _broker_pos4[0].empty:
+            _broker_codes4 = set(_broker_pos4[0]["stock_code"].astype(str).str.zfill(6).tolist())
+            _broker_overlap4 = [
+                {"stock_code": c, "stock_name": row.get("stock_name", c)}
+                for _, row in _broker_pos4[0].iterrows()
+                for c in [str(row["stock_code"]).zfill(6)]
+                if c in _cand_codes4
+            ]
+            _overlap_source4 = "KIS 브로커 실계좌"
+        elif _broker_pos4[0] is not None:
+            # KIS 조회 성공했지만 보유종목 없음
+            _broker_overlap4 = []
+            _overlap_source4 = "KIS 브로커 실계좌"
+        # KIS 조회 실패 시 로컬 fallback
+        if _broker_pos4[0] is None:
+            from position_manager import PositionManager as _PM4
+            _pm4 = _PM4(str(PROJECT_ROOT / "config.yaml"), mode=order_mode.lower())
+            _all4 = _pm4.get_all_positions()
+            _open4 = [p for p in _all4.values() if getattr(p, "status", "OPEN") == "OPEN" and not getattr(p, "is_closed", False)]
+            _broker_overlap4 = [
+                {"stock_code": p.stock_code, "stock_name": p.stock_name}
+                for p in _open4 if str(p.stock_code).zfill(6) in _cand_codes4
+            ]
+    else:
+        from position_manager import PositionManager as _PM4
+        _pm4 = _PM4(str(PROJECT_ROOT / "config.yaml"), mode=order_mode.lower())
+        _all4 = _pm4.get_all_positions()
+        _open4 = [p for p in _all4.values() if getattr(p, "status", "OPEN") == "OPEN" and not getattr(p, "is_closed", False)]
+        _broker_overlap4 = [
+            {"stock_code": p.stock_code, "stock_name": p.stock_name}
+            for p in _open4 if str(p.stock_code).zfill(6) in _cand_codes4
+        ]
+
+    if _broker_overlap4:
         _excl_names4 = ", ".join(
-            f"{p.stock_name}({p.stock_code})" for p in _overlap4[:10]
+            f"{h.get('stock_name','?')}({h.get('stock_code','?')})" for h in _broker_overlap4[:10]
         )
         st.info(
-            f"현재 보유 중인 종목 {len(_overlap4)}개가 후보 리스트와 겹칩니다 → 주문 시 이 종목들은 제외됩니다.\n\n"
-            f"제외 예정: {_excl_names4}" + (" 외..." if len(_overlap4) > 10 else "") + "\n\n"
-            f"남은 주문 대상: 후보 {len(df_candidates)}개 중 {len(df_candidates) - len(_overlap4)}개"
+            f"KIS 계좌에서 보유 중인 종목 {len(_broker_overlap4)}개가 후보 리스트와 겹칩니다 → 주문 시 제외됩니다. "
+            f"({_overlap_source4} 기준)\n\n"
+            f"제외 예정: {_excl_names4}" + (" 외..." if len(_broker_overlap4) > 10 else "") + "\n\n"
+            f"남은 주문 대상: 후보 {len(df_candidates)}개 중 {len(df_candidates) - len(_broker_overlap4)}개"
         )
 except Exception:
     pass
