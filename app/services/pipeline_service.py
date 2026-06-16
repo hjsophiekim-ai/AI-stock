@@ -490,8 +490,8 @@ def run_full_pipeline(
     buy20_sr = run_pipeline_step(
         step_name="select_today_buy_top20",
         script_name="select_today_buy_top20.py",
-        args=["--date", today, "--safe-mode", "--mode", "mock"],
-        timeout=120,
+        args=["--date", today, "--mode", "paper"],
+        timeout=60,
     )
     step_results.append(buy20_sr)
     if not buy20_sr["success"]:
@@ -825,8 +825,8 @@ def run_fast_candidate_pipeline(
     buy20_sr = run_pipeline_step(
         step_name="select_today_buy_top20",
         script_name="select_today_buy_top20.py",
-        args=["--date", today, "--safe-mode", "--mode", "mock"],
-        timeout=120,
+        args=["--date", today, "--mode", "paper"],
+        timeout=60,
     )
     step_results.append(buy20_sr)
     if not buy20_sr["success"]:

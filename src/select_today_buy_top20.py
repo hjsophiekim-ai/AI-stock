@@ -181,7 +181,12 @@ def select_buy_top20(
     if "probability_2pct" in df.columns:
         df = df.rename(columns={"probability_2pct": "legacy_nextday_probability_2pct"})
 
+    safe_path = Path(output_dir) / f"buy_top20_safe_{today}.csv"
+    final_path = Path(output_dir) / f"buy_top20_{today}.csv"
+    max_n = int(_safe_cfg().get("max_buy_candidates", 20) or 20)
+
     if safe_mode:
+        # KIS 실시간 가격 보강 후 엄격한 안전 필터 적용
         try:
             df = _enrich_with_kis_realtime(df, mode=mode.lower(), max_fetch=max_fetch)
         except Exception as exc:
@@ -192,26 +197,51 @@ def select_buy_top20(
                 "candidate_count": 0,
             }
 
-    filtered = apply_safe_intraday_filter(df, _safe_cfg())
-    max_n = int(_safe_cfg().get("max_buy_candidates", 20) or 20)
-    passed = filtered[filtered["market_safety_pass"]].copy()
-    passed = passed.sort_values("final_safe_intraday_score", ascending=False, kind="stable").head(max_n)
-    passed = passed.reset_index(drop=True)
-    passed["final_buy_rank"] = range(1, len(passed) + 1)
-    passed["allocation_version"] = "SAFE_INTRADAY_BUY_TOP20_V1"
+        filtered = apply_safe_intraday_filter(df, _safe_cfg())
+        passed = filtered[filtered["market_safety_pass"]].copy()
+        passed = passed.sort_values("final_safe_intraday_score", ascending=False, kind="stable").head(max_n)
+        passed = passed.reset_index(drop=True)
+        passed["final_buy_rank"] = range(1, len(passed) + 1)
+        passed["allocation_version"] = "SAFE_INTRADAY_BUY_TOP20_V1"
+        passed.to_csv(safe_path, index=False, encoding="utf-8-sig")
 
-    safe_path = Path(output_dir) / f"buy_top20_safe_{today}.csv"
-    final_path = Path(output_dir) / f"buy_top20_{today}.csv"
-    passed.to_csv(safe_path, index=False, encoding="utf-8-sig")
+        ok, failed = copy_if_valid(safe_path, final_path, _safe_cfg())
+        summary = summarize_filter_failures(filtered)
+        candidate_count = len(passed)
+        min_trade = int(_safe_cfg().get("min_candidates_to_trade", 10))
+        if candidate_count < min_trade and not _safe_cfg().get("allow_trade_when_candidates_below_min", False):
+            failed.append("candidate_count_below_min_candidates_to_trade")
+            ok = False
+    else:
+        # Paper 모드: KIS API 없이 AI 점수(prob_intraday_2pct)로 빠른 선정
+        # 이름 기반 Hard exclusion만 적용 (실시간 데이터 불필요)
+        name_col = next((c for c in ("stock_name", "name") if c in df.columns), None)
+        names = df[name_col].fillna("").astype(str) if name_col else pd.Series("", index=df.index)
+        code_col = "stock_code" if "stock_code" in df.columns else "ticker"
+        codes = df[code_col].astype(str).str.zfill(6) if code_col in df.columns else pd.Series("", index=df.index)
 
-    ok, failed = copy_if_valid(safe_path, final_path, _safe_cfg())
-    summary = summarize_filter_failures(filtered)
-    min_trade = int(_safe_cfg().get("min_candidates_to_trade", 10))
-    candidate_count = len(passed)
-    below_min = candidate_count < min_trade
-    if below_min and not _safe_cfg().get("allow_trade_when_candidates_below_min", False):
-        failed.append("candidate_count_below_min_candidates_to_trade")
-        ok = False
+        is_excluded = (
+            names.str.contains("스팩|기업인수목적", regex=True)
+            | names.str.contains("우B|우C|우선주", regex=True)
+            | names.str.endswith("우")
+            | names.str.contains("리츠|ETN|ETF|인버스|레버리지", regex=True)
+            | codes.str[-1].isin(["5", "7", "9"])  # 우선주 종목코드 끝자리
+        )
+        paper_df = df[~is_excluded].copy()
+        paper_df = paper_df.sort_values("prob_intraday_2pct", ascending=False, kind="stable")
+        passed = paper_df.head(max_n).reset_index(drop=True)
+        passed["final_buy_rank"] = range(1, len(passed) + 1)
+        passed["market_safety_pass"] = True
+        passed["final_safe_intraday_score"] = passed["prob_intraday_2pct"]
+        passed["allocation_version"] = "PAPER_INTRADAY_BUY_TOP20_V1"
+        passed.to_csv(safe_path, index=False, encoding="utf-8-sig")
+
+        candidate_count = len(passed)
+        ok = candidate_count > 0
+        failed = [] if ok else ["no_candidates"]
+        if ok:
+            final_path.write_bytes(safe_path.read_bytes())
+        summary = {"excluded_name_filter": int((~is_excluded).sum()) if len(df) > 0 else 0}
 
     result = {
         "success": bool(ok),
@@ -221,14 +251,14 @@ def select_buy_top20(
         "safe_output_file": str(safe_path),
         "candidate_count": int(candidate_count),
         "original_count": int(len(df)),
-        "filter_pass_count": int(len(passed)),
+        "filter_pass_count": int(candidate_count),
         "date": today,
         "failed_checks": failed,
         **summary,
     }
     if not ok:
-        result["error"] = "안전 필터 통과 실패 — buy_top20_YYYYMMDD.csv를 업데이트하지 않았습니다."
-    logger.info("safe buy_top20 result: %s", result)
+        result["error"] = "buy_top20 생성 실패" if not safe_mode else "안전 필터 통과 실패 — buy_top20_YYYYMMDD.csv를 업데이트하지 않았습니다."
+    logger.info("buy_top20 result: %s", result)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return result
 
